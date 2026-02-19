@@ -91,6 +91,7 @@ import os
 import json
 import io
 import copy
+import threading
 import datetime
 import base64
 import textwrap
@@ -430,7 +431,11 @@ def min_n_distribution_free(coverage=0.95, confidence=0.95, r=1):
 def sigma_from_basis(value, basis, distribution="Normal"):
     """
     Convert a user-entered value to a standard uncertainty (1σ) based on
-    the stated sigma basis.
+    the stated sigma basis, accounting for the source's distribution type.
+
+    For 2σ (95%) and 3σ (99.7%) bases, the divisor is the distribution's
+    percentile factor rather than the Normal assumption of 2.0 / 3.0,
+    so that the resulting 1σ matches the distribution's actual variance.
 
     Ref: ASME PTC 19.1-2018, Type B evaluation.
     Ref: JCGM 100:2008 (GUM), Section 4.3.
@@ -438,9 +443,12 @@ def sigma_from_basis(value, basis, distribution="Normal"):
     if basis == "Confirmed 1σ" or basis == "Assumed 1σ (unverified)":
         return value
     elif basis == "2σ (95%)":
-        return value / 2.0
+        # Divisor = z such that CDF(z*σ) - CDF(-z*σ) ≈ 95% for the distribution
+        divisor = _percentile_divisor(distribution, 0.95)
+        return value / divisor
     elif basis == "3σ (99.7%)":
-        return value / 3.0
+        divisor = _percentile_divisor(distribution, 0.997)
+        return value / divisor
     elif basis == "Bounding (min/max)":
         if distribution == "Uniform":
             return value / np.sqrt(3)
@@ -449,6 +457,45 @@ def sigma_from_basis(value, basis, distribution="Normal"):
         else:
             return value / 3.0  # assume normal 3σ
     return value
+
+
+def _percentile_divisor(distribution: str, coverage: float) -> float:
+    """
+    Return the number of standard deviations that span the given symmetric
+    central coverage interval for the specified distribution type.
+
+    For Normal, this is simply the inverse-normal (e.g. 1.96 for 95%).
+    For other distributions, the factor differs.
+    """
+    from scipy.stats import norm as _norm, t as _t
+    alpha = (1 - coverage) / 2.0
+
+    if distribution in ("Normal", "Lognormal", "Lognormal (σ=0.5)"):
+        return float(_norm.ppf(1 - alpha))
+    elif distribution == "Student-t (df=5)":
+        # 95th percentile of t(5) / std(t(5)); std = sqrt(5/3)
+        t_val = float(_t.ppf(1 - alpha, 5))
+        t_std = np.sqrt(5.0 / 3.0)
+        return t_val / t_std
+    elif distribution == "Student-t (df=10)":
+        t_val = float(_t.ppf(1 - alpha, 10))
+        t_std = np.sqrt(10.0 / 8.0)
+        return t_val / t_std
+    elif distribution == "Uniform":
+        # Uniform: half-width = sqrt(3)*σ, so P(|X|<k*σ) = min(k/sqrt(3), 1)
+        # k = sqrt(3) * coverage (but capped at sqrt(3))
+        return min(np.sqrt(3) * coverage, np.sqrt(3))
+    elif distribution == "Triangular":
+        # Symmetric triangular on [-a, a] with σ = a/√6.
+        # CDF is quadratic, not linear.  The central coverage p corresponds
+        # to k standard deviations where k = √6 · (1 − √(1 − p)).
+        # Derivation: P(|X| < k·σ) = p ⟹ F(k·σ) - F(-k·σ) = p
+        #   with F(x) = 0.5 + x/a − x²/(2a²), solving gives
+        #   k·σ = a·(1 − √(1−p)), hence k = (a/σ)·(1−√(1−p)) = √6·(1−√(1−p)).
+        return min(np.sqrt(6) * (1.0 - np.sqrt(1.0 - coverage)), np.sqrt(6))
+    else:
+        # Default: normal assumption
+        return float(_norm.ppf(1 - alpha))
 
 
 def compute_descriptive_stats(data):
@@ -557,10 +604,10 @@ def assess_sample_size(n):
         k_approx = one_sided_tolerance_k(max(n, 2), 0.95, 0.95)
         msg = (
             f"SMALL SAMPLE (n={n}). k-factor penalty is significant "
-            f"(k ≈ {k_approx:.2f} for 95/95 vs k=2.0 at large n). "
+            f"(k ≈ {k_approx:.2f} for 95/95 vs k→1.645 at large n). "
             f"Consider pooling additional locations if justified. "
             f"Distribution-free 95/95 bounds require n ≥ 59. "
-            f"To reduce k below 2.2, you need n ≥ 25. "
+            f"To reduce k below 2.2, you need n ≥ 32. "
             f"[V&V 20 §6, PTC 19.1 §7]"
         )
         return msg, 'red'
@@ -672,70 +719,234 @@ def fit_distributions(data):
     return results
 
 
-def generate_mc_samples(distribution, sigma, mean, n_trials, raw_data=None):
+def generate_mc_samples(distribution, sigma, mean, n_trials, raw_data=None,
+                        rng=None):
     """
     Generate Monte Carlo samples from a specified distribution.
 
+    Parameters
+    ----------
+    rng : numpy.random.Generator, optional
+        Thread-safe RNG instance.  Falls back to the legacy global RNG
+        if not provided (for backward compatibility in non-threaded use).
+
     Ref: JCGM 101:2008 (GUM Supplement 1).
     """
+    # Use provided Generator or fall back to legacy API
+    if rng is None:
+        rng = np.random.default_rng()
     if distribution == "Normal":
-        return np.random.normal(mean, sigma, n_trials)
+        return rng.normal(mean, sigma, n_trials)
     elif distribution == "Uniform":
         a = sigma * np.sqrt(3)
-        return np.random.uniform(mean - a, mean + a, n_trials)
+        return rng.uniform(mean - a, mean + a, n_trials)
     elif distribution == "Triangular":
         a = sigma * np.sqrt(6)
-        return np.random.triangular(mean - a, mean, mean + a, n_trials)
+        if a == 0:
+            return np.full(n_trials, mean)
+        return rng.triangular(mean - a, mean, mean + a, n_trials)
     elif distribution == "Lognormal":
         if sigma > 0 and abs(mean) > sigma * 0.01:
-            # Lognormal requires a positive mean; use abs(mean) for parameterisation
             abs_mean = abs(mean)
             underlying_sigma = np.sqrt(np.log(1 + (sigma / abs_mean) ** 2))
             underlying_mu = np.log(abs_mean) - underlying_sigma ** 2 / 2
-            samples = np.random.lognormal(underlying_mu, underlying_sigma, n_trials)
+            samples = rng.lognormal(underlying_mu, underlying_sigma, n_trials)
             if mean < 0:
                 samples = -samples  # mirror for negative mean
             return samples
-        # Lognormal is undefined for mean≈0; fall back to Normal
-        return np.random.normal(mean, max(sigma, 1e-15), n_trials)
+        return rng.normal(mean, max(sigma, 1e-15), n_trials)
     elif distribution == "Lognormal (σ=0.5)":
-        underlying_sigma = 0.5
-        if abs(mean) > 1e-10:
-            underlying_mu = np.log(abs(mean)) - underlying_sigma ** 2 / 2
-            samples = np.random.lognormal(underlying_mu, underlying_sigma, n_trials)
+        # Moderately skewed lognormal: cap underlying_sigma at 0.5 but
+        # still honour the user's sigma for the variance.
+        if sigma > 0 and abs(mean) > sigma * 0.01:
+            abs_mean = abs(mean)
+            user_sigma_ln = np.sqrt(np.log(1 + (sigma / abs_mean) ** 2))
+            underlying_sigma = min(user_sigma_ln, 0.5)
+            underlying_mu = np.log(abs_mean) - underlying_sigma ** 2 / 2
+            raw = rng.lognormal(underlying_mu, underlying_sigma, n_trials)
+            raw_std = float(np.std(raw, ddof=0))
+            if raw_std > 1e-15:
+                samples = mean + (raw - np.mean(raw)) * (sigma / raw_std)
+            else:
+                samples = raw
             if mean < 0:
-                samples = -samples
+                samples = 2 * mean - samples  # mirror
             return samples
-        return np.random.normal(mean, max(sigma, 1e-15), n_trials)
+        return rng.normal(mean, max(sigma, 1e-15), n_trials)
     elif distribution == "Logistic":
         scale = sigma * np.sqrt(3) / np.pi
-        return np.random.logistic(mean, scale, n_trials)
+        return rng.logistic(mean, scale, n_trials)
     elif distribution == "Laplace":
         scale = sigma / np.sqrt(2)
-        return np.random.laplace(mean, scale, n_trials)
+        return rng.laplace(mean, scale, n_trials)
     elif distribution == "Student-t (df=5)":
-        samples = np.random.standard_t(5, n_trials)
+        samples = rng.standard_t(5, n_trials)
         t_std = np.sqrt(5.0 / 3.0)
         return mean + sigma * samples / t_std
     elif distribution == "Student-t (df=10)":
-        samples = np.random.standard_t(10, n_trials)
+        samples = rng.standard_t(10, n_trials)
         t_std = np.sqrt(10.0 / 8.0)
         return mean + sigma * samples / t_std
     elif distribution == "Exponential":
-        return np.random.exponential(sigma, n_trials) + (mean - sigma)
+        return rng.exponential(sigma, n_trials) + (mean - sigma)
     elif distribution == "Weibull":
         # Use shape=2 (Rayleigh-like) by default, scale to match sigma
         # Var(Weibull k=2) = scale^2 * (1 - pi/4), so scale = sigma / sqrt(1 - pi/4)
         shape = 2.0
         scale = sigma / np.sqrt(1.0 - np.pi / 4.0)
-        samples = np.random.weibull(shape, n_trials) * scale
-        return samples - np.mean(samples) + mean
+        samples = rng.weibull(shape, n_trials) * scale
+        # Use theoretical mean for recentering (avoids sample-mean correlation)
+        from scipy.special import gamma as _gamma_fn
+        theoretical_mean = scale * _gamma_fn(1.0 + 1.0 / shape)
+        return samples - theoretical_mean + mean
     elif distribution == "Custom/Empirical (Bootstrap)":
         if raw_data is not None and len(raw_data) > 0:
-            return np.random.choice(raw_data, size=n_trials, replace=True)
-        return np.random.normal(mean, sigma, n_trials)
+            centered = raw_data - np.mean(raw_data) + mean
+            return rng.choice(centered, size=n_trials, replace=True)
+        return rng.normal(mean, sigma, n_trials)
     else:
-        return np.random.normal(mean, sigma, n_trials)
+        return rng.normal(mean, sigma, n_trials)
+
+
+def generate_lhs_samples(distribution, sigma, mean, n_trials, raw_data=None,
+                         rng=None):
+    """
+    Generate Latin Hypercube samples from a specified distribution.
+
+    Uses stratified sampling of the [0, 1] probability space followed by
+    the inverse-CDF (percent-point function) transform.  Produces the same
+    marginal distribution as ``generate_mc_samples`` but with much better
+    coverage of the tails, giving equivalent accuracy in ~1/10 the samples.
+
+    Parameters
+    ----------
+    distribution : str
+        Distribution name (same strings as ``generate_mc_samples``).
+    sigma : float
+        Standard uncertainty (standard deviation) for the source.
+    mean : float
+        Central value of the distribution.
+    n_trials : int
+        Number of samples to draw.
+    raw_data : array-like, optional
+        Raw data for Custom/Empirical Bootstrap resampling.
+    rng : numpy.random.Generator, optional
+        Thread-safe RNG.  Falls back to a fresh Generator if not provided.
+
+    Returns
+    -------
+    samples : numpy.ndarray of shape (n_trials,)
+
+    Ref
+    ---
+    McKay, Beckman & Conover (1979); JCGM 101:2008 §6.4;
+    ASME V&V 20, Section 4.4 — Monte Carlo propagation methods.
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+
+    # ------------------------------------------------------------------
+    # Core LHS: stratify [0, 1] into n_trials equal intervals, draw one
+    # uniform random deviate per interval, then shuffle.
+    # ------------------------------------------------------------------
+    n = n_trials
+    intervals = (np.arange(n, dtype=np.float64) + rng.uniform(0, 1, n)) / n
+    rng.shuffle(intervals)
+    # Clip to avoid ±inf at the boundaries of the ppf
+    u = np.clip(intervals, 0.5 / n, 1.0 - 0.5 / n)
+
+    # ------------------------------------------------------------------
+    # Inverse-CDF transform for each distribution type.
+    # ------------------------------------------------------------------
+    if sigma == 0:
+        return np.full(n, mean)
+
+    if distribution == "Normal":
+        return norm.ppf(u, loc=mean, scale=sigma)
+
+    elif distribution == "Uniform":
+        a = sigma * np.sqrt(3)
+        return uniform.ppf(u, loc=mean - a, scale=2 * a)
+
+    elif distribution == "Triangular":
+        a = sigma * np.sqrt(6)
+        if a == 0:
+            return np.full(n, mean)
+        # scipy triang: c = (mode - loc) / scale.  Symmetric ⇒ c = 0.5
+        return triang.ppf(u, c=0.5, loc=mean - a, scale=2 * a)
+
+    elif distribution == "Lognormal":
+        if sigma > 0 and abs(mean) > sigma * 0.01:
+            abs_mean = abs(mean)
+            underlying_sigma = np.sqrt(np.log(1 + (sigma / abs_mean) ** 2))
+            underlying_mu = np.log(abs_mean) - underlying_sigma ** 2 / 2
+            samples = lognorm.ppf(u, s=underlying_sigma, scale=np.exp(underlying_mu))
+            if mean < 0:
+                samples = -samples
+            return samples
+        return norm.ppf(u, loc=mean, scale=max(sigma, 1e-15))
+
+    elif distribution == "Lognormal (σ=0.5)":
+        if sigma > 0 and abs(mean) > sigma * 0.01:
+            abs_mean = abs(mean)
+            user_sigma_ln = np.sqrt(np.log(1 + (sigma / abs_mean) ** 2))
+            underlying_sigma = min(user_sigma_ln, 0.5)
+            underlying_mu = np.log(abs_mean) - underlying_sigma ** 2 / 2
+            raw = lognorm.ppf(u, s=underlying_sigma, scale=np.exp(underlying_mu))
+            raw_std = float(np.std(raw, ddof=0))
+            if raw_std > 1e-15:
+                samples = mean + (raw - np.mean(raw)) * (sigma / raw_std)
+            else:
+                samples = raw
+            if mean < 0:
+                samples = 2 * mean - samples
+            return samples
+        return norm.ppf(u, loc=mean, scale=max(sigma, 1e-15))
+
+    elif distribution == "Logistic":
+        scale = sigma * np.sqrt(3) / np.pi
+        return logistic.ppf(u, loc=mean, scale=scale)
+
+    elif distribution == "Laplace":
+        scale = sigma / np.sqrt(2)
+        return laplace.ppf(u, loc=mean, scale=scale)
+
+    elif distribution == "Student-t (df=5)":
+        t_std = np.sqrt(5.0 / 3.0)
+        raw = t_dist.ppf(u, df=5)
+        return mean + sigma * raw / t_std
+
+    elif distribution == "Student-t (df=10)":
+        t_std = np.sqrt(10.0 / 8.0)
+        raw = t_dist.ppf(u, df=10)
+        return mean + sigma * raw / t_std
+
+    elif distribution == "Exponential":
+        # Exponential with mean = sigma, shifted so distribution mean = mean
+        return expon.ppf(u, loc=mean - sigma, scale=sigma)
+
+    elif distribution == "Weibull":
+        shape = 2.0
+        scale = sigma / np.sqrt(1.0 - np.pi / 4.0)
+        raw = weibull_min.ppf(u, c=shape, scale=scale)
+        from scipy.special import gamma as _gamma_fn
+        theoretical_mean = scale * _gamma_fn(1.0 + 1.0 / shape)
+        return raw - theoretical_mean + mean
+
+    elif distribution == "Custom/Empirical (Bootstrap)":
+        # Stratified resampling from empirical CDF
+        if raw_data is not None and len(raw_data) > 0:
+            centered = np.sort(raw_data - np.mean(raw_data) + mean)
+            # Build empirical CDF: F(x_i) = i / (N+1)  (Hazen plotting position)
+            n_data = len(centered)
+            ecdf_x = centered
+            ecdf_y = (np.arange(1, n_data + 1)) / (n_data + 1.0)
+            # Interpolate the quantile function at the stratified u values
+            return np.interp(u, ecdf_y, ecdf_x)
+        return norm.ppf(u, loc=mean, scale=sigma)
+
+    else:
+        return norm.ppf(u, loc=mean, scale=sigma)
 
 
 # K-factor lookup table generator for reference tab
@@ -918,6 +1129,7 @@ class AnalysisSettings:
     mc_n_trials: int = 100000
     mc_seed: Optional[int] = None
     mc_bootstrap: bool = True
+    mc_sampling_method: str = "Monte Carlo (Random)"
     bound_type: str = "Both (for comparison)"
     mc_comparison_sampling: str = "Bootstrap from raw data"
     global_unit: str = "°F"
@@ -954,6 +1166,9 @@ class RSSResults:
     bias_explained: bool = False
     source_contributions: List[dict] = field(default_factory=list)
     computed: bool = False
+    # Coverage settings used — needed by MC tab for apples-to-apples comparison
+    _coverage: float = 0.95
+    _one_sided: bool = True
 
 
 @dataclass
@@ -968,14 +1183,21 @@ class MCResults:
     upper_bound: float = 0.0
     bootstrap_ci_low: float = 0.0
     bootstrap_ci_high: float = 0.0
+    # Coverage-matched percentiles (computed from settings, not hardcoded)
+    _lower_pct: float = 5.0     # lower percentile used (e.g. 2.5 for 95% two-sided)
+    _upper_pct: float = 95.0    # upper percentile used (e.g. 97.5 for 95% two-sided)
+    _coverage: float = 0.95
+    _one_sided: bool = True
+    sampling_method: str = "Monte Carlo (Random)"
     samples: np.ndarray = field(default_factory=lambda: np.array([]))
     computed: bool = False
 
     def to_dict(self):
         d = {}
+        _skip = {'samples', '_p5_boots', '_p95_boots'}
         for k, v in self.__dict__.items():
-            if k == 'samples':
-                continue  # Don't save raw MC samples
+            if k in _skip:
+                continue  # Don't save large arrays (samples, bootstrap)
             d[k] = v
         return d
 
@@ -1149,6 +1371,7 @@ def get_dark_stylesheet():
     }}
     QTableWidget {{
         background-color: {c['bg_widget']};
+        alternate-background-color: {c['bg_alt']};
         color: {c['fg']};
         gridline-color: {c['border']};
         border: 1px solid {c['border']};
@@ -1156,6 +1379,9 @@ def get_dark_stylesheet():
     }}
     QTableWidget::item {{
         padding: 4px;
+    }}
+    QTableWidget::item:alternate {{
+        background-color: {c['bg_alt']};
     }}
     QTableWidget::item:selected {{
         background-color: {c['selection']};
@@ -3961,6 +4187,22 @@ class AnalysisSettingsTab(QWidget):
         form = QFormLayout(grp)
         form.setSpacing(6)
 
+        # -- Sampling method --
+        self._cmb_mc_sampling = QComboBox()
+        self._cmb_mc_sampling.addItem("Monte Carlo (Random)",
+                                       "Monte Carlo (Random)")
+        self._cmb_mc_sampling.addItem("Latin Hypercube (LHS)",
+                                       "Latin Hypercube (LHS)")
+        self._cmb_mc_sampling.setToolTip(
+            "Monte Carlo (Random): standard pseudo-random sampling.\n"
+            "Latin Hypercube (LHS): stratified sampling that divides each\n"
+            "source's probability space into N equal intervals and draws\n"
+            "exactly one sample per interval.  Produces the same result\n"
+            "distributions with ~10× fewer samples needed for convergence.\n"
+            "[McKay et al. 1979; JCGM 101:2008 §6.4; ASME V&V 20 §4.4]"
+        )
+        form.addRow("Sampling method:", self._cmb_mc_sampling)
+
         # -- Number of trials --
         self._cmb_mc_trials = QComboBox()
         mc_trial_options = [10000, 50000, 100000, 500000, 1000000]
@@ -4078,58 +4320,13 @@ class AnalysisSettingsTab(QWidget):
         self._main_layout.addWidget(grp)
 
     # =================================================================
-    # SECTION 5: COMPARISON DATA SAMPLING (for MC)
+    # SECTION 5: (Removed — comparison-data sampling is not applicable;
+    # V&V 20 MC propagates uncertainty sources only, using E_mean as a
+    # constant offset.  The mc_comparison_sampling dataclass field is
+    # retained for backward compatibility with saved JSON projects.)
     # =================================================================
     def _build_comparison_sampling_section(self):
-        grp = QGroupBox("Comparison Data Sampling (for MC)  [informational]")
-        grp.setToolTip(
-            "Note: The Monte Carlo method propagates uncertainty sources\n"
-            "only and uses the mean comparison error (\u0112) as a constant\n"
-            "offset, consistent with V&V 20. Comparison-error scatter is\n"
-            "not resampled to avoid double-counting."
-        )
-        grp.setEnabled(False)
-        layout = QVBoxLayout(grp)
-        layout.setSpacing(6)
-
-        self._bg_sampling = QButtonGroup(self)
-
-        self._rb_samp_bootstrap = QRadioButton(
-            "Bootstrap from raw data  [Recommended]"
-        )
-        self._rb_samp_bootstrap.setToolTip(
-            "Resamples with replacement from the actual comparison-error "
-            "data. Preserves the empirical distribution shape including "
-            "skewness and heavy tails. Recommended when n \u2265 10."
-        )
-        self._rb_samp_bootstrap.setChecked(True)
-        self._bg_sampling.addButton(self._rb_samp_bootstrap, 0)
-        layout.addWidget(self._rb_samp_bootstrap)
-
-        self._rb_samp_parametric = QRadioButton(
-            "Normal(\u0112, s_E) parametric"
-        )
-        self._rb_samp_parametric.setToolTip(
-            "Generates MC samples from a normal distribution with the "
-            "observed mean and standard deviation. Appropriate only when "
-            "normality of E has been confirmed."
-        )
-        self._bg_sampling.addButton(self._rb_samp_parametric, 1)
-        layout.addWidget(self._rb_samp_parametric)
-
-        # -- Guidance --
-        self._guidance_sampling = GuidancePanel("Sampling Guidance")
-        self._guidance_sampling.set_guidance(
-            "\u2022 Bootstrap (recommended): Non-parametric; preserves "
-            "actual data shape. Best when n \u2265 10.\n"
-            "\u2022 Parametric: Assumes normality. Use only if the "
-            "comparison-error distribution passes normality tests "
-            "(Shapiro\u2013Wilk p > 0.05). [GUM \u00a74.3, JCGM 101 \u00a77]",
-            'green'
-        )
-        layout.addWidget(self._guidance_sampling)
-
-        self._main_layout.addWidget(grp)
+        pass  # intentionally empty — section removed
 
     # -----------------------------------------------------------------
     # SIGNAL CONNECTIONS
@@ -4152,6 +4349,9 @@ class AnalysisSettingsTab(QWidget):
         self._spn_manual_k.valueChanged.connect(self._emit_settings_changed)
 
         # Monte Carlo
+        self._cmb_mc_sampling.currentIndexChanged.connect(
+            self._emit_settings_changed
+        )
         self._cmb_mc_trials.currentIndexChanged.connect(
             self._emit_settings_changed
         )
@@ -4160,11 +4360,6 @@ class AnalysisSettingsTab(QWidget):
 
         # Bound type
         self._bg_bound.idToggled.connect(
-            lambda *_: self._emit_settings_changed()
-        )
-
-        # Sampling
-        self._bg_sampling.idToggled.connect(
             lambda *_: self._emit_settings_changed()
         )
 
@@ -4202,6 +4397,7 @@ class AnalysisSettingsTab(QWidget):
         manual_k = self._spn_manual_k.value()
 
         # Monte Carlo
+        mc_sampling_method = self._cmb_mc_sampling.currentData()
         mc_n_trials = self._cmb_mc_trials.currentData()
         seed_val = self._spn_seed.value()
         mc_seed = seed_val if seed_val != 0 else None
@@ -4216,14 +4412,6 @@ class AnalysisSettingsTab(QWidget):
         }
         bound_type = bound_map.get(bound_id, "Both (for comparison)")
 
-        # Sampling
-        samp_id = self._bg_sampling.checkedId()
-        samp_map = {
-            0: "Bootstrap from raw data",
-            1: "Normal(Ē, s_E)",
-        }
-        mc_comparison_sampling = samp_map.get(samp_id, "Bootstrap from raw data")
-
         return AnalysisSettings(
             coverage=coverage,
             confidence=confidence,
@@ -4233,8 +4421,8 @@ class AnalysisSettingsTab(QWidget):
             mc_n_trials=mc_n_trials,
             mc_seed=mc_seed,
             mc_bootstrap=mc_bootstrap,
+            mc_sampling_method=mc_sampling_method,
             bound_type=bound_type,
-            mc_comparison_sampling=mc_comparison_sampling,
         )
 
     def set_settings(self, settings: AnalysisSettings):
@@ -4248,74 +4436,72 @@ class AnalysisSettingsTab(QWidget):
         # Block signals while bulk-loading to avoid spurious emissions
         self._loading = True
         self.blockSignals(True)
+        try:
+            # Coverage
+            for idx in range(self._cmb_coverage.count()):
+                if self._cmb_coverage.itemData(idx) == settings.coverage:
+                    self._cmb_coverage.setCurrentIndex(idx)
+                    break
 
-        # Coverage
-        for idx in range(self._cmb_coverage.count()):
-            if self._cmb_coverage.itemData(idx) == settings.coverage:
-                self._cmb_coverage.setCurrentIndex(idx)
-                break
+            # Confidence
+            for idx in range(self._cmb_confidence.count()):
+                if self._cmb_confidence.itemData(idx) == settings.confidence:
+                    self._cmb_confidence.setCurrentIndex(idx)
+                    break
 
-        # Confidence
-        for idx in range(self._cmb_confidence.count()):
-            if self._cmb_confidence.itemData(idx) == settings.confidence:
-                self._cmb_confidence.setCurrentIndex(idx)
-                break
+            # One-sided / two-sided
+            if settings.one_sided:
+                self._rb_one_sided.setChecked(True)
+            else:
+                self._rb_two_sided.setChecked(True)
 
-        # One-sided / two-sided
-        if settings.one_sided:
-            self._rb_one_sided.setChecked(True)
-        else:
-            self._rb_two_sided.setChecked(True)
+            # k-method
+            k_reverse = {
+                K_METHOD_VV20: 0,
+                K_METHOD_WS: 1,
+                K_METHOD_TOLERANCE: 2,
+                K_METHOD_MANUAL: 3,
+            }
+            btn_id = k_reverse.get(settings.k_method, 0)
+            btn = self._bg_k_method.button(btn_id)
+            if btn:
+                btn.setChecked(True)
+            self._spn_manual_k.setValue(settings.manual_k)
+            self._spn_manual_k.setEnabled(btn_id == 3)
 
-        # k-method
-        k_reverse = {
-            K_METHOD_VV20: 0,
-            K_METHOD_WS: 1,
-            K_METHOD_TOLERANCE: 2,
-            K_METHOD_MANUAL: 3,
-        }
-        btn_id = k_reverse.get(settings.k_method, 0)
-        btn = self._bg_k_method.button(btn_id)
-        if btn:
-            btn.setChecked(True)
-        self._spn_manual_k.setValue(settings.manual_k)
-        self._spn_manual_k.setEnabled(btn_id == 3)
+            # MC sampling method (backward-compat: default to Random)
+            mc_method = getattr(settings, 'mc_sampling_method',
+                                "Monte Carlo (Random)")
+            for idx in range(self._cmb_mc_sampling.count()):
+                if self._cmb_mc_sampling.itemData(idx) == mc_method:
+                    self._cmb_mc_sampling.setCurrentIndex(idx)
+                    break
 
-        # Monte Carlo trials
-        for idx in range(self._cmb_mc_trials.count()):
-            if self._cmb_mc_trials.itemData(idx) == settings.mc_n_trials:
-                self._cmb_mc_trials.setCurrentIndex(idx)
-                break
+            # Monte Carlo trials
+            for idx in range(self._cmb_mc_trials.count()):
+                if self._cmb_mc_trials.itemData(idx) == settings.mc_n_trials:
+                    self._cmb_mc_trials.setCurrentIndex(idx)
+                    break
 
-        # Seed
-        self._spn_seed.setValue(settings.mc_seed if settings.mc_seed else 0)
+            # Seed
+            self._spn_seed.setValue(settings.mc_seed if settings.mc_seed else 0)
 
-        # Bootstrap
-        self._chk_bootstrap.setChecked(settings.mc_bootstrap)
+            # Bootstrap
+            self._chk_bootstrap.setChecked(settings.mc_bootstrap)
 
-        # Bound type
-        bound_reverse = {
-            "Known uncertainties only (u_val)": 0,
-            "Total observed scatter (s_E)": 1,
-            "Both (for comparison)": 2,
-        }
-        bound_id = bound_reverse.get(settings.bound_type, 2)
-        bound_btn = self._bg_bound.button(bound_id)
-        if bound_btn:
-            bound_btn.setChecked(True)
-
-        # Sampling
-        samp_reverse = {
-            "Bootstrap from raw data": 0,
-            "Normal(\u0112, s_E)": 1,
-        }
-        samp_id = samp_reverse.get(settings.mc_comparison_sampling, 0)
-        samp_btn = self._bg_sampling.button(samp_id)
-        if samp_btn:
-            samp_btn.setChecked(True)
-
-        self.blockSignals(False)
-        self._loading = False
+            # Bound type
+            bound_reverse = {
+                "Known uncertainties only (u_val)": 0,
+                "Total observed scatter (s_E)": 1,
+                "Both (for comparison)": 2,
+            }
+            bound_id = bound_reverse.get(settings.bound_type, 2)
+            bound_btn = self._bg_bound.button(bound_id)
+            if bound_btn:
+                bound_btn.setChecked(True)
+        finally:
+            self.blockSignals(False)
+            self._loading = False
 
         audit_log.log(
             "SETTINGS_LOADED",
@@ -4742,6 +4928,8 @@ class RSSResultsTab(QWidget):
             bias_explained=bias_explained,
             source_contributions=contributions,
             computed=True,
+            _coverage=settings.coverage,
+            _one_sided=settings.one_sided,
         )
 
         # Build budget table data
@@ -5391,9 +5579,16 @@ class _MCWorkerThread(QThread):
 
     For each trial the worker draws independent samples from every enabled
     uncertainty source (using ``generate_mc_samples``) and sums them to form
-    the combined-error sample.  The comparison-data contribution is handled
-    according to the user's chosen sampling strategy (bootstrap from raw data
-    or parametric Normal).
+    the combined-error sample.  The comparison-error mean (Ē) is added as
+    a constant offset so the MC distribution is centred on the observed bias,
+    consistent with the V&V 20 validation assessment (|Ē| vs k·u_val).
+
+    Percentile bounds are computed at the coverage probability specified in
+    AnalysisSettings (not hard-coded to P5/P95).  Optional bootstrap CIs
+    quantify sampling uncertainty on those percentiles.
+
+    Uses a thread-local ``numpy.random.Generator`` for reproducibility and
+    thread safety (no global ``np.random.seed``).
 
     Signals
     -------
@@ -5424,12 +5619,12 @@ class _MCWorkerThread(QThread):
         self._sources = sources
         self._comp_data = comp_data
         self._settings = settings
-        self._abort = False
+        self._abort_event = threading.Event()
 
     # -- public helpers --------------------------------------------------
     def abort(self):
         """Request early termination (checked between chunks)."""
-        self._abort = True
+        self._abort_event.set()
 
     # -- main execution --------------------------------------------------
     def run(self):  # noqa: D401 – Qt override
@@ -5441,9 +5636,15 @@ class _MCWorkerThread(QThread):
     def _execute(self):
         settings = self._settings
         n_trials = settings.mc_n_trials
-        # Set seed for reproducibility (worker thread only)
+        # Thread-safe RNG — isolated from global numpy state
         if settings.mc_seed is not None:
-            np.random.seed(int(settings.mc_seed))
+            rng = np.random.default_rng(int(settings.mc_seed))
+        else:
+            rng = np.random.default_rng()
+
+        # Select sampling function based on user setting
+        use_lhs = getattr(settings, 'mc_sampling_method', '') == "Latin Hypercube (LHS)"
+        _sample_fn = generate_lhs_samples if use_lhs else generate_mc_samples
 
         # ----------------------------------------------------------
         # 1. Draw samples from each uncertainty source and sum them.
@@ -5452,7 +5653,7 @@ class _MCWorkerThread(QThread):
         n_sources = len(self._sources)
 
         for idx, src in enumerate(self._sources):
-            if self._abort:
+            if self._abort_event.is_set():
                 return
             sigma = src.get_standard_uncertainty()
             mean = 0.0 if src.is_centered_on_zero else src.mean_value
@@ -5461,8 +5662,9 @@ class _MCWorkerThread(QThread):
                 if src.input_type == "Tabular Data" and len(src.tabular_data) > 1
                 else None
             )
-            samples = generate_mc_samples(
+            samples = _sample_fn(
                 src.distribution, sigma, mean, n_trials, raw_data=raw_data,
+                rng=rng,
             )
             combined += samples
             pct = int(50 * (idx + 1) / max(n_sources, 1))
@@ -5488,15 +5690,36 @@ class _MCWorkerThread(QThread):
         # ----------------------------------------------------------
         # 3. Compute summary statistics.
         # ----------------------------------------------------------
-        if self._abort:
+        if self._abort_event.is_set():
             return
 
         mc = MCResults()
         mc.n_trials = n_trials
+        mc.sampling_method = getattr(settings, 'mc_sampling_method',
+                                     "Monte Carlo (Random)")
         mc.combined_mean = float(np.mean(combined))
         mc.combined_std = float(np.std(combined, ddof=1))
-        mc.pct_5 = float(np.percentile(combined, 5))
-        mc.pct_95 = float(np.percentile(combined, 95))
+
+        # Compute coverage-matched percentiles from settings
+        coverage = settings.coverage
+        one_sided = settings.one_sided
+        mc._coverage = coverage
+        mc._one_sided = one_sided
+
+        if one_sided:
+            # One-sided: lower = 1-coverage, upper = coverage
+            lower_pct = (1.0 - coverage) * 100.0
+            upper_pct = coverage * 100.0
+        else:
+            # Two-sided: symmetric central interval
+            alpha = (1.0 - coverage) / 2.0
+            lower_pct = alpha * 100.0
+            upper_pct = (1.0 - alpha) * 100.0
+
+        mc._lower_pct = lower_pct
+        mc._upper_pct = upper_pct
+        mc.pct_5 = float(np.percentile(combined, lower_pct))
+        mc.pct_95 = float(np.percentile(combined, upper_pct))
         mc.lower_bound = mc.pct_5
         mc.upper_bound = mc.pct_95
         mc.samples = combined
@@ -5505,21 +5728,25 @@ class _MCWorkerThread(QThread):
 
         # ----------------------------------------------------------
         # 4. Optional bootstrap confidence intervals on percentiles.
+        #    1000 resamples gives stable 95% CIs on tail percentiles
+        #    (JCGM 101:2008 §7.9 recommends M >= 10^4 for adaptive;
+        #    1000 is a practical compromise for interactive use).
         # ----------------------------------------------------------
         if settings.mc_bootstrap:
-            if self._abort:
+            if self._abort_event.is_set():
                 return
-            n_bootstrap = 100
+            n_bootstrap = 1000
             p5_boots = np.empty(n_bootstrap)
             p95_boots = np.empty(n_bootstrap)
             for b in range(n_bootstrap):
-                if self._abort:
+                if self._abort_event.is_set():
                     return
-                boot = np.random.choice(combined, size=n_trials, replace=True)
-                p5_boots[b] = np.percentile(boot, 5)
-                p95_boots[b] = np.percentile(boot, 95)
-                pct = 75 + int(25 * (b + 1) / n_bootstrap)
-                self.progress_updated.emit(min(pct, 99))
+                boot = rng.choice(combined, size=n_trials, replace=True)
+                p5_boots[b] = np.percentile(boot, lower_pct)
+                p95_boots[b] = np.percentile(boot, upper_pct)
+                if b % 50 == 0:  # update progress every 50 resamples
+                    pct = 75 + int(25 * (b + 1) / n_bootstrap)
+                    self.progress_updated.emit(min(pct, 99))
 
             mc.bootstrap_ci_low = float(np.percentile(p5_boots, 2.5))
             mc.bootstrap_ci_high = float(np.percentile(p95_boots, 97.5))
@@ -5590,8 +5817,12 @@ class MonteCarloResultsTab(QWidget):
         self._btn_run.setEnabled(False)
         self._results_text.clear()
 
-        enabled = [s for s in sources if s.enabled]
-        self._worker = _MCWorkerThread(enabled, comp_data, settings, parent=self)
+        # Deep-copy inputs so the worker thread is isolated from GUI edits
+        enabled = [copy.deepcopy(s) for s in sources if s.enabled]
+        self._worker = _MCWorkerThread(
+            enabled, copy.deepcopy(comp_data), copy.deepcopy(settings),
+            parent=self,
+        )
         self._worker.progress_updated.connect(self._on_progress)
         self._worker.finished_result.connect(self._on_finished)
         self._worker.error_occurred.connect(self._on_error)
@@ -5610,6 +5841,8 @@ class MonteCarloResultsTab(QWidget):
         self._progress_bar.setVisible(False)
         self._fig.clear()
         self._canvas.draw_idle()
+        if hasattr(self, '_guidance_mc_convergence'):
+            self._guidance_mc_convergence.set_guidance("", "green")
         if hasattr(self, '_guidance_mc_vs_rss'):
             self._guidance_mc_vs_rss.set_guidance("", "green")
 
@@ -5747,6 +5980,10 @@ class MonteCarloResultsTab(QWidget):
 
     # -- Guidance panels (interpretation) ----------------------------
     def _build_guidance_panels(self):
+        self._guidance_mc_convergence = GuidancePanel(
+            "MC Convergence Check", parent=self,
+        )
+        self._left_layout.addWidget(self._guidance_mc_convergence)
         self._guidance_mc_vs_rss = GuidancePanel(
             "MC vs RSS Comparison", parent=self,
         )
@@ -5791,10 +6028,13 @@ class MonteCarloResultsTab(QWidget):
         self._progress_bar.setValue(100)
         self._progress_bar.setVisible(False)
         self._btn_run.setEnabled(True)
+        method_abbr = ("LHS" if getattr(mc_results, 'sampling_method', '')
+                       == "Latin Hypercube (LHS)" else "MC")
         self._status_label.setText(
-            f"Complete ({mc_results.n_trials:,} trials)"
+            f"Complete — {method_abbr} ({mc_results.n_trials:,} trials)"
         )
         self._populate_results_text(mc_results)
+        self._check_convergence(mc_results)
         self._update_guidance(mc_results)
         self._update_plots(mc_results)
         self.mc_finished.emit()
@@ -5811,30 +6051,31 @@ class MonteCarloResultsTab(QWidget):
     # =================================================================
     def _populate_results_text(self, mc: MCResults):
         """Fill the text panel with a formatted summary."""
-        unit = "unit"
-        if self._rss_results is not None and hasattr(self._rss_results, 'source_contributions'):
-            # Attempt to infer unit from RSS results or fall back
-            pass
-        # Infer unit from the stored results' parent context if available.
-        # In practice the main window will set this before calling run_mc.
         unit_str = getattr(self, '_display_unit', 'unit')
 
         lines = []
+        method_name = getattr(mc, 'sampling_method', 'Monte Carlo (Random)')
         lines.append(
-            f"Monte Carlo Results (N = {mc.n_trials:,} trials):\n"
+            f"{method_name} Results (N = {mc.n_trials:,} trials):\n"
         )
+        lo_pct = mc._lower_pct
+        hi_pct = mc._upper_pct
+        cov = mc._coverage
+        sided = "one-sided" if mc._one_sided else "two-sided"
+        cov_label = f"{cov*100:.0f}% {sided}"
+
         lines.append("Combined Error Distribution:")
         lines.append(f"  Mean           = {mc.combined_mean:+.4f} [{unit_str}]")
         lines.append(f"  Std Dev        = {mc.combined_std:.4f} [{unit_str}]")
-        lines.append(f"  5th Percentile = {mc.pct_5:+.4f} [{unit_str}]")
-        lines.append(f"  95th Percentile= {mc.pct_95:+.4f} [{unit_str}]")
+        lines.append(f"  P{lo_pct:.4g}       = {mc.pct_5:+.4f} [{unit_str}]")
+        lines.append(f"  P{hi_pct:.4g}      = {mc.pct_95:+.4f} [{unit_str}]")
         lines.append("")
-        lines.append("Prediction Bounds:")
+        lines.append(f"Prediction Bounds ({cov_label}):")
         lines.append(
-            f"  Lower bound (5th percentile)  = {mc.lower_bound:+.4f} [{unit_str}]"
+            f"  Lower bound (P{lo_pct:.4g})  = {mc.lower_bound:+.4f} [{unit_str}]"
         )
         lines.append(
-            f"  Upper bound (95th percentile) = {mc.upper_bound:+.4f} [{unit_str}]"
+            f"  Upper bound (P{hi_pct:.4g}) = {mc.upper_bound:+.4f} [{unit_str}]"
         )
 
         # Bootstrap confidence intervals on percentile estimates
@@ -5851,13 +6092,13 @@ class MonteCarloResultsTab(QWidget):
             p95_ci_hi = float(np.percentile(p95_boots, 97.5))
 
             lines.append("")
-            lines.append("Bootstrap Confidence on Percentiles (100 repeats):")
+            lines.append("Bootstrap Confidence on Percentiles (1000 resamples):")
             lines.append(
-                f"  5th percentile:  {p5_mean:+.4f} \u00b1 {p5_std:.4f}"
+                f"  P{lo_pct:.4g}:  {p5_mean:+.4f} \u00b1 {p5_std:.4f}"
                 f"  (95% CI: [{p5_ci_lo:+.4f}, {p5_ci_hi:+.4f}])"
             )
             lines.append(
-                f"  95th percentile: {p95_mean:+.4f} \u00b1 {p95_std:.4f}"
+                f"  P{hi_pct:.4g}: {p95_mean:+.4f} \u00b1 {p95_std:.4f}"
                 f"  (95% CI: [{p95_ci_lo:+.4f}, {p95_ci_hi:+.4f}])"
             )
 
@@ -5866,9 +6107,91 @@ class MonteCarloResultsTab(QWidget):
     # =================================================================
     # GUIDANCE / INTERPRETATION
     # =================================================================
+    def _check_convergence(self, mc: MCResults):
+        """
+        Estimate the sampling uncertainty of the MC percentile estimates
+        and warn if convergence is insufficient.
+
+        Uses the bootstrap CIs when available; otherwise falls back to an
+        analytical approximation for the standard error of a percentile
+        (SE = sqrt(q(1-q) / (n * f(x_q)^2))).
+
+        Ref: JCGM 101:2008 §7.9 — adaptive MC procedure.
+        """
+        if mc.samples.size == 0:
+            self._guidance_mc_convergence.set_guidance(
+                "No MC samples available.", "green")
+            return
+
+        n = mc.n_trials
+        samples = mc.samples
+
+        # Coverage-matched quantile fractions
+        lo_q = getattr(mc, '_lower_pct', 5.0) / 100.0   # e.g. 0.05
+        hi_q = getattr(mc, '_upper_pct', 95.0) / 100.0   # e.g. 0.95
+        lo_label = f"P{mc._lower_pct:.4g}" if hasattr(mc, '_lower_pct') else "P5"
+        hi_label = f"P{mc._upper_pct:.4g}" if hasattr(mc, '_upper_pct') else "P95"
+
+        # Estimate SE of the percentiles via analytical formula
+        # SE(P_q) ≈ sqrt(q*(1-q) / n) / f(x_q)  where f is the kernel density
+        # at the percentile.  We use a simple bandwidth estimator.
+        from scipy.stats import gaussian_kde
+        try:
+            kde = gaussian_kde(samples)
+            f_p5 = float(kde.evaluate([mc.pct_5])[0])
+            f_p95 = float(kde.evaluate([mc.pct_95])[0])
+        except Exception:
+            f_p5 = f_p95 = 0.0
+
+        se_p5 = np.sqrt(lo_q * (1 - lo_q) / n) / max(f_p5, 1e-15)
+        se_p95 = np.sqrt(hi_q * (1 - hi_q) / n) / max(f_p95, 1e-15)
+
+        # Relative SE as fraction of the interval width
+        interval_width = abs(mc.pct_95 - mc.pct_5)
+        if interval_width > 1e-15:
+            rel_se_p5 = se_p5 / interval_width
+            rel_se_p95 = se_p95 / interval_width
+            max_rel_se = max(rel_se_p5, rel_se_p95)
+        else:
+            max_rel_se = 0.0
+
+        # Threshold: 1% of interval width ≈ 2 significant digits
+        if max_rel_se > 0.02:
+            severity = "red"
+            msg = (
+                f"\u26a0 MC percentile estimates may not be converged.\n"
+                f"SE({lo_label}) \u2248 {se_p5:.4g}, SE({hi_label}) \u2248 {se_p95:.4g}  "
+                f"(max relative SE = {max_rel_se:.1%} of interval width).\n\n"
+                f"Consider increasing the number of MC trials for stable "
+                f"results. [JCGM 101:2008 \u00a77.9]"
+            )
+        elif max_rel_se > 0.01:
+            severity = "yellow"
+            msg = (
+                f"MC convergence is marginal.\n"
+                f"SE({lo_label}) \u2248 {se_p5:.4g}, SE({hi_label}) \u2248 {se_p95:.4g}  "
+                f"(max relative SE = {max_rel_se:.1%} of interval width).\n\n"
+                f"Results are usable but increasing trials would improve "
+                f"precision. [JCGM 101:2008 \u00a77.9]"
+            )
+        else:
+            severity = "green"
+            msg = (
+                f"MC percentile estimates are well converged.\n"
+                f"SE({lo_label}) \u2248 {se_p5:.4g}, SE({hi_label}) \u2248 {se_p95:.4g}  "
+                f"(max relative SE = {max_rel_se:.1%} of interval width).\n"
+                f"[JCGM 101:2008 \u00a77.9]"
+            )
+
+        self._guidance_mc_convergence.set_guidance(msg, severity)
+
     def _update_guidance(self, mc: MCResults):
         """
         Compare MC bounds against RSS bounds and set guidance severity.
+
+        Both intervals are computed at the *same* coverage probability so the
+        comparison is apples-to-apples.  The coverage comes from the RSS
+        settings (e.g. 95% one-sided → P95, or 95% two-sided → P2.5/P97.5).
 
         Lighter-tailed (platykurtic / uniform) sources tend to produce
         a tighter MC bound, while heavier-tailed or skewed sources
@@ -5883,10 +6206,36 @@ class MonteCarloResultsTab(QWidget):
             )
             return
 
-        # RSS prediction interval half-width (using u_val based bounds)
-        rss_half = rss.k_factor * rss.u_val
-        # MC half-width from percentiles
-        mc_half = (mc.pct_95 - mc.pct_5) / 2.0
+        # Determine the coverage probability used by the RSS k-factor
+        # so we can extract the matching MC percentiles.
+        coverage = getattr(rss, '_coverage', 0.95)
+        one_sided = getattr(rss, '_one_sided', True)
+
+        samples = mc.samples
+        if samples.size == 0:
+            self._guidance_mc_vs_rss.set_guidance(
+                "No MC samples available.", "green")
+            return
+
+        mc_center = mc.combined_mean
+
+        if one_sided:
+            # One-sided: RSS upper bound = E_mean + k*u_val
+            # Compare with MC upper percentile at same coverage
+            rss_upper = rss.E_mean + rss.k_factor * rss.u_val
+            mc_upper = float(np.percentile(samples, coverage * 100))
+            rss_half = rss_upper - rss.E_mean
+            mc_half = mc_upper - mc_center
+            cov_label = f"{coverage*100:.0f}% one-sided"
+        else:
+            # Two-sided: RSS = E_mean ± k*u_val
+            # Compare with MC symmetric percentile at same coverage
+            alpha = (1 - coverage) / 2.0
+            mc_lo = float(np.percentile(samples, alpha * 100))
+            mc_hi = float(np.percentile(samples, (1 - alpha) * 100))
+            rss_half = rss.k_factor * rss.u_val
+            mc_half = (mc_hi - mc_lo) / 2.0
+            cov_label = f"{coverage*100:.0f}% two-sided"
 
         if mc_half < 1e-12 and rss_half < 1e-12:
             self._guidance_mc_vs_rss.set_guidance(
@@ -5895,13 +6244,12 @@ class MonteCarloResultsTab(QWidget):
             )
             return
 
-        ratio = mc_half / max(rss_half, 1e-12)
+        ratio = mc_half / max(abs(rss_half), 1e-12)
 
         if ratio < 0.95:
-            # MC tighter
             severity = "green"
             msg = (
-                f"Monte Carlo 90% interval half-width ({mc_half:.4g}) is "
+                f"Monte Carlo {cov_label} half-width ({mc_half:.4g}) is "
                 f"tighter than the RSS bound ({rss_half:.4g}).\n"
                 f"Ratio MC/RSS = {ratio:.3f}.\n\n"
                 "This is typical when the dominant uncertainty source has "
@@ -5909,10 +6257,9 @@ class MonteCarloResultsTab(QWidget):
                 "uniform).  The RSS normal assumption is conservative here."
             )
         elif ratio > 1.05:
-            # MC wider
             severity = "yellow"
             msg = (
-                f"Monte Carlo 90% interval half-width ({mc_half:.4g}) is "
+                f"Monte Carlo {cov_label} half-width ({mc_half:.4g}) is "
                 f"wider than the RSS bound ({rss_half:.4g}).\n"
                 f"Ratio MC/RSS = {ratio:.3f}.\n\n"
                 "This may indicate heavier tails (leptokurtic), skewness, "
@@ -5923,7 +6270,7 @@ class MonteCarloResultsTab(QWidget):
         else:
             severity = "green"
             msg = (
-                f"Monte Carlo 90% interval half-width ({mc_half:.4g}) is "
+                f"Monte Carlo {cov_label} half-width ({mc_half:.4g}) is "
                 f"consistent with the RSS bound ({rss_half:.4g}).\n"
                 f"Ratio MC/RSS = {ratio:.3f}.\n\n"
                 "The RSS normal-assumption adequately represents the "
@@ -5991,16 +6338,18 @@ class MonteCarloResultsTab(QWidget):
                 label=f"RSS Normal (\u03c3=u_val={rss.u_val:.3g})",
             )
 
-        # Percentile lines
+        # Percentile lines — use coverage-matched labels
+        lo_pct = getattr(mc, '_lower_pct', 5.0)
+        hi_pct = getattr(mc, '_upper_pct', 95.0)
         ax.axvline(
             mc.pct_5, color=DARK_COLORS['orange'], linewidth=1.2,
             linestyle='-.', alpha=0.9,
-            label=f"P5 = {mc.pct_5:+.4g}",
+            label=f"P{lo_pct:.4g} = {mc.pct_5:+.4g}",
         )
         ax.axvline(
             mc.pct_95, color=DARK_COLORS['red'], linewidth=1.2,
             linestyle='-.', alpha=0.9,
-            label=f"P95 = {mc.pct_95:+.4g}",
+            label=f"P{hi_pct:.4g} = {mc.pct_95:+.4g}",
         )
         # Mean line
         ax.axvline(
@@ -6042,14 +6391,18 @@ class MonteCarloResultsTab(QWidget):
             label="Empirical CDF",
         )
 
-        # Horizontal lines at coverage percentiles
+        # Horizontal lines at coverage-matched percentile levels
+        lo_frac = getattr(mc, '_lower_pct', 5.0) / 100.0
+        hi_frac = getattr(mc, '_upper_pct', 95.0) / 100.0
+        lo_cdf_label = f"{mc._lower_pct:.4g}%" if hasattr(mc, '_lower_pct') else "5%"
+        hi_cdf_label = f"{mc._upper_pct:.4g}%" if hasattr(mc, '_upper_pct') else "95%"
         ax.axhline(
-            0.05, color=DARK_COLORS['orange'], linewidth=1.0,
-            linestyle=':', alpha=0.8, label="5% level",
+            lo_frac, color=DARK_COLORS['orange'], linewidth=1.0,
+            linestyle=':', alpha=0.8, label=f"{lo_cdf_label} level",
         )
         ax.axhline(
-            0.95, color=DARK_COLORS['red'], linewidth=1.0,
-            linestyle=':', alpha=0.8, label="95% level",
+            hi_frac, color=DARK_COLORS['red'], linewidth=1.0,
+            linestyle=':', alpha=0.8, label=f"{hi_cdf_label} level",
         )
 
         # Vertical drop lines from percentile values
@@ -6100,19 +6453,21 @@ class MonteCarloResultsTab(QWidget):
         p5_running = np.empty(len(eval_points))
         p95_running = np.empty(len(eval_points))
 
+        lo_pct = getattr(mc, '_lower_pct', 5.0)
+        hi_pct = getattr(mc, '_upper_pct', 95.0)
         for i, k in enumerate(eval_points):
-            p5_running[i] = np.percentile(samples[:k], 5)
-            p95_running[i] = np.percentile(samples[:k], 95)
+            p5_running[i] = np.percentile(samples[:k], lo_pct)
+            p95_running[i] = np.percentile(samples[:k], hi_pct)
 
         ax.plot(
             eval_points, p5_running,
             color=DARK_COLORS['orange'], linewidth=1.2,
-            label="Running P5",
+            label=f"Running P{lo_pct:.4g}",
         )
         ax.plot(
             eval_points, p95_running,
             color=DARK_COLORS['red'], linewidth=1.2,
-            label="Running P95",
+            label=f"Running P{hi_pct:.4g}",
         )
 
         # Final converged values as horizontal reference
@@ -6175,9 +6530,11 @@ class ComparisonRollUpTab(QWidget):
     _ROW_LABELS = [
         "Combined \u03c3 or equivalent",
         "k-factor used",
+        "Expanded uncertainty (U_val = k\u00d7\u03c3)",
         "Lower bound (underprediction)",
         "Upper bound (overprediction)",
         "Mean comparison error (\u0112)",
+        "|\u0112| \u2264 U_val ?  (Validated?)",
         "Includes model form error?",
         "Distribution assumption",
         "Reference standard",
@@ -6260,6 +6617,14 @@ class ComparisonRollUpTab(QWidget):
                 row.append(item.text() if item else "")
             data.append(row)
         return data
+
+    def get_rollup_header_labels(self) -> list:
+        """Return the current column header labels from the rollup table."""
+        headers = []
+        for c in range(self._table.columnCount()):
+            item = self._table.horizontalHeaderItem(c)
+            headers.append(item.text() if item else f"Col {c}")
+        return headers
 
     # =================================================================
     # UI CONSTRUCTION
@@ -6444,44 +6809,92 @@ class ComparisonRollUpTab(QWidget):
                 item.setForeground(QColor(color))
             self._table.setItem(row, col, item)
 
+        # Row indices:
+        #  0  Combined σ or equivalent
+        #  1  k-factor used
+        #  2  Expanded uncertainty (U_val = k×σ)
+        #  3  Lower bound (underprediction)
+        #  4  Upper bound (overprediction)
+        #  5  Mean comparison error (Ē)
+        #  6  |Ē| ≤ U_val ?  (Validated?)
+        #  7  Includes model form error?
+        #  8  Distribution assumption
+        #  9  Reference standard
+
         # ---------- RSS (u_val) column  — col 1 -----------------------
         if rss is not None and rss.computed:
             _set(0, 1, f"{rss.u_val:.4f}")
             _set(1, 1, f"{rss.k_factor:.3f}")
-            _set(2, 1, f"{rss.lower_bound_uval:.4f}")
-            _set(3, 1, f"{rss.upper_bound_uval:.4f}")
-            _set(4, 1, f"{rss.E_mean:.4f}")
-            _set(5, 1, "No")
-            _set(6, 1, "Normal")
-            _set(7, 1, "ASME V&V 20-2009")
+            _set(2, 1, f"{rss.U_val:.4f}")
+            _set(3, 1, f"{rss.lower_bound_uval:.4f}")
+            _set(4, 1, f"{rss.upper_bound_uval:.4f}")
+            _set(5, 1, f"{rss.E_mean:.4f}")
+            # Validation verdict
+            if rss.U_val > 0:
+                ratio = abs(rss.E_mean) / rss.U_val
+                if ratio <= 1.0:
+                    _set(6, 1, f"YES ({ratio:.3f} \u2264 1.0)",
+                         DARK_COLORS.get('green', '#66bb6a'))
+                else:
+                    _set(6, 1, f"NO ({ratio:.3f} > 1.0)",
+                         DARK_COLORS.get('red', '#ef5350'))
+            else:
+                _set(6, 1, "\u2014")
+            _set(7, 1, "No")
+            _set(8, 1, "Normal")
+            _set(9, 1, "ASME V&V 20-2009")
         else:
             for r in range(self._N_ROWS):
                 _set(r, 1, "\u2014")
 
         # ---------- RSS (s_E) column  — col 2 -------------------------
         if rss is not None and rss.computed:
+            U_sE = rss.k_factor * rss.s_E
             _set(0, 2, f"{rss.s_E:.4f}")
             _set(1, 2, f"{rss.k_factor:.3f}")
-            _set(2, 2, f"{rss.lower_bound_sE:.4f}")
-            _set(3, 2, f"{rss.upper_bound_sE:.4f}")
-            _set(4, 2, f"{rss.E_mean:.4f}")
-            _set(5, 2, "Yes")
-            _set(6, 2, "Normal")
-            _set(7, 2, "ASME V&V 20-2009")
+            _set(2, 2, f"{U_sE:.4f}")
+            _set(3, 2, f"{rss.lower_bound_sE:.4f}")
+            _set(4, 2, f"{rss.upper_bound_sE:.4f}")
+            _set(5, 2, f"{rss.E_mean:.4f}")
+            if U_sE > 0:
+                ratio_sE = abs(rss.E_mean) / U_sE
+                if ratio_sE <= 1.0:
+                    _set(6, 2, f"YES ({ratio_sE:.3f} \u2264 1.0)",
+                         DARK_COLORS.get('green', '#66bb6a'))
+                else:
+                    _set(6, 2, f"NO ({ratio_sE:.3f} > 1.0)",
+                         DARK_COLORS.get('red', '#ef5350'))
+            else:
+                _set(6, 2, "\u2014")
+            _set(7, 2, "Yes")
+            _set(8, 2, "Normal")
+            _set(9, 2, "ASME V&V 20-2009")
         else:
             for r in range(self._N_ROWS):
                 _set(r, 2, "\u2014")
 
         # ---------- Monte Carlo column  — col 3 -----------------------
         if mc is not None and mc.computed:
+            mc_half = (mc.pct_95 - mc.pct_5) / 2.0
+            lo_lbl = f"P{mc._lower_pct:.4g}" if hasattr(mc, '_lower_pct') else "P5"
+            hi_lbl = f"P{mc._upper_pct:.4g}" if hasattr(mc, '_upper_pct') else "P95"
             _set(0, 3, f"{mc.combined_std:.4f}")
             _set(1, 3, "N/A (distribution-free)")
-            _set(2, 3, f"{mc.lower_bound:.4f}")
-            _set(3, 3, f"{mc.upper_bound:.4f}")
-            _set(4, 3, f"{mc.combined_mean:.4f}")
-            _set(5, 3, "Depends")
-            _set(6, 3, "Actual")
-            _set(7, 3, "JCGM 101:2008")
+            _set(2, 3, f"\u00b1{mc_half:.4f} ({lo_lbl}\u2013{hi_lbl})")
+            _set(3, 3, f"{mc.lower_bound:.4f}")
+            _set(4, 3, f"{mc.upper_bound:.4f}")
+            _set(5, 3, f"{mc.combined_mean:.4f}")
+            # MC validation: is Ē within the MC prediction interval?
+            E_mean = mc.combined_mean
+            if mc.lower_bound <= 0 <= mc.upper_bound:
+                _set(6, 3, f"YES (\u0112 within {lo_lbl}\u2013{hi_lbl})",
+                     DARK_COLORS.get('green', '#66bb6a'))
+            else:
+                _set(6, 3, f"NO (\u0112 outside {lo_lbl}\u2013{hi_lbl})",
+                     DARK_COLORS.get('red', '#ef5350'))
+            _set(7, 3, "Depends on sources")
+            _set(8, 3, "Actual (sampled)")
+            _set(9, 3, "JCGM 101:2008")
         else:
             for r in range(self._N_ROWS):
                 _set(r, 3, "\u2014")
@@ -6494,16 +6907,18 @@ class ComparisonRollUpTab(QWidget):
             flat = comp.flat_data()
             _set(0, 4, f"{emp_std:.4f}")
             _set(1, 4, "N/A (empirical)")
+            _set(2, 4, "N/A")
             if flat.size > 0:
-                _set(2, 4, f"{float(np.min(flat)):.4f}")
-                _set(3, 4, f"{float(np.max(flat)):.4f}")
+                _set(3, 4, f"{float(np.min(flat)):.4f}")
+                _set(4, 4, f"{float(np.max(flat)):.4f}")
             else:
-                _set(2, 4, "\u2014")
                 _set(3, 4, "\u2014")
-            _set(4, 4, f"{emp_mean:.4f}")
-            _set(5, 4, "Yes")
-            _set(6, 4, "None")
-            _set(7, 4, f"n = {n} data points")
+                _set(4, 4, "\u2014")
+            _set(5, 4, f"{emp_mean:.4f}")
+            _set(6, 4, "N/A")
+            _set(7, 4, "Yes (all sources)")
+            _set(8, 4, "None (raw data)")
+            _set(9, 4, f"n = {n} data points")
         else:
             for r in range(self._N_ROWS):
                 _set(r, 4, "\u2014")
@@ -6618,31 +7033,153 @@ class ComparisonRollUpTab(QWidget):
             lines.append("4. DATA QUALITY CONCERNS: None identified.")
             lines.append("")
 
-        # --- Certification-relevant language ----------------------------
-        lines.append("5. CERTIFICATION STATEMENT:")
+        # --- Expanded Certification Statement ----------------------------
+        lines.append("=" * 60)
+        lines.append("  VALIDATION CERTIFICATION STATEMENT")
+        lines.append("=" * 60)
+        lines.append("")
+
+        sided_label = "one-sided" if settings.one_sided else "two-sided"
+        cov_pct = f"{settings.coverage*100:.0f}%"
+        conf_pct = f"{settings.confidence*100:.0f}%"
+        unit = settings.global_unit
+
+        # --- 5a. RSS Validation Assessment (ASME V&V 20) ---
+        lines.append("5a. RSS VALIDATION ASSESSMENT (ASME V&V 20):")
         if rss is not None and rss.computed and rss.U_val > 0:
             ratio = abs(rss.E_mean) / rss.U_val
-            if ratio < 1.0:
-                lines.append(
-                    f"   Based on ASME V&V 20 methodology, the computational model "
-                    f"has been validated for the tested conditions with a "
-                    f"{settings.coverage*100:.0f}% coverage / "
-                    f"{settings.confidence*100:.0f}% confidence validation "
-                    f"uncertainty of U_val = {rss.U_val:.4f}. The comparison "
-                    f"error magnitude (|\u0112| = {abs(rss.E_mean):.4f}) is within "
-                    f"the validation uncertainty band."
-                )
+            lines.append(f"    Method:           Root-Sum-Square (RSS) per ASME V&V 20-2009 (R2016)")
+            lines.append(f"    Coverage:         {cov_pct} / {conf_pct} ({sided_label})")
+            lines.append(f"    k-factor:         {rss.k_factor:.4f}  (method: {rss.k_method_used})")
+            lines.append(f"    u_val:            {rss.u_val:.4f} [{unit}]  (combined standard uncertainty)")
+            lines.append(f"    U_val:            {rss.U_val:.4f} [{unit}]  (expanded uncertainty = k \u00d7 u_val)")
+            lines.append(f"    |\u0112|:              {abs(rss.E_mean):.4f} [{unit}]  (mean comparison error magnitude)")
+            lines.append(f"    |\u0112| / U_val:      {ratio:.4f}")
+            lines.append(f"    Prediction band:  [{rss.lower_bound_uval:+.4f}, {rss.upper_bound_uval:+.4f}] [{unit}]")
+            if ratio <= 1.0:
+                lines.append(f"")
+                lines.append(f"    \u2713 VALIDATED: The mean comparison error (|\u0112| = {abs(rss.E_mean):.4f}) is")
+                lines.append(f"      within the expanded validation uncertainty (U_val = {rss.U_val:.4f}).")
+                lines.append(f"      The model is validated at {cov_pct} coverage / {conf_pct} confidence")
+                lines.append(f"      for the tested conditions per ASME V&V 20 \u00a76, Eq. (1).")
             else:
-                lines.append(
-                    f"   Based on ASME V&V 20 methodology, the comparison error "
-                    f"(|\u0112| = {abs(rss.E_mean):.4f}) exceeds the validation "
-                    f"uncertainty (U_val = {rss.U_val:.4f}). The model is NOT "
-                    f"validated at the {settings.coverage*100:.0f}% / "
-                    f"{settings.confidence*100:.0f}% level. Additional model "
-                    f"improvements or uncertainty reductions are recommended."
-                )
+                lines.append(f"")
+                lines.append(f"    \u2717 NOT VALIDATED: The mean comparison error (|\u0112| = {abs(rss.E_mean):.4f})")
+                lines.append(f"      exceeds the expanded validation uncertainty (U_val = {rss.U_val:.4f}).")
+                lines.append(f"      A statistically significant model bias exists that is not")
+                lines.append(f"      explained by the identified uncertainty sources.")
+                lines.append(f"      Recommendation: investigate systematic errors in boundary")
+                lines.append(f"      conditions, grid convergence, or turbulence modelling, or")
+                lines.append(f"      identify additional uncertainty sources.")
         else:
-            lines.append("   Insufficient results to generate a certification statement.")
+            lines.append("    RSS analysis not available or U_val = 0.")
+        lines.append("")
+
+        # --- 5b. Monte Carlo Validation Assessment (JCGM 101) ---
+        lines.append("5b. MONTE CARLO VALIDATION ASSESSMENT (JCGM 101:2008):")
+        if mc is not None and mc.computed:
+            mc_half = (mc.pct_95 - mc.pct_5) / 2.0
+            mc_lo_lbl = f"P{mc._lower_pct:.4g}" if hasattr(mc, '_lower_pct') else "P5"
+            mc_hi_lbl = f"P{mc._upper_pct:.4g}" if hasattr(mc, '_upper_pct') else "P95"
+            mc_cov_pct = f"{mc._coverage*100:.0f}%" if hasattr(mc, '_coverage') else cov_pct
+            mc_sided = "one-sided" if getattr(mc, '_one_sided', True) else "two-sided"
+            mc_interval_label = f"{mc_cov_pct} {mc_sided}"
+            mc_method_name = getattr(mc, 'sampling_method', 'Monte Carlo (Random)')
+            if "LHS" in mc_method_name:
+                method_line = ("Monte Carlo propagation (Latin Hypercube "
+                               "sampling) per JCGM 101:2008 §6.4")
+            else:
+                method_line = "Monte Carlo propagation (random sampling) per JCGM 101:2008"
+            lines.append(f"    Method:           {method_line}")
+            lines.append(f"    Trials:           {mc.n_trials:,}")
+            lines.append(f"    Coverage:         {mc_interval_label}")
+            lines.append(f"    Combined \u03c3:       {mc.combined_std:.4f} [{unit}]")
+            lines.append(f"    {mc_lo_lbl} (lower bound): {mc.pct_5:+.4f} [{unit}]")
+            lines.append(f"    {mc_hi_lbl} (upper bound): {mc.pct_95:+.4f} [{unit}]")
+            lines.append(f"    Interval half-width: \u00b1{mc_half:.4f} [{unit}]  ({mc_interval_label})")
+            lines.append(f"    \u0112 (MC mean):      {mc.combined_mean:+.4f} [{unit}]")
+            if hasattr(mc, '_p5_boots') and hasattr(mc, '_p95_boots'):
+                p5_ci = (float(np.percentile(mc._p5_boots, 2.5)),
+                         float(np.percentile(mc._p5_boots, 97.5)))
+                p95_ci = (float(np.percentile(mc._p95_boots, 2.5)),
+                          float(np.percentile(mc._p95_boots, 97.5)))
+                lines.append(f"    Bootstrap 95% CI on {mc_lo_lbl}:  [{p5_ci[0]:+.4f}, {p5_ci[1]:+.4f}] [{unit}]")
+                lines.append(f"    Bootstrap 95% CI on {mc_hi_lbl}: [{p95_ci[0]:+.4f}, {p95_ci[1]:+.4f}] [{unit}]")
+            lines.append(f"")
+            # MC validation: the prediction interval should contain zero
+            # (zero = no prediction error) if the model is validated
+            if mc.pct_5 <= 0 <= mc.pct_95:
+                lines.append(f"    \u2713 VALIDATED: Zero (no prediction error) falls within the")
+                lines.append(f"      Monte Carlo {mc_interval_label} prediction interval [{mc.pct_5:+.4f}, {mc.pct_95:+.4f}].")
+                lines.append(f"      The model prediction uncertainty, propagated from actual source")
+                lines.append(f"      distributions without assuming normality, encompasses the")
+                lines.append(f"      observed comparison errors.")
+            else:
+                lines.append(f"    \u2717 NOT VALIDATED: Zero falls outside the Monte Carlo")
+                lines.append(f"      {mc_interval_label} prediction interval [{mc.pct_5:+.4f}, {mc.pct_95:+.4f}].")
+                lines.append(f"      The model exhibits a systematic bias that exceeds the")
+                lines.append(f"      propagated uncertainty from the identified sources.")
+        else:
+            lines.append("    Monte Carlo analysis not available.")
+        lines.append("")
+
+        # --- 5c. MC vs RSS Agreement ---
+        lines.append("5c. MC vs RSS AGREEMENT:")
+        if (rss is not None and rss.computed and rss.U_val > 0
+                and mc is not None and mc.computed):
+            mc_half = (mc.pct_95 - mc.pct_5) / 2.0
+            rss_half = rss.k_factor * rss.u_val
+            if rss_half > 1e-12:
+                mc_rss_ratio = mc_half / rss_half
+                mc_cov_label = mc_interval_label if (mc is not None and mc.computed and hasattr(mc, '_coverage')) else f"{cov_pct} {sided_label}"
+                lines.append(f"    MC {mc_cov_label} half-width / RSS half-width = {mc_rss_ratio:.3f}")
+                if abs(mc_rss_ratio - 1.0) < 0.05:
+                    lines.append(f"    The RSS normal assumption adequately represents the combined")
+                    lines.append(f"    uncertainty.  Both methods produce consistent bounds.")
+                elif mc_rss_ratio > 1.05:
+                    lines.append(f"    The MC interval is wider than RSS, indicating the source")
+                    lines.append(f"    distributions have heavier tails or skewness than Normal.")
+                    lines.append(f"    The MC bounds are recommended for conservative reporting.")
+                else:
+                    lines.append(f"    The MC interval is tighter than RSS, indicating the source")
+                    lines.append(f"    distributions have lighter tails than Normal (e.g., Uniform).")
+                    lines.append(f"    The RSS bounds are conservative.")
+        else:
+            lines.append("    Both RSS and MC results required for comparison.")
+        lines.append("")
+
+        # --- 5d. Recommended Accuracy Statement for Report ---
+        lines.append("5d. RECOMMENDED CFD ACCURACY STATEMENT:")
+        lines.append("    (Copy/adapt the following for the VVUQ report conclusion)")
+        lines.append("")
+        if rss is not None and rss.computed and rss.U_val > 0:
+            ratio = abs(rss.E_mean) / rss.U_val
+            validated = ratio <= 1.0
+            lines.append(f'    "The CFD model has been assessed per ASME V&V 20-2009 (R2016)')
+            lines.append(f'     using {len([s for s in (sources or []) if s.enabled])} identified uncertainty sources.')
+            if mc is not None and mc.computed:
+                mc_lo_s = f"P{mc._lower_pct:.4g}" if hasattr(mc, '_lower_pct') else "P5"
+                mc_hi_s = f"P{mc._upper_pct:.4g}" if hasattr(mc, '_upper_pct') else "P95"
+                mc_cov_s = f"{mc._coverage*100:.0f}%" if hasattr(mc, '_coverage') else cov_pct
+                mc_side_s = "one-sided" if getattr(mc, '_one_sided', True) else "two-sided"
+                lines.append(f'     RSS expanded uncertainty:  U_val = \u00b1{rss.U_val:.4f} [{unit}]')
+                lines.append(f'       ({cov_pct} coverage / {conf_pct} confidence, {sided_label})')
+                lines.append(f'     MC prediction interval:   [{mc.pct_5:+.4f}, {mc.pct_95:+.4f}] [{unit}]')
+                lines.append(f'       ({mc.n_trials:,} trials, {mc_cov_s} {mc_side_s}, JCGM 101:2008)')
+                if hasattr(mc, '_p5_boots') and hasattr(mc, '_p95_boots'):
+                    lines.append(f'     MC bootstrap 95% CI:      {mc_lo_s} \u2208 [{float(np.percentile(mc._p5_boots, 2.5)):+.4f}, {float(np.percentile(mc._p5_boots, 97.5)):+.4f}]')
+                    lines.append(f'                                {mc_hi_s} \u2208 [{float(np.percentile(mc._p95_boots, 2.5)):+.4f}, {float(np.percentile(mc._p95_boots, 97.5)):+.4f}]')
+            else:
+                lines.append(f'     Expanded uncertainty: U_val = \u00b1{rss.U_val:.4f} [{unit}]')
+                lines.append(f'       ({cov_pct} coverage / {conf_pct} confidence, {sided_label})')
+            lines.append(f'     Mean comparison error: \u0112 = {rss.E_mean:+.4f} [{unit}]')
+            lines.append(f'     Validation ratio:     |\u0112| / U_val = {ratio:.4f}')
+            if validated:
+                lines.append(f'     RESULT: The model IS VALIDATED at the stated coverage level."')
+            else:
+                lines.append(f'     RESULT: The model is NOT VALIDATED at the stated coverage level."')
+        else:
+            lines.append("    Insufficient data to generate a certification statement.")
         lines.append("")
 
         self._findings_edit.setPlainText("\n".join(lines))
@@ -6825,12 +7362,23 @@ class ComparisonRollUpTab(QWidget):
         if comp_rss is not None and comp_rss.computed:
             _set(0, col_rss, f"{comp_rss.u_val:.4f}")
             _set(1, col_rss, f"{comp_rss.k_factor:.3f}")
-            _set(2, col_rss, f"{comp_rss.lower_bound_uval:.4f}")
-            _set(3, col_rss, f"{comp_rss.upper_bound_uval:.4f}")
-            _set(4, col_rss, f"{comp_rss.E_mean:.4f}")
-            _set(5, col_rss, "No")
-            _set(6, col_rss, "Normal")
-            _set(7, col_rss, "ASME V&V 20-2009")
+            _set(2, col_rss, f"{comp_rss.U_val:.4f}")
+            _set(3, col_rss, f"{comp_rss.lower_bound_uval:.4f}")
+            _set(4, col_rss, f"{comp_rss.upper_bound_uval:.4f}")
+            _set(5, col_rss, f"{comp_rss.E_mean:.4f}")
+            if comp_rss.U_val > 0:
+                r_cmp = abs(comp_rss.E_mean) / comp_rss.U_val
+                if r_cmp <= 1.0:
+                    _set(6, col_rss, f"YES ({r_cmp:.3f})",
+                         DARK_COLORS.get('green', '#66bb6a'))
+                else:
+                    _set(6, col_rss, f"NO ({r_cmp:.3f})",
+                         DARK_COLORS.get('red', '#ef5350'))
+            else:
+                _set(6, col_rss, "\u2014")
+            _set(7, col_rss, "No")
+            _set(8, col_rss, "Normal")
+            _set(9, col_rss, "ASME V&V 20-2009")
         else:
             for r in range(self._N_ROWS):
                 _set(r, col_rss, "\u2014")
@@ -6838,14 +7386,24 @@ class ComparisonRollUpTab(QWidget):
         # --- Comparison MC column (col = base_cols + 1) -----------------
         col_mc = base_cols + 1
         if comp_mc is not None and comp_mc.computed:
+            mc_half = (comp_mc.pct_95 - comp_mc.pct_5) / 2.0
+            lo_lbl_c = f"P{comp_mc._lower_pct:.4g}" if hasattr(comp_mc, '_lower_pct') else "P5"
+            hi_lbl_c = f"P{comp_mc._upper_pct:.4g}" if hasattr(comp_mc, '_upper_pct') else "P95"
             _set(0, col_mc, f"{comp_mc.combined_std:.4f}")
             _set(1, col_mc, "N/A (distribution-free)")
-            _set(2, col_mc, f"{comp_mc.lower_bound:.4f}")
-            _set(3, col_mc, f"{comp_mc.upper_bound:.4f}")
-            _set(4, col_mc, f"{comp_mc.combined_mean:.4f}")
-            _set(5, col_mc, "Depends")
-            _set(6, col_mc, "Actual")
-            _set(7, col_mc, "JCGM 101:2008")
+            _set(2, col_mc, f"\u00b1{mc_half:.4f} ({lo_lbl_c}\u2013{hi_lbl_c})")
+            _set(3, col_mc, f"{comp_mc.lower_bound:.4f}")
+            _set(4, col_mc, f"{comp_mc.upper_bound:.4f}")
+            _set(5, col_mc, f"{comp_mc.combined_mean:.4f}")
+            if comp_mc.lower_bound <= 0 <= comp_mc.upper_bound:
+                _set(6, col_mc, "YES",
+                     DARK_COLORS.get('green', '#66bb6a'))
+            else:
+                _set(6, col_mc, "NO",
+                     DARK_COLORS.get('red', '#ef5350'))
+            _set(7, col_mc, "Depends")
+            _set(8, col_mc, "Actual")
+            _set(9, col_mc, "JCGM 101:2008")
         else:
             for r in range(self._N_ROWS):
                 _set(r, col_mc, "\u2014")
@@ -6866,25 +7424,29 @@ class ComparisonRollUpTab(QWidget):
             _set(1, col_delta, f"{delta_k:+.3f}",
                  DARK_COLORS['green'] if abs(delta_k) < 0.01
                  else DARK_COLORS['yellow'])
-            # Row 2: lower bound delta
+            # Row 2: U_val delta
+            delta_U = self._rss.U_val - comp_rss.U_val
+            _set(2, col_delta, f"{delta_U:+.4f}",
+                 DARK_COLORS['green'] if abs(delta_U) < 0.01
+                 else DARK_COLORS['yellow'])
+            # Row 3: lower bound delta
             delta_lb = self._rss.lower_bound_uval - comp_rss.lower_bound_uval
-            _set(2, col_delta, f"{delta_lb:+.4f}",
+            _set(3, col_delta, f"{delta_lb:+.4f}",
                  DARK_COLORS['green'] if abs(delta_lb) < 0.01
                  else DARK_COLORS['yellow'])
-            # Row 3: upper bound delta
+            # Row 4: upper bound delta
             delta_ub = self._rss.upper_bound_uval - comp_rss.upper_bound_uval
-            _set(3, col_delta, f"{delta_ub:+.4f}",
+            _set(4, col_delta, f"{delta_ub:+.4f}",
                  DARK_COLORS['green'] if abs(delta_ub) < 0.01
                  else DARK_COLORS['yellow'])
-            # Row 4: mean error delta
+            # Row 5: mean error delta
             delta_E = self._rss.E_mean - comp_rss.E_mean
-            _set(4, col_delta, f"{delta_E:+.4f}",
+            _set(5, col_delta, f"{delta_E:+.4f}",
                  DARK_COLORS['green'] if abs(delta_E) < 0.01
                  else DARK_COLORS['yellow'])
-            # Rows 5-7: qualitative — no numeric delta
-            _set(5, col_delta, "\u2014")
-            _set(6, col_delta, "\u2014")
-            _set(7, col_delta, "\u2014")
+            # Rows 6-9: qualitative — no numeric delta
+            for r in range(6, self._N_ROWS):
+                _set(r, col_delta, "\u2014")
         else:
             for r in range(self._N_ROWS):
                 _set(r, col_delta, "\u2014")
@@ -7973,6 +8535,7 @@ class HTMLReportGenerator:
         assumptions_text: str,
         figures: Dict[str, Figure],
         audit_entries: list,
+        rollup_headers: list = None,
     ) -> str:
         """
         Build and return a complete self-contained HTML report string.
@@ -8046,8 +8609,9 @@ class HTMLReportGenerator:
             budget_table, sources, unit))
 
         # ---- 4. RSS Results -------------------------------------------
-        sections_html.append(self._build_rss_section(
-            rss_results, settings, unit, figures.get("rss_plots")))
+        if rss_results is not None and rss_results.computed:
+            sections_html.append(self._build_rss_section(
+                rss_results, settings, unit, figures.get("rss_plots")))
 
         # ---- 5. Monte Carlo Results (optional) ------------------------
         if mc_results is not None and mc_results.computed:
@@ -8057,7 +8621,8 @@ class HTMLReportGenerator:
 
         # ---- 6. Comparison Roll-Up ------------------------------------
         sections_html.append(self._build_rollup_section(
-            rollup_table, findings_text))
+            rollup_table, findings_text,
+            header_labels=rollup_headers))
 
         # ---- 7. Assumptions & Engineering Judgments --------------------
         sections_html.append(self._build_assumptions_section(
@@ -8158,11 +8723,13 @@ class HTMLReportGenerator:
             ("k-factor method", _esc(s.k_method)),
             ("Bound type", _esc(s.bound_type)),
             ("Units", _esc(s.global_unit)),
+            ("MC sampling method", _esc(getattr(s, 'mc_sampling_method',
+                                               'Monte Carlo (Random)'))),
             ("MC trials", f"{s.mc_n_trials:,}"),
             ("MC seed", str(s.mc_seed) if s.mc_seed is not None else "Random"),
             ("MC bootstrap resampling",
              "Enabled" if s.mc_bootstrap else "Disabled"),
-            ("MC comparison sampling", _esc(s.mc_comparison_sampling)),
+            ("MC comparison data", "E\u0305 constant offset (V&V 20)"),
         ]
         if s.k_method == K_METHOD_MANUAL:
             rows.insert(4, ("Manual k value", f"{s.manual_k:.4f}"))
@@ -8367,13 +8934,13 @@ class HTMLReportGenerator:
             ("Number of data points", f"{r.n_data}"),
         ]
 
-        if r.lower_bound_uval > 0 or r.upper_bound_uval > 0:
+        if r.lower_bound_uval != 0.0 or r.upper_bound_uval != 0.0:
             results_rows.append(
                 ("U<sub>val</sub> bounds",
                  f"[{r.lower_bound_uval:.6g}, {r.upper_bound_uval:.6g}] "
                  f"{_esc(unit)}")
             )
-        if r.lower_bound_sE > 0 or r.upper_bound_sE > 0:
+        if r.lower_bound_sE != 0.0 or r.upper_bound_sE != 0.0:
             results_rows.append(
                 ("s<sub>E</sub> bounds",
                  f"[{r.lower_bound_sE:.6g}, {r.upper_bound_sE:.6g}] "
@@ -8435,11 +9002,15 @@ class HTMLReportGenerator:
         sided_label = "one-sided" if s.one_sided else "two-sided"
 
         mc_rows = [
+            ("Sampling method",
+             _esc(getattr(mc, 'sampling_method', 'Monte Carlo (Random)'))),
             ("Number of trials", f"{mc.n_trials:,}"),
             ("Combined mean", f"{mc.combined_mean:.6g} {_esc(unit)}"),
             ("Combined std dev", f"{mc.combined_std:.6g} {_esc(unit)}"),
-            ("5th percentile", f"{mc.pct_5:.6g} {_esc(unit)}"),
-            ("95th percentile", f"{mc.pct_95:.6g} {_esc(unit)}"),
+            (f"P{mc._lower_pct:.4g}" if hasattr(mc, '_lower_pct') else "P5",
+             f"{mc.pct_5:.6g} {_esc(unit)}"),
+            (f"P{mc._upper_pct:.4g}" if hasattr(mc, '_upper_pct') else "P95",
+             f"{mc.pct_95:.6g} {_esc(unit)}"),
             (f"Lower bound ({s.coverage*100:.0f}%/{s.confidence*100:.0f}% "
              f"{sided_label})",
              f"{mc.lower_bound:.6g} {_esc(unit)}"),
@@ -8448,9 +9019,11 @@ class HTMLReportGenerator:
              f"{mc.upper_bound:.6g} {_esc(unit)}"),
         ]
 
+        lo_h = f"P{mc._lower_pct:.4g}" if hasattr(mc, '_lower_pct') else "P5"
+        hi_h = f"P{mc._upper_pct:.4g}" if hasattr(mc, '_upper_pct') else "P95"
         if mc.bootstrap_ci_low != 0 or mc.bootstrap_ci_high != 0:
             mc_rows.append(
-                ("Bootstrap 95% CI on bound",
+                (f"Bootstrap 95% CI envelope (lower on {lo_h}, upper on {hi_h})",
                  f"[{mc.bootstrap_ci_low:.6g}, {mc.bootstrap_ci_high:.6g}] "
                  f"{_esc(unit)}")
             )
@@ -8498,14 +9071,20 @@ class HTMLReportGenerator:
 
     # -- 6. Comparison Roll-Up ------------------------------------------
     def _build_rollup_section(self, rollup_table: list,
-                               findings_text: str) -> str:
+                               findings_text: str,
+                               header_labels: list = None) -> str:
         # rollup_table is a list of lists (rows) from the QTableWidget
         if not rollup_table:
             table_html = "<p><em>No roll-up data available.</em></p>"
         else:
-            # Column headers
-            header_labels = ["Quantity", "RSS (u_val)", "RSS (s_E)",
-                             "Monte Carlo", "Empirical"]
+            # Column headers — use provided labels or infer from data width
+            if header_labels is None or len(header_labels) == 0:
+                n_cols = len(rollup_table[0]) if rollup_table else 5
+                header_labels = ["Quantity", "RSS (u_val)", "RSS (s_E)",
+                                 "Monte Carlo", "Empirical"]
+                # Pad if comparison columns added more
+                while len(header_labels) < n_cols:
+                    header_labels.append(f"Col {len(header_labels)+1}")
             header_cells = "".join(
                 f"<th>{_esc(h)}</th>" for h in header_labels
             )
@@ -9712,9 +10291,23 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            self._tab_comparison.set_comparison_data(result['comparison_data'])
-            self._tab_sources.set_sources(result['sources'])
-            self._tab_settings.set_settings(result['settings'])
+            # Clear stale results before populating from loaded project
+            self._tab_rss.clear_results()
+            self._tab_mc.clear_results()
+            self._tab_rollup.clear_results()
+
+            # Block signals on sources/settings tabs to prevent triple
+            # redundant _auto_compute_rss during bulk load.  The single
+            # QTimer.singleShot(200, ...) below handles the recompute.
+            self._tab_sources.blockSignals(True)
+            self._tab_settings.blockSignals(True)
+            try:
+                self._tab_comparison.set_comparison_data(result['comparison_data'])
+                self._tab_sources.set_sources(result['sources'])
+                self._tab_settings.set_settings(result['settings'])
+            finally:
+                self._tab_sources.blockSignals(False)
+                self._tab_settings.blockSignals(False)
 
             # Restore project metadata
             if result.get('project_metadata'):
@@ -9857,6 +10450,7 @@ class MainWindow(QMainWindow):
         all_sources = self._tab_sources.get_all_sources()
         budget_table = self._tab_rss.get_budget_table_data()
         rollup_table = self._tab_rollup.get_rollup_table_data()
+        rollup_headers = self._tab_rollup.get_rollup_header_labels()
         findings = self._tab_rollup.get_findings_text()
         assumptions = self._tab_rollup.get_assumptions_text()
 
@@ -9893,6 +10487,7 @@ class MainWindow(QMainWindow):
             assumptions_text=assumptions,
             figures=figures,
             audit_entries=audit_log.to_dict(),
+            rollup_headers=rollup_headers,
         )
         return html
 
