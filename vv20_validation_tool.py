@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VVUQ Uncertainty Aggregator v1.0
+VVUQ Uncertainty Aggregator v1.2
 CFD Validation Uncertainty Tool per ASME V&V 20 Framework
 
 Single-file PySide6 GUI application for computing CFD model validation
 uncertainty per the ASME V&V 20 framework with RSS and Monte Carlo methods.
 
 Standards References:
-    - ASME V&V 20-2009 (R2016)
+    - ASME V&V 20-2009 (R2021)
     - JCGM 100:2008 (GUM)
     - JCGM 101:2008 (GUM Supplement 1)
     - ASME PTC 19.1-2018
     - AIAA G-077-1998
 
-Copyright (c) 2025. All rights reserved.
+Copyright (c) 2026. All rights reserved.
 """
 
 # =============================================================================
@@ -24,9 +24,9 @@ import sys
 import subprocess
 import importlib
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 APP_NAME = "VVUQ Uncertainty Aggregator"
-APP_DATE = "2025-02-17"
+APP_DATE = "2026-02-23"
 
 REQUIRED_PACKAGES = {
     'PySide6': 'PySide6',
@@ -73,16 +73,20 @@ def check_and_install_dependencies():
     import os
     req_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'requirements.txt')
     if not os.path.exists(req_path):
-        with open(req_path, 'w') as f:
-            f.write("# VVUQ Uncertainty Aggregator v1.0 - Dependencies\n")
-            f.write("# Install with: pip install -r requirements.txt\n")
-            f.write("PySide6>=6.5.0\n")
-            f.write("numpy>=1.24.0\n")
-            f.write("scipy>=1.10.0\n")
-            f.write("matplotlib>=3.7.0\n")
-            f.write("openpyxl>=3.1.0\n")
+        try:
+            with open(req_path, 'w') as f:
+                f.write("# VVUQ Uncertainty Aggregator v1.2 - Dependencies\n")
+                f.write("# Install with: pip install -r requirements.txt\n")
+                f.write("PySide6>=6.5.0\n")
+                f.write("numpy>=1.24.0\n")
+                f.write("scipy>=1.10.0\n")
+                f.write("matplotlib>=3.7.0\n")
+                f.write("openpyxl>=3.1.0\n")
+        except OSError:
+            pass  # Read-only installation — skip requirements.txt generation
 
-check_and_install_dependencies()
+if __name__ == '__main__':
+    check_and_install_dependencies()
 
 # =============================================================================
 # SECTION 1: IMPORTS
@@ -91,12 +95,14 @@ import os
 import json
 import io
 import copy
+import itertools
 import threading
 import datetime
 import base64
 import textwrap
 import warnings
 import traceback
+import tempfile
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -105,11 +111,219 @@ from scipy import stats
 from scipy.stats import (
     norm, t as t_dist, nct, chi2, binom, uniform, triang,
     shapiro, kstest, anderson, skew, kurtosis,
-    lognorm, logistic, laplace, weibull_min, expon
+    lognorm, logistic, laplace, weibull_min, expon, goodness_of_fit
 )
+# ═══════════════════════════════════════════════════════════════════════════
+# SECTION: SHARED VVUQ REPORT COMPONENTS
+# Keep shared data (constants, terms, renderer) consistent across all four
+# VVUQ tools (Uncertainty Aggregator, GCI Calculator, Iterative Uncertainty,
+# Statistical Analyzer).
+# Import line and data definitions below must match across all four files.
+# Last synchronized: 2026-02-23
+# ═══════════════════════════════════════════════════════════════════════════
+from html import escape as _html_esc
+
+DECISION_CONSEQUENCE_LEVELS = ("Low", "Medium", "High")
+DEFAULT_DECISION_CONSEQUENCE = "Medium"
+
+VVUQ_TERMS: list = [
+    ("Verification",
+     "Checks whether the numerical model is solved correctly for the implemented equations."),
+    ("Validation",
+     "Checks whether the model predicts reality with acceptable uncertainty for the intended use."),
+    ("Aleatory uncertainty",
+     "Irreducible variability in the system or environment (e.g., natural scatter)."),
+    ("Epistemic uncertainty",
+     "Reducible uncertainty caused by limited knowledge, sparse data, or model assumptions."),
+    ("Standard uncertainty (1-sigma)",
+     "The uncertainty value carried into combination calculations before coverage expansion."),
+    ("Expanded uncertainty",
+     "Standard uncertainty multiplied by k-factor to meet a target coverage/confidence."),
+    ("Model-form uncertainty",
+     "Uncertainty from missing or imperfect physics, closures, or assumptions in the model."),
+    ("Carry-Over value",
+     "Single uncertainty value selected for transfer into the aggregator workflow."),
+]
+
+_CHECK_LABELS = {
+    "inputs_documented": "Inputs and assumptions are documented",
+    "method_selected": "Method choice is justified and traceable",
+    "units_consistent": "Units are consistent across all sources",
+    "data_quality": "Data quantity/quality checks passed",
+    "diagnostics_pass": "Diagnostics passed (fit, stationarity, convergence, etc.)",
+    "independent_review": "Independent technical review completed",
+    "conservative_bound": "Conservative bound or margin policy applied",
+    "validation_plan": "Validation closure plan is defined",
+}
+
+_REQUIRED_BY_LEVEL = {
+    "Low": (
+        "inputs_documented",
+        "method_selected",
+        "units_consistent",
+    ),
+    "Medium": (
+        "inputs_documented",
+        "method_selected",
+        "units_consistent",
+        "data_quality",
+        "diagnostics_pass",
+    ),
+    "High": (
+        "inputs_documented",
+        "method_selected",
+        "units_consistent",
+        "data_quality",
+        "diagnostics_pass",
+        "independent_review",
+        "conservative_bound",
+        "validation_plan",
+    ),
+}
+
+
+class CredibilityEvaluation:
+    """Result of deterministic credibility checklist evaluation."""
+    __slots__ = ("consequence", "passed", "required_checks", "missing_labels")
+
+    def __init__(self, consequence, passed, required_checks, missing_labels):
+        self.consequence = consequence
+        self.passed = passed
+        self.required_checks = required_checks
+        self.missing_labels = missing_labels
+
+
+def normalize_decision_consequence(value: str) -> str:
+    """Normalize user text to one of Low/Medium/High."""
+    txt = (value or "").strip().lower()
+    if txt.startswith("h"):
+        return "High"
+    if txt.startswith("l"):
+        return "Low"
+    return "Medium"
+
+
+def evaluate_credibility(consequence, evidence):
+    """Evaluate deterministic credibility checklist for a decision level."""
+    level = normalize_decision_consequence(consequence)
+    required = _REQUIRED_BY_LEVEL[level]
+    required_checks = []
+    missing = []
+    for key in required:
+        ok = bool(evidence.get(key, False))
+        label = _CHECK_LABELS.get(key, key)
+        required_checks.append((label, ok))
+        if not ok:
+            missing.append(label)
+    return CredibilityEvaluation(
+        consequence=level,
+        passed=(len(missing) == 0),
+        required_checks=required_checks,
+        missing_labels=missing,
+    )
+
+
+def render_credibility_html(consequence, evidence, section_id="section-credibility"):
+    """Render credibility section HTML with pass/fail banner and checklist."""
+    ev = evaluate_credibility(consequence, evidence)
+    if ev.passed:
+        verdict_cls = "pass"
+        verdict_text = f"Minimum evidence is met for {ev.consequence.lower()}-consequence use."
+    else:
+        verdict_cls = "fail"
+        verdict_text = f"Minimum evidence is NOT met for {ev.consequence.lower()}-consequence use."
+    items = []
+    for label, ok in ev.required_checks:
+        mark = "PASS" if ok else "MISSING"
+        items.append(f"<li><strong>{mark}</strong> - {_html_esc(label)}</li>")
+    missing_html = ""
+    if ev.missing_labels:
+        missing_lines = "".join(f"<li>{_html_esc(lbl)}</li>" for lbl in ev.missing_labels)
+        missing_html = f"<h3>Required Before Release</h3><ul>{missing_lines}</ul>"
+    return (
+        f'<div class="section" id="{_html_esc(section_id)}">'
+        "<h2>Credibility Framing</h2>"
+        f"<p><strong>Decision consequence:</strong> {_html_esc(ev.consequence)}</p>"
+        f'<div class="verdict {verdict_cls}">{_html_esc(verdict_text)}</div>'
+        "<h3>Checklist</h3>"
+        f"<ul>{''.join(items)}</ul>"
+        f"{missing_html}"
+        "</div>"
+    )
+
+
+def render_decision_card_html(title, use_value, use_distribution, use_combination,
+                              stop_checks, notes=""):
+    """Render novice-first final decision card."""
+    checks = list(stop_checks)
+    stop_list = "".join(f"<li>{_html_esc(x)}</li>" for x in checks)
+    notes_html = f"<p><strong>Why:</strong> {_html_esc(notes)}</p>" if notes else ""
+    return (
+        '<div class="section">'
+        f"<h2>{_html_esc(title)}</h2>"
+        '<div class="highlight">'
+        f"<p><strong>Use this value:</strong> {_html_esc(use_value)}</p>"
+        f"<p><strong>Use this distribution:</strong> {_html_esc(use_distribution)}</p>"
+        f"<p><strong>Use this combination method:</strong> {_html_esc(use_combination)}</p>"
+        "<p><strong>Do not proceed if any check fails:</strong></p>"
+        f"<ul>{stop_list}</ul>"
+        f"{notes_html}"
+        "</div></div>"
+    )
+
+
+def render_vvuq_glossary_html(section_id="section-vvuq-glossary"):
+    """Render fixed VVUQ terminology table for report consistency."""
+    rows = "".join(
+        f"<tr><td>{_html_esc(term)}</td><td>{_html_esc(defn)}</td></tr>"
+        for term, defn in VVUQ_TERMS
+    )
+    return (
+        f'<div class="section" id="{_html_esc(section_id)}">'
+        "<h2>VVUQ Terminology Panel</h2>"
+        "<table><tr><th>Term</th><th>Definition</th></tr>"
+        f"{rows}</table></div>"
+    )
+
+
+def render_conformity_template_html(metric_name, metric_value, consequence,
+                                    section_id="section-conformity"):
+    """Render optional conformity-assessment wording template."""
+    level = normalize_decision_consequence(consequence)
+    if level == "High":
+        gb = "Recommended guard-band: 10% of requirement margin"
+    elif level == "Medium":
+        gb = "Recommended guard-band: 5% of requirement margin"
+    else:
+        gb = "Recommended guard-band: analyst judgment (document rationale)"
+    return (
+        f'<div class="section" id="{_html_esc(section_id)}">'
+        "<h2>Conformity Assessment Template (Optional)</h2>"
+        "<p>This section is a wording template. Fill in requirement limits "
+        "and acceptance logic before release.</p>"
+        '<div class="findings-block">'
+        f"<p><strong>Assessed metric:</strong> {_html_esc(metric_name)} = {_html_esc(metric_value)}</p>"
+        "<p><strong>Requirement limit:</strong> [INSERT LIMIT AND DIRECTION]</p>"
+        "<p><strong>Acceptance rule:</strong> Accept only if measured/predicted value "
+        "including uncertainty remains inside requirement after guard-banding.</p>"
+        f"<p><strong>Decision consequence:</strong> {_html_esc(level)}. {_html_esc(gb)}.</p>"
+        "<p><strong>Guard-band statement:</strong> [INSERT APPLIED GUARD-BAND METHOD]</p>"
+        "</div></div>"
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════
+# END: SHARED VVUQ REPORT COMPONENTS
+# ═══════════════════════════════════════════════════════════════════════════
 
 # Force matplotlib to use PySide6 (must be set BEFORE importing matplotlib.backends)
 os.environ["QT_API"] = "pyside6"
+if "MPLCONFIGDIR" not in os.environ:
+    try:
+        mpl_cache_dir = os.path.join(tempfile.gettempdir(), "vv20_validation_tool_mplconfig")
+        os.makedirs(mpl_cache_dir, exist_ok=True)
+        os.environ["MPLCONFIGDIR"] = mpl_cache_dir
+    except OSError:
+        pass
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout,
@@ -219,6 +433,7 @@ FONT_FAMILIES = ["Segoe UI", "DejaVu Sans", "Liberation Sans", "Noto Sans",
 DARK_COLORS = {
     'bg': '#1e1e2e',
     'bg_alt': '#252536',
+    'surface0': '#313244',
     'bg_widget': '#2a2a3c',
     'bg_input': '#333348',
     'fg': '#cdd6f4',
@@ -231,6 +446,7 @@ DARK_COLORS = {
     'red': '#f38ba8',
     'orange': '#fab387',
     'border': '#45475a',
+    'overlay0': '#6c7086',
     'selection': '#45475a',
     'link': '#89dceb',
 }
@@ -252,6 +468,59 @@ PLOT_STYLE = {
     'grid.color': DARK_COLORS['border'],
     'legend.facecolor': DARK_COLORS['bg_widget'],
     'legend.edgecolor': DARK_COLORS['border'],
+}
+
+# Light theme for HTML report export (print-ready)
+REPORT_PLOT_STYLE = {
+    'figure.facecolor': '#ffffff',
+    'axes.facecolor': '#ffffff',
+    'axes.edgecolor': '#333333',
+    'axes.labelcolor': '#1a1a2e',
+    'text.color': '#1a1a2e',
+    'xtick.color': '#333333',
+    'ytick.color': '#333333',
+    'xtick.labelsize': 7,
+    'ytick.labelsize': 7,
+    'axes.labelsize': 8,
+    'axes.titlesize': 9,
+    'legend.fontsize': 6.5,
+    'grid.color': '#cccccc',
+    'legend.facecolor': '#f5f5f5',
+    'legend.edgecolor': '#999999',
+}
+
+# Greyscale theme for formal print submissions
+PRINT_GREYSCALE_STYLE = {
+    'figure.facecolor': '#ffffff',
+    'axes.facecolor': '#ffffff',
+    'axes.edgecolor': '#000000',
+    'axes.labelcolor': '#000000',
+    'text.color': '#000000',
+    'xtick.color': '#000000',
+    'ytick.color': '#000000',
+    'xtick.labelsize': 7,
+    'ytick.labelsize': 7,
+    'axes.labelsize': 8,
+    'axes.titlesize': 9,
+    'legend.fontsize': 6.5,
+    'grid.color': '#aaaaaa',
+    'legend.facecolor': '#ffffff',
+    'legend.edgecolor': '#000000',
+}
+
+# Named style profiles for export dialogs
+CHART_STYLE_PROFILES = {
+    "Interactive Dark": PLOT_STYLE,
+    "Report Light": REPORT_PLOT_STYLE,
+    "Print Greyscale": PRINT_GREYSCALE_STYLE,
+}
+
+# Figure size presets for export (width, height in inches)
+FIGURE_SIZE_PRESETS = {
+    "Half-page (3.5×2.8 in)": (3.5, 2.8),
+    "Full-page (7.0×4.5 in)": (7.0, 4.5),
+    "Appendix landscape (10.0×6.0 in)": (10.0, 6.0),
+    "Default (6×4 in)": (6.0, 4.0),
 }
 
 
@@ -383,8 +652,14 @@ def welch_satterthwaite(sigmas, dofs):
     numerator = u_c ** 4
     denominator = 0.0
     for s, v in zip(sigmas, dofs):
-        if np.isinf(v) or v == 0:
+        if np.isinf(v):
             continue  # Type B sources drop out
+        if v == 0:
+            warnings.warn(
+                f"Source with sigma={s:.4g} has DOF=0 (no data supports "
+                f"this estimate). Treating as Type B (infinite DOF)."
+            )
+            continue
         denominator += s ** 4 / v
 
     if denominator == 0:
@@ -541,6 +816,76 @@ def compute_descriptive_stats(data):
     return result
 
 
+def compute_multivariate_validation(cd: 'ComparisonData') -> dict:
+    """Compute covariance-aware supplemental validation metrics.
+
+    Returns a dictionary with:
+      - computed (bool)
+      - score (normalized Mahalanobis mean-bias scalar)
+      - t2 (Hotelling-style statistic approximation)
+      - pvalue (chi-square approximation on t2)
+      - n_locations, n_conditions
+      - note
+    """
+    out = {
+        'computed': False,
+        'score': 0.0,
+        't2': 0.0,
+        'pvalue': 1.0,
+        'n_locations': 0,
+        'n_conditions': 0,
+        'note': "",
+    }
+    if cd is None or cd.data is None or cd.data.size == 0 or cd.data.ndim != 2:
+        out['note'] = "Multivariate metric not computed: no matrix data."
+        return out
+
+    X = np.asarray(cd.data, dtype=float)
+    # Keep only conditions with complete location vectors.
+    valid_cols = np.all(np.isfinite(X), axis=0)
+    X = X[:, valid_cols]
+
+    m, n = X.shape if X.ndim == 2 else (0, 0)
+    out['n_locations'] = int(m)
+    out['n_conditions'] = int(n)
+    if m < 2 or n < 3:
+        out['note'] = (
+            "Multivariate metric requires at least 2 locations and 3 complete conditions."
+        )
+        return out
+
+    try:
+        mean_vec = np.mean(X, axis=1)
+        S = np.cov(X, bias=False)
+        if S.ndim == 0:
+            S = np.array([[float(S)]], dtype=float)
+        S = np.asarray(S, dtype=float)
+        # Light Tikhonov regularization for near-singular covariance.
+        tr = float(np.trace(S)) if S.size > 0 else 0.0
+        reg = max(1e-12, 1e-10 * tr / max(m, 1))
+        S_reg = S + reg * np.eye(m)
+        S_inv = np.linalg.pinv(S_reg)
+        d2 = float(mean_vec.T @ S_inv @ mean_vec)
+        d2 = max(d2, 0.0)
+        score = float(np.sqrt(d2) / max(np.sqrt(m), 1.0))
+        t2 = float(n * d2)
+        pvalue = float(1.0 - chi2.cdf(t2, df=m))
+
+        out.update({
+            'computed': True,
+            'score': score,
+            't2': t2,
+            'pvalue': pvalue,
+            'note': (
+                "Multivariate supplemental metric computed on complete-condition matrix "
+                "(covariance-aware mean-bias distance)."
+            ),
+        })
+    except Exception as exc:
+        out['note'] = f"Multivariate metric failed: {exc}"
+    return out
+
+
 def assess_distribution(stats_dict):
     """
     Provide automated distribution assessment based on descriptive statistics.
@@ -630,17 +975,33 @@ def assess_sample_size(n):
         return msg, 'green'
 
 
-def fit_distributions(data):
+def _resolve_gof_mc_samples(n: int, requested: Optional[int]) -> int:
+    """Resolve bootstrap GOF sample count with runtime guardrails."""
+    if requested is not None:
+        return max(0, int(requested))
+    if n <= 8:
+        return 0
+    if n <= 30:
+        return 49
+    if n <= 200:
+        return 39
+    if n <= 1000:
+        return 29
+    return 19
+
+
+def fit_distributions(data, _n_mc_gof: Optional[int] = None):
     """
     Fit candidate distributions to data and rank by goodness of fit.
 
     Returns list of dicts sorted by best fit, each containing:
-        name, params, ks_stat, ks_p, ad_stat (if available), recommendation
+        name, params, gof_p, ks_p, AICc, recommendation
     """
     data = np.array(data, dtype=float)
     data = data[~np.isnan(data)]
     if len(data) < 5:
         return []
+    n_mc_gof = _resolve_gof_mc_samples(len(data), _n_mc_gof)
 
     results = []
     candidates = {
@@ -669,58 +1030,203 @@ def fit_distributions(data):
                 fit_data = data
                 shift = 0
 
-            params = dist.fit(fit_data)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                params = dist.fit(fit_data)
+            # KS test is retained as a diagnostic only.
             ks_stat, ks_p = kstest(fit_data, dist.cdf, args=params)
+
+            gof_stat = float('inf')
+            gof_p = 0.0
+            gof_method = "bootstrap_ad"
+            if n_mc_gof <= 0:
+                gof_stat = float(ks_stat)
+                gof_p = float(ks_p)
+                gof_method = "ks_screening"
+            else:
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", RuntimeWarning)
+                        gof = goodness_of_fit(
+                            dist=dist,
+                            data=fit_data,
+                            statistic='ad',
+                            n_mc_samples=n_mc_gof,
+                            random_state=0,
+                        )
+                    gof_stat = float(gof.statistic)
+                    gof_p = float(gof.pvalue)
+                except Exception:
+                    # Fallback for environments/distributions where bootstrap GOF fails.
+                    gof_stat = float(ks_stat)
+                    gof_p = float(ks_p)
+                    gof_method = "ks_fallback"
+
+            # AIC/BIC information criteria (preferred ranking)
+            n = len(fit_data)
+            k_params = len(params)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                log_lik = float(np.sum(dist.logpdf(fit_data, *params)))
+            aic = 2.0 * k_params - 2.0 * log_lik
+            # Corrected AIC (AICc) for small samples
+            if n - k_params - 1 > 0:
+                aicc = aic + (2.0 * k_params * (k_params + 1)) / (n - k_params - 1)
+            else:
+                aicc = aic
+            bic = k_params * np.log(n) - 2.0 * log_lik
 
             results.append({
                 'name': name,
                 'params': params,
                 'shift': shift,
+                'gof_stat': float(gof_stat),
+                'gof_p': float(gof_p),
+                'gof_method': gof_method,
+                'passed_gof': bool(gof_p > 0.05),
                 'ks_stat': float(ks_stat),
                 'ks_p': float(ks_p),
+                'aic': float(aic),
+                'aicc': float(aicc),
+                'bic': float(bic),
+                'n_params': k_params,
             })
         except Exception:
             continue
 
     # Also test Triangular
     try:
-        params = stats.triang.fit(data)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            params = stats.triang.fit(data)
         ks_stat, ks_p = kstest(data, stats.triang.cdf, args=params)
+        gof_stat = float('inf')
+        gof_p = 0.0
+        gof_method = "bootstrap_ad"
+        if n_mc_gof <= 0:
+            gof_stat = float(ks_stat)
+            gof_p = float(ks_p)
+            gof_method = "ks_screening"
+        else:
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    gof = goodness_of_fit(
+                        dist=stats.triang,
+                        data=data,
+                        statistic='ad',
+                        n_mc_samples=n_mc_gof,
+                        random_state=0,
+                    )
+                gof_stat = float(gof.statistic)
+                gof_p = float(gof.pvalue)
+            except Exception:
+                gof_stat = float(ks_stat)
+                gof_p = float(ks_p)
+                gof_method = "ks_fallback"
+        n = len(data)
+        k_params = len(params)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            log_lik = float(np.sum(stats.triang.logpdf(data, *params)))
+        aic = 2.0 * k_params - 2.0 * log_lik
+        if n - k_params - 1 > 0:
+            aicc = aic + (2.0 * k_params * (k_params + 1)) / (n - k_params - 1)
+        else:
+            aicc = aic
+        bic = k_params * np.log(n) - 2.0 * log_lik
         results.append({
             'name': 'Triangular',
             'params': params,
             'shift': 0,
+            'gof_stat': float(gof_stat),
+            'gof_p': float(gof_p),
+            'gof_method': gof_method,
+            'passed_gof': bool(gof_p > 0.05),
             'ks_stat': float(ks_stat),
             'ks_p': float(ks_p),
+            'aic': float(aic),
+            'aicc': float(aicc),
+            'bic': float(bic),
+            'n_params': k_params,
         })
     except Exception:
         pass
 
-    # Sort by KS p-value (higher is better fit)
-    results.sort(key=lambda x: x['ks_p'], reverse=True)
+    # Primary sort: GOF pass first, then AICc, then GOF p-value.
+    results.sort(
+        key=lambda x: (
+            0 if x.get('passed_gof') else 1,
+            x.get('aicc', float('inf')),
+            -x.get('gof_p', 0.0),
+            -x.get('ks_p', 0.0),
+        )
+    )
 
     # Add recommendations
+    # AICc = Corrected Akaike Information Criterion: a score measuring
+    # how well a distribution fits the data; lower is better.  The
+    # correction prevents overfitting with small samples.
     for i, r in enumerate(results):
-        if i == 0 and r['ks_p'] > 0.05:
+        aicc_str = f"AICc={r.get('aicc', 0):.1f}"
+        gof_str = f"GOF p={r.get('gof_p', 0.0):.3f}"
+        diag_str = f"KS(diag)={r['ks_p']:.3f}"
+        gof_method = r.get('gof_method', 'bootstrap_ad')
+        method_note = (
+            "Bootstrap GOF passed at α=0.05."
+            if gof_method == "bootstrap_ad"
+            else "KS screening used (runtime guardrail mode)."
+            if gof_method == "ks_screening"
+            else "Bootstrap GOF unavailable; KS fallback used."
+        )
+        if i == 0:
+            if r.get('passed_gof'):
+                r['recommendation'] = (
+                    f"Best fit: {r['name']} ({aicc_str}, {gof_str}; {diag_str}). "
+                    f"{method_note} [GUM §4.3, JCGM 101]"
+                )
+            else:
+                r['recommendation'] = (
+                    f"Best fit by AICc fallback: {r['name']} "
+                    f"({aicc_str}, {gof_str}; {diag_str}). "
+                    "No candidate passed GOF screening."
+                )
+        elif r.get('passed_gof'):
             r['recommendation'] = (
-                f"Best fit: {r['name']} (KS p={r['ks_p']:.3f}). "
-                f"Cannot reject this distribution at α=0.05. [GUM §4.3]"
-            )
-        elif r['ks_p'] > 0.05:
-            r['recommendation'] = (
-                f"Acceptable fit: {r['name']} (KS p={r['ks_p']:.3f}). [GUM §4.3]"
+                f"Acceptable: {r['name']} ({aicc_str}, {gof_str}; {diag_str}). "
+                f"{method_note}"
             )
         else:
             r['recommendation'] = (
-                f"Poor fit: {r['name']} (KS p={r['ks_p']:.3f}). "
-                f"Rejected at α=0.05."
+                f"Poor fit: {r['name']} ({aicc_str}, {gof_str}; {diag_str}). "
+                "GOF screening below α=0.05."
             )
 
     return results
 
 
+def generate_bifurcated_normal(sigma_upper, sigma_lower, mean, n_trials,
+                               rng=None):
+    """Generate samples from a bifurcated (split) Gaussian.
+
+    Uses σ⁺ for samples above the mean and σ⁻ for samples below.
+    This produces a continuous, potentially asymmetric distribution that
+    honours the different uncertainties in each direction.
+
+    References: Barlow, R. (2004) "Asymmetric Statistical Errors".
+    """
+    if rng is None:
+        rng = np.random.default_rng()
+    # Draw from standard normal and rescale each half
+    z = rng.standard_normal(n_trials)
+    samples = np.where(z >= 0,
+                       mean + z * sigma_upper,
+                       mean + z * sigma_lower)
+    return samples
+
+
 def generate_mc_samples(distribution, sigma, mean, n_trials, raw_data=None,
-                        rng=None):
+                        rng=None, sigma_upper=None, sigma_lower=None):
     """
     Generate Monte Carlo samples from a specified distribution.
 
@@ -729,12 +1235,20 @@ def generate_mc_samples(distribution, sigma, mean, n_trials, raw_data=None,
     rng : numpy.random.Generator, optional
         Thread-safe RNG instance.  Falls back to the legacy global RNG
         if not provided (for backward compatibility in non-threaded use).
+    sigma_upper, sigma_lower : float, optional
+        When both are provided (asymmetric mode), uses a bifurcated Gaussian
+        instead of the symmetric distribution for Normal sources.
 
     Ref: JCGM 101:2008 (GUM Supplement 1).
     """
     # Use provided Generator or fall back to legacy API
     if rng is None:
         rng = np.random.default_rng()
+    # Asymmetric (bifurcated) Gaussian for Normal sources
+    if (sigma_upper is not None and sigma_lower is not None
+            and distribution == "Normal"):
+        return generate_bifurcated_normal(
+            sigma_upper, sigma_lower, mean, n_trials, rng=rng)
     if distribution == "Normal":
         return rng.normal(mean, sigma, n_trials)
     elif distribution == "Uniform":
@@ -809,14 +1323,14 @@ def generate_mc_samples(distribution, sigma, mean, n_trials, raw_data=None,
 
 
 def generate_lhs_samples(distribution, sigma, mean, n_trials, raw_data=None,
-                         rng=None):
+                         rng=None, sigma_upper=None, sigma_lower=None):
     """
     Generate Latin Hypercube samples from a specified distribution.
 
     Uses stratified sampling of the [0, 1] probability space followed by
     the inverse-CDF (percent-point function) transform.  Produces the same
-    marginal distribution as ``generate_mc_samples`` but with much better
-    coverage of the tails, giving equivalent accuracy in ~1/10 the samples.
+    marginal distribution as ``generate_mc_samples`` but with stratified
+    coverage that often stabilizes percentile estimates faster than random MC.
 
     Parameters
     ----------
@@ -832,6 +1346,8 @@ def generate_lhs_samples(distribution, sigma, mean, n_trials, raw_data=None,
         Raw data for Custom/Empirical Bootstrap resampling.
     rng : numpy.random.Generator, optional
         Thread-safe RNG.  Falls back to a fresh Generator if not provided.
+    sigma_upper, sigma_lower : float, optional
+        Asymmetric σ⁺/σ⁻ — uses bifurcated Gaussian via inverse CDF.
 
     Returns
     -------
@@ -839,7 +1355,8 @@ def generate_lhs_samples(distribution, sigma, mean, n_trials, raw_data=None,
 
     Ref
     ---
-    McKay, Beckman & Conover (1979); JCGM 101:2008 §6.4;
+    McKay, Beckman & Conover (1979);
+    JCGM 101:2008 (Monte Carlo framework);
     ASME V&V 20, Section 4.4 — Monte Carlo propagation methods.
     """
     if rng is None:
@@ -860,6 +1377,14 @@ def generate_lhs_samples(distribution, sigma, mean, n_trials, raw_data=None,
     # ------------------------------------------------------------------
     if sigma == 0:
         return np.full(n, mean)
+
+    # Asymmetric bifurcated Gaussian (LHS version)
+    if (sigma_upper is not None and sigma_lower is not None
+            and distribution == "Normal"):
+        z = norm.ppf(u)
+        return np.where(z >= 0,
+                        mean + z * sigma_upper,
+                        mean + z * sigma_lower)
 
     if distribution == "Normal":
         return norm.ppf(u, loc=mean, scale=sigma)
@@ -1007,9 +1532,42 @@ class UncertaintySource:
     notes: str = ""
     is_centered_on_zero: bool = True
     enabled: bool = True
+    correlation_group: str = ""       # group label for correlated sources
+    correlation_coefficient: float = 0.0  # pairwise ρ with group reference
+    # Epistemic/aleatoric classification (Section 6.2)
+    uncertainty_class: str = "aleatoric"    # aleatoric, epistemic, mixed
+    representation: str = "distribution"    # distribution, interval, scenario_set, model_ensemble
+    basis_type: str = "measured"            # measured, spec_limit, expert_judgment, standard_reference, assumed
+    reducibility: str = "low"               # high, medium, low
+    evidence_note: str = ""                 # concise traceability text
+    # Interval bounds for epistemic interval representation (double-loop MC)
+    interval_lower: float = 0.0            # lower bound when representation="interval"
+    interval_upper: float = 0.0            # upper bound when representation="interval"
+    # Asymmetric uncertainty (GUM §4.3.8, Barlow 2004)
+    asymmetric: bool = False                # Enable asymmetric mode
+    sigma_upper: float = 0.0               # σ⁺ (positive direction)
+    sigma_lower: float = 0.0               # σ⁻ (negative direction)
+    one_sided: bool = False                 # Only one direction tested
+    one_sided_direction: str = "upper"      # "upper" or "lower"
+    mirror_assumed: bool = True             # Assume σ_missing = σ_observed
 
     def get_standard_uncertainty(self) -> float:
-        """Return the 1σ standard uncertainty for this source."""
+        """Return the 1σ standard uncertainty for this source.
+
+        When *asymmetric* is True, returns the effective σ per GUM §4.3.8:
+            σ_eff = √((σ⁺² + σ⁻²) / 2)
+        If *one_sided* and *mirror_assumed*, the missing direction is set
+        equal to the observed direction.
+        """
+        if self.asymmetric:
+            sp = self.sigma_upper
+            sm = self.sigma_lower
+            if self.one_sided and self.mirror_assumed:
+                if self.one_sided_direction == "upper":
+                    sm = sp
+                else:
+                    sp = sm
+            return float(np.sqrt((sp ** 2 + sm ** 2) / 2.0))
         if self.input_type == "Tabular Data" and len(self.tabular_data) > 1:
             return float(np.std(self.tabular_data, ddof=1))
         elif self.input_type == "Sigma Value Only":
@@ -1027,6 +1585,24 @@ class UncertaintySource:
                 return abs(self.sensitivity_deltas[0])
             return 0.0
         return self.sigma_value
+
+    def get_sigma_upper(self) -> float:
+        """Return σ⁺ (positive direction uncertainty)."""
+        if not self.asymmetric:
+            return self.get_standard_uncertainty()
+        sp = self.sigma_upper
+        if self.one_sided and self.mirror_assumed and self.one_sided_direction == "lower":
+            sp = self.sigma_lower
+        return sp
+
+    def get_sigma_lower(self) -> float:
+        """Return σ⁻ (negative direction uncertainty)."""
+        if not self.asymmetric:
+            return self.get_standard_uncertainty()
+        sm = self.sigma_lower
+        if self.one_sided and self.mirror_assumed and self.one_sided_direction == "upper":
+            sm = self.sigma_upper
+        return sm
 
     def get_dof(self) -> float:
         """Return degrees of freedom for this source."""
@@ -1071,7 +1647,8 @@ class ComparisonData:
         """Return all data as a flat 1D array."""
         if self.data.size == 0:
             return np.array([])
-        return self.data.flatten()[~np.isnan(self.data.flatten())]
+        flat = self.data.flatten()
+        return flat[~np.isnan(flat)]
 
     def get_stats(self) -> dict:
         flat = self.flat_data()
@@ -1133,6 +1710,12 @@ class AnalysisSettings:
     bound_type: str = "Both (for comparison)"
     mc_comparison_sampling: str = "Bootstrap from raw data"
     global_unit: str = "°F"
+    validation_mode: str = "Standard scalar (V&V 20)"
+    # Double-loop Monte Carlo settings (Oberkampf & Roy 2010)
+    mc_mode: str = "Single-Loop"               # "Single-Loop", "Double-Loop (Corners)", "Double-Loop (Full)"
+    mc_n_outer: int = 200                       # outer loop epistemic samples (Full mode)
+    mc_n_inner: int = 10000                     # inner loop aleatory samples per realization
+    mc_mixed_treatment: str = "Treat as epistemic"  # "Treat as epistemic" or "Treat as aleatory"
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -1163,12 +1746,27 @@ class RSSResults:
     upper_bound_sE: float = 0.0
     u_model: float = 0.0
     model_form_pct: float = 0.0
-    bias_explained: bool = False
+    bias_explained: Optional[bool] = None
     source_contributions: List[dict] = field(default_factory=list)
     computed: bool = False
-    # Coverage settings used — needed by MC tab for apples-to-apples comparison
-    _coverage: float = 0.95
-    _one_sided: bool = True
+    has_correlations: bool = False
+    correlation_groups: List[str] = field(default_factory=list)
+    # Effective pairwise correlation detail: list of (group_name, names_list, C_matrix)
+    correlation_matrices: List[tuple] = field(default_factory=list)
+    # Uncertainty class split
+    u_aleatoric: float = 0.0     # RSS of aleatoric-class source sigmas
+    u_epistemic: float = 0.0     # RSS of epistemic-class source sigmas
+    u_mixed: float = 0.0         # RSS of mixed-class source sigmas
+    pct_epistemic: float = 0.0   # U_E² / u_val² × 100
+    # Optional multivariate supplemental validation metric
+    multivariate_enabled: bool = False
+    multivariate_computed: bool = False
+    multivariate_score: float = 0.0
+    multivariate_t2: float = 0.0
+    multivariate_pvalue: float = 1.0
+    multivariate_n_locations: int = 0
+    multivariate_n_conditions: int = 0
+    multivariate_note: str = ""
 
 
 @dataclass
@@ -1190,6 +1788,7 @@ class MCResults:
     _one_sided: bool = True
     sampling_method: str = "Monte Carlo (Random)"
     samples: np.ndarray = field(default_factory=lambda: np.array([]))
+    notes: List[str] = field(default_factory=list)
     computed: bool = False
 
     def to_dict(self):
@@ -1198,6 +1797,71 @@ class MCResults:
         for k, v in self.__dict__.items():
             if k in _skip:
                 continue  # Don't save large arrays (samples, bootstrap)
+            d[k] = v
+        return d
+
+
+@dataclass
+class DoubleLoopMCResults:
+    """Stores double-loop Monte Carlo results (epistemic/aleatory separation).
+
+    The outer loop varies epistemic parameters; the inner loop propagates
+    aleatory uncertainty.  The result is a family of CDFs whose envelope
+    forms a probability box (p-box).
+
+    References:
+        Oberkampf & Roy (2010), Verification and Validation in Scientific Computing
+        Ferson et al. (2003), Constructing probability boxes and Dempster-Shafer structures
+    """
+    mode: str = "corners"                  # "corners" or "full"
+    n_outer: int = 0                       # number of epistemic realizations
+    n_inner: int = 0                       # aleatory trials per realization
+    n_epistemic_sources: int = 0           # count of epistemic sources in outer loop
+    n_aleatory_sources: int = 0            # count of aleatory sources in inner loop
+
+    # P-box envelope (bounding CDFs on a shared x-grid)
+    pbox_x: np.ndarray = field(default_factory=lambda: np.array([]))
+    pbox_cdf_lower: np.ndarray = field(default_factory=lambda: np.array([]))
+    pbox_cdf_upper: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # Summary statistics across the family of inner-loop CDFs
+    lower_bound_min: float = 0.0           # worst-case (most negative) lower bound
+    lower_bound_max: float = 0.0           # best-case lower bound
+    upper_bound_min: float = 0.0           # best-case upper bound
+    upper_bound_max: float = 0.0           # worst-case (most positive) upper bound
+    mean_of_means: float = 0.0             # mean of inner-loop means
+    std_of_means: float = 0.0              # std of inner-loop means (epistemic spread)
+
+    # Validation metric
+    validation_fraction: float = 0.0       # fraction of realizations bracketing zero
+
+    # Coverage settings used
+    _coverage: float = 0.95
+    _one_sided: bool = True
+    _lower_pct: float = 5.0
+    _upper_pct: float = 95.0
+
+    # Per-realization summary arrays (each length n_outer)
+    realization_lower_bounds: np.ndarray = field(default_factory=lambda: np.array([]))
+    realization_upper_bounds: np.ndarray = field(default_factory=lambda: np.array([]))
+    realization_means: np.ndarray = field(default_factory=lambda: np.array([]))
+
+    # Epistemic source names and corner values for reporting
+    epistemic_source_names: List[str] = field(default_factory=list)
+
+    notes: List[str] = field(default_factory=list)
+    computed: bool = False
+
+    def to_dict(self):
+        d = {}
+        _skip = {'pbox_x', 'pbox_cdf_lower', 'pbox_cdf_upper',
+                 'realization_lower_bounds', 'realization_upper_bounds',
+                 'realization_means'}
+        for k, v in self.__dict__.items():
+            if k in _skip:
+                continue
+            if isinstance(v, np.ndarray):
+                continue  # skip any remaining arrays
             d[k] = v
         return d
 
@@ -1237,20 +1901,240 @@ def style_table(table, column_widths=None, stretch_col=None):
 
 def copy_figure_to_clipboard(fig):
     """Copy a matplotlib Figure to the system clipboard as an image."""
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=150, bbox_inches='tight',
-                facecolor='white', edgecolor='none')
-    buf.seek(0)
-    from PySide6.QtGui import QImage, QClipboard
-    image = QImage.fromData(buf.read())
-    QApplication.clipboard().setImage(image)
+    try:
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=150, bbox_inches='tight',
+                    facecolor='white', edgecolor='none')
+        buf.seek(0)
+        from PySide6.QtGui import QImage
+        image = QImage.fromData(buf.read())
+        QApplication.clipboard().setImage(image)
+    except Exception as exc:
+        QMessageBox.warning(
+            None, "Clipboard Error",
+            f"Could not copy figure to clipboard:\n\n{exc}"
+        )
 
 
-def make_plot_toolbar_with_copy(canvas, fig, parent):
+def export_figure_package(fig, base_path: str, metadata: Optional[dict] = None,
+                          figure_id: str = "", analysis_id: str = "",
+                          settings_hash: str = "", data_hash: str = "",
+                          units: str = "", method_context: str = ""):
+    """Export a matplotlib Figure in publication-quality formats.
+
+    Generates:
+        {base_path}_300dpi.png  — 300 DPI raster
+        {base_path}_600dpi.png  — 600 DPI raster
+        {base_path}.svg         — Scalable Vector Graphics
+        {base_path}.pdf         — PDF vector
+        {base_path}_meta.json   — Metadata sidecar (10-key regulatory spec)
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+    base_path : str
+        Path without extension (e.g., "C:/output/gci_convergence").
+    metadata : dict, optional
+        Extra metadata entries to include in the JSON sidecar.
+    figure_id : str, optional
+        Figure identifier (e.g., "rss_pdf", "convergence_plot").
+    analysis_id : str, optional
+        Project name or unique analysis identifier.
+    settings_hash : str, optional
+        SHA-256 hash of the settings used to generate this figure.
+    data_hash : str, optional
+        SHA-256 hash of the input data.
+    units : str, optional
+        Unit string for the plotted quantity.
+    method_context : str, optional
+        Method identifier (e.g., "RSS ASME V&V 20", "GCI Celik 2008").
     """
-    Create a toolbar row containing the matplotlib NavigationToolbar
-    and a 'Copy to Clipboard' button for pasting into PowerPoint etc.
-    Returns a QWidget containing both.
+    import json
+    from datetime import datetime, timezone
+
+    for dpi_val in (300, 600):
+        fig.savefig(f"{base_path}_{dpi_val}dpi.png", format="png", dpi=dpi_val,
+                    bbox_inches="tight", facecolor="white", edgecolor="none")
+
+    fig.savefig(f"{base_path}.svg", format="svg",
+                bbox_inches="tight", facecolor="white", edgecolor="none")
+    fig.savefig(f"{base_path}.pdf", format="pdf",
+                bbox_inches="tight", facecolor="white", edgecolor="none")
+
+    meta = {
+        "tool_name": APP_NAME,
+        "tool_version": APP_VERSION,
+        "figure_id": figure_id or os.path.basename(base_path),
+        "analysis_id": analysis_id,
+        "profile": "report_light",
+        "settings_hash": settings_hash,
+        "data_hash": data_hash,
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "units": units,
+        "method_context": method_context,
+        "formats": ["png@300dpi", "png@600dpi", "svg", "pdf"],
+    }
+    if metadata:
+        meta.update(metadata)
+
+    with open(f"{base_path}_meta.json", "w", encoding="utf-8") as fp:
+        json.dump(meta, fp, indent=2)
+
+
+def copy_report_quality_figure(fig):
+    """Copy a matplotlib Figure to clipboard at 300 DPI with light report theme."""
+    # Save original properties
+    orig_props = []
+    for ax in fig.get_axes():
+        orig_props.append({
+            'facecolor': ax.get_facecolor(),
+            'title_color': ax.title.get_color() if ax.title else None,
+            'xlabel_color': ax.xaxis.label.get_color(),
+            'ylabel_color': ax.yaxis.label.get_color(),
+            'spine_colors': {s: ax.spines[s].get_edgecolor() for s in ax.spines},
+        })
+        ax.set_facecolor(REPORT_PLOT_STYLE['axes.facecolor'])
+        ax.title.set_color(REPORT_PLOT_STYLE['text.color'])
+        ax.xaxis.label.set_color(REPORT_PLOT_STYLE['axes.labelcolor'])
+        ax.yaxis.label.set_color(REPORT_PLOT_STYLE['axes.labelcolor'])
+        ax.tick_params(axis='x', colors=REPORT_PLOT_STYLE['xtick.color'])
+        ax.tick_params(axis='y', colors=REPORT_PLOT_STYLE['ytick.color'])
+        for spine in ax.spines.values():
+            spine.set_edgecolor(REPORT_PLOT_STYLE['axes.edgecolor'])
+        leg = ax.get_legend()
+        if leg:
+            leg.get_frame().set_facecolor(REPORT_PLOT_STYLE['legend.facecolor'])
+            leg.get_frame().set_edgecolor(REPORT_PLOT_STYLE['legend.edgecolor'])
+            for text in leg.get_texts():
+                text.set_color(REPORT_PLOT_STYLE['text.color'])
+
+    orig_fig_fc = fig.get_facecolor()
+    fig.set_facecolor('#ffffff')
+
+    # Render at 300 DPI and copy to clipboard
+    try:
+        buf = io.BytesIO()
+        fig.savefig(buf, format='png', dpi=300, bbox_inches='tight',
+                    facecolor='white', edgecolor='none')
+        buf.seek(0)
+        from PySide6.QtGui import QImage
+        image = QImage.fromData(buf.read())
+        QApplication.clipboard().setImage(image)
+    except Exception as exc:
+        QMessageBox.warning(
+            None, "Clipboard Error",
+            f"Could not copy report-quality figure to clipboard:\n\n{exc}"
+        )
+    finally:
+        # Restore original dark-theme properties
+        fig.set_facecolor(orig_fig_fc)
+        for ax, props in zip(fig.get_axes(), orig_props):
+            ax.set_facecolor(props['facecolor'])
+            if props['title_color']:
+                ax.title.set_color(props['title_color'])
+            ax.xaxis.label.set_color(props['xlabel_color'])
+            ax.yaxis.label.set_color(props['ylabel_color'])
+            ax.tick_params(axis='x', colors=PLOT_STYLE['xtick.color'])
+            ax.tick_params(axis='y', colors=PLOT_STYLE['ytick.color'])
+            for s_name, s_color in props['spine_colors'].items():
+                ax.spines[s_name].set_edgecolor(s_color)
+            leg = ax.get_legend()
+            if leg:
+                leg.get_frame().set_facecolor(PLOT_STYLE['legend.facecolor'])
+                leg.get_frame().set_edgecolor(PLOT_STYLE['legend.edgecolor'])
+                for text in leg.get_texts():
+                    text.set_color(PLOT_STYLE['text.color'])
+
+
+def _find_main_window(widget):
+    """Walk up the widget hierarchy to find the MainWindow ancestor."""
+    w = widget
+    while w is not None:
+        if hasattr(w, '_project_name') and hasattr(w, '_tab_settings'):
+            return w
+        w = w.parent() if hasattr(w, 'parent') and callable(w.parent) else None
+    return None
+
+
+def _export_figure_package_dialog(fig, parent, **metadata_kwargs):
+    """Open a file dialog and export a figure package.
+
+    Any keyword arguments are forwarded to export_figure_package() as
+    metadata fields (analysis_id, settings_hash, method_context, etc.).
+    If *parent* has a ``_get_export_metadata()`` method, its return dict
+    is used as defaults (overridden by explicit kwargs).
+    """
+    filepath, _ = QFileDialog.getSaveFileName(
+        parent, "Export Figure Package",
+        os.path.expanduser("~"),
+        "Figure Base Name (*)",
+    )
+    if not filepath:
+        return
+    # Remove any extension the user may have typed
+    base = os.path.splitext(filepath)[0]
+    # Collect metadata from application context
+    meta = {}
+    mw = _find_main_window(parent)
+    if mw is not None:
+        meta['analysis_id'] = getattr(mw, '_project_name', '')
+        try:
+            settings = mw._tab_settings.get_settings()
+            import hashlib as _hashlib
+            s_json = json.dumps({
+                'coverage': settings.coverage,
+                'confidence': settings.confidence,
+                'one_sided': settings.one_sided,
+                'k_method': settings.k_method,
+                'bound_type': getattr(settings, 'bound_type', ''),
+            }, sort_keys=True)
+            meta['settings_hash'] = _hashlib.sha256(
+                s_json.encode()).hexdigest()[:16]
+            meta['units'] = settings.global_unit
+        except Exception:
+            pass
+        # data_hash: fingerprint of comparison data + source sigmas
+        try:
+            import hashlib as _hashlib2
+            comp = mw._tab_comparison.get_comparison_data()
+            sources = mw._tab_sources.get_sources()
+            d_parts = []
+            if comp.data.size > 0:
+                d_parts.append(comp.data.tobytes())
+            for s in sources:
+                if s.enabled:
+                    d_parts.append(f"{s.name}:{s.get_standard_uncertainty()}".encode())
+            if d_parts:
+                h = _hashlib2.sha256(b"".join(d_parts))
+                meta['data_hash'] = h.hexdigest()[:16]
+        except Exception:
+            pass
+    meta.update(metadata_kwargs)
+    try:
+        export_figure_package(fig, base, **meta)
+    except Exception as exc:
+        QMessageBox.critical(
+            parent, "Export Error",
+            f"Could not export figure package:\n\n{exc}"
+        )
+        return
+    if hasattr(parent, '_status_bar'):
+        parent._status_bar.showMessage(
+            f"Figure package exported to {base}_*.{{png,svg,pdf,json}}", 8000
+        )
+
+
+def make_plot_toolbar_with_copy(canvas, fig, parent, method_context=""):
+    """
+    Create a toolbar row containing the matplotlib NavigationToolbar,
+    'Copy to Clipboard', 'Copy Report-Quality', and 'Export Figure Package'
+    buttons. Returns a QWidget containing all controls.
+
+    Parameters
+    ----------
+    method_context : str
+        Auto-populated into the figure metadata sidecar (e.g.,
+        "RSS ASME V&V 20", "Monte Carlo JCGM 101").
     """
     toolbar_widget = QWidget(parent)
     toolbar_layout = QHBoxLayout(toolbar_widget)
@@ -1260,21 +2144,46 @@ def make_plot_toolbar_with_copy(canvas, fig, parent):
     nav_toolbar = NavigationToolbar(canvas, parent)
     toolbar_layout.addWidget(nav_toolbar)
 
-    btn_copy = QPushButton("Copy to Clipboard")
-    btn_copy.setToolTip(
-        "Copy this chart as an image to the system clipboard.\n"
-        "Paste directly into PowerPoint, Word, or email."
-    )
-    btn_copy.setMaximumWidth(140)
-    btn_copy.setStyleSheet(
+    btn_style = (
         f"QPushButton {{ background-color: {DARK_COLORS['bg_widget']}; "
         f"color: {DARK_COLORS['fg']}; border: 1px solid {DARK_COLORS['border']}; "
         f"border-radius: 3px; padding: 4px 8px; font-size: 11px; }}"
         f"QPushButton:hover {{ border-color: {DARK_COLORS['accent']}; "
         f"color: {DARK_COLORS['accent']}; }}"
     )
+
+    btn_copy = QPushButton("Copy to Clipboard")
+    btn_copy.setToolTip(
+        "Copy this chart as a draft image (150 DPI) to the clipboard.\n"
+        "Paste directly into PowerPoint, Word, or email."
+    )
+    btn_copy.setMaximumWidth(140)
+    btn_copy.setStyleSheet(btn_style)
     btn_copy.clicked.connect(lambda: copy_figure_to_clipboard(fig))
     toolbar_layout.addWidget(btn_copy)
+
+    btn_rq = QPushButton("Copy Report-Quality")
+    btn_rq.setToolTip(
+        "Copy this chart at 300 DPI with light report theme.\n"
+        "Suitable for formal report insertion."
+    )
+    btn_rq.setMaximumWidth(155)
+    btn_rq.setStyleSheet(btn_style)
+    btn_rq.clicked.connect(lambda: copy_report_quality_figure(fig))
+    toolbar_layout.addWidget(btn_rq)
+
+    btn_export = QPushButton("Export Figure Package...")
+    btn_export.setToolTip(
+        "Export PNG (300+600 DPI), SVG, PDF, and JSON metadata sidecar.\n"
+        "Produces a complete regulatory-quality figure archive."
+    )
+    btn_export.setMaximumWidth(170)
+    btn_export.setStyleSheet(btn_style)
+    _mc = method_context  # capture for lambda
+    btn_export.clicked.connect(
+        lambda: _export_figure_package_dialog(fig, parent, method_context=_mc)
+    )
+    toolbar_layout.addWidget(btn_export)
 
     return toolbar_widget
 
@@ -1864,7 +2773,9 @@ class ComparisonDataTab(QWidget):
         self._canvas.setMinimumHeight(500)
 
         # Toolbar with Copy to Clipboard button
-        toolbar_row = make_plot_toolbar_with_copy(self._canvas, self._fig, self)
+        toolbar_row = make_plot_toolbar_with_copy(
+            self._canvas, self._fig, self,
+            method_context="Comparison Data (ASME V&V 20)")
 
         # Wrap canvas in a scroll area for horizontal scrolling
         plot_scroll = QScrollArea()
@@ -2267,11 +3178,16 @@ class ComparisonDataTab(QWidget):
                     f"\u26A0 |mean - \u0112| = {deviation:.4g} > 2\u03c3 = {2*overall_std:.4g}"
                 )
                 flag_item.setForeground(QColor(DARK_COLORS['red']))
-                audit_log.log_warning(
-                    f"Location '{ls['name']}' mean ({ls['mean']:.4g}) deviates "
-                    f"> 2\u03c3 from overall mean ({overall_mean:.4g}). "
-                    f"Pooling assumption may be violated."
-                )
+                warn_key = f"loc_outlier_{ls['name']}"
+                if not hasattr(self, '_logged_warnings'):
+                    self._logged_warnings = set()
+                if warn_key not in self._logged_warnings:
+                    self._logged_warnings.add(warn_key)
+                    audit_log.log_warning(
+                        f"Location '{ls['name']}' mean ({ls['mean']:.4g}) deviates "
+                        f"> 2\u03c3 from overall mean ({overall_mean:.4g}). "
+                        f"Pooling assumption may be violated."
+                    )
             else:
                 flag_item = QTableWidgetItem("OK")
                 flag_item.setForeground(QColor(DARK_COLORS['green']))
@@ -2529,7 +3445,7 @@ class _MiniDistributionCanvas(FigureCanvas):
                     pdf_vals = dist_cls.pdf(x_range + shift, *res['params'])
                 else:
                     pdf_vals = dist_cls.pdf(x_range, *res['params'])
-                lbl = f"{res['name']} (p={res['ks_p']:.3f})"
+                lbl = f"{res['name']} (GOF p={res.get('gof_p', 0.0):.3f})"
                 ax.plot(x_range, pdf_vals, linewidth=1.6,
                         color=colors_pdf[idx], label=lbl)
             except Exception:
@@ -2624,7 +3540,9 @@ class _TabularDataPanel(QWidget):
         self._btn_fit = QPushButton("Auto-Fit Distribution")
         self._btn_fit.setToolTip(
             "Fit candidate distributions to the data and rank by\n"
-            "Kolmogorov-Smirnov goodness-of-fit. [GUM \u00a74.3]"
+            "GOF p-value: bootstrap AD by default, with KS screening\n"
+            "used in sparse/fast mode and KS fallback if bootstrap fails.\n"
+            "[GUM \u00a74.3, JCGM 101]"
         )
         fit_row.addWidget(self._btn_fit)
         fit_row.addStretch()
@@ -2752,13 +3670,13 @@ class _TabularDataPanel(QWidget):
         if self._fit_results:
             best = self._fit_results[0]
             self._fit_guidance.set_guidance(best['recommendation'],
-                                           'green' if best['ks_p'] > 0.05 else 'yellow')
+                                           'green' if best.get('passed_gof') else 'yellow')
             self._fit_guidance.setVisible(True)
             self._mini_canvas.plot_fit(self._data, self._fit_results)
             self._mini_canvas.setVisible(True)
             audit_log.log_computation(
                 "AUTO_FIT",
-                f"Best fit: {best['name']} (KS p={best['ks_p']:.4f})"
+                f"Best fit: {best['name']} (GOF p={best.get('gof_p', 0.0):.4f})"
             )
         else:
             self._fit_guidance.set_guidance(
@@ -2785,7 +3703,7 @@ class _TabularDataPanel(QWidget):
 
     def get_recommended_distribution(self) -> str:
         """Return the name of the best-fit distribution, or empty string."""
-        if self._fit_results and self._fit_results[0]['ks_p'] > 0.05:
+        if self._fit_results and self._fit_results[0].get('passed_gof'):
             return self._fit_results[0]['name']
         return ""
 
@@ -2861,17 +3779,117 @@ class _SigmaValuePanel(QWidget):
         self._basis_warn.setVisible(False)
         layout.addRow(self._basis_warn)
 
+        # ---- Asymmetric uncertainty section ----
+        self._chk_asymmetric = QCheckBox("Asymmetric \u03c3\u207a / \u03c3\u207b")
+        self._chk_asymmetric.setToolTip(
+            "Enable when sensitivity results differ in the positive\n"
+            "and negative directions. Uses effective \u03c3 per GUM \u00a74.3.8:\n"
+            "\u03c3_eff = \u221a((\u03c3\u207a\u00b2 + \u03c3\u207b\u00b2) / 2)\n\n"
+            "MC propagation uses a Split Gaussian (different spread\n"
+            "above/below the mean) per Barlow (2004) for more\n"
+            "rigorous asymmetric treatment."
+        )
+        layout.addRow(self._chk_asymmetric)
+
+        # Asymmetric detail frame (hidden by default)
+        self._asym_frame = QFrame()
+        self._asym_frame.setVisible(False)
+        asym_lay = QFormLayout(self._asym_frame)
+        asym_lay.setContentsMargins(8, 4, 0, 4)
+        asym_lay.setSpacing(4)
+
+        self._spn_sigma_upper = QDoubleSpinBox()
+        self._spn_sigma_upper.setRange(0.0, 1e9)
+        self._spn_sigma_upper.setDecimals(6)
+        self._spn_sigma_upper.setSingleStep(0.01)
+        self._spn_sigma_upper.setToolTip("Uncertainty in the positive direction (\u03c3\u207a)")
+        asym_lay.addRow("\u03c3\u207a (upper):", self._spn_sigma_upper)
+
+        self._spn_sigma_lower = QDoubleSpinBox()
+        self._spn_sigma_lower.setRange(0.0, 1e9)
+        self._spn_sigma_lower.setDecimals(6)
+        self._spn_sigma_lower.setSingleStep(0.01)
+        self._spn_sigma_lower.setToolTip("Uncertainty in the negative direction (\u03c3\u207b)")
+        asym_lay.addRow("\u03c3\u207b (lower):", self._spn_sigma_lower)
+
+        self._chk_one_sided = QCheckBox("One-sided only")
+        self._chk_one_sided.setToolTip(
+            "Check if only one perturbation direction was tested.\n"
+            "Mirror assumption: \u03c3_missing = \u03c3_observed."
+        )
+        asym_lay.addRow(self._chk_one_sided)
+
+        self._cmb_one_sided_dir = QComboBox()
+        self._cmb_one_sided_dir.addItems(["upper", "lower"])
+        self._cmb_one_sided_dir.setToolTip("Which direction was actually tested?")
+        self._cmb_one_sided_dir.setEnabled(False)
+        asym_lay.addRow("Tested direction:", self._cmb_one_sided_dir)
+
+        self._lbl_eff_sigma = QLabel("\u2014")
+        self._lbl_eff_sigma.setStyleSheet(
+            f"font-weight: bold; color: {DARK_COLORS['accent']};"
+        )
+        self._lbl_eff_sigma.setToolTip(
+            "Effective \u03c3 = \u221a((\u03c3\u207a\u00b2 + \u03c3\u207b\u00b2) / 2)"
+        )
+        asym_lay.addRow("Effective \u03c3:", self._lbl_eff_sigma)
+
+        layout.addRow(self._asym_frame)
+
         # Connections
         self._spn_sigma.valueChanged.connect(self._on_changed)
         self._cmb_basis.currentIndexChanged.connect(self._on_changed)
         self._spn_sample.valueChanged.connect(self._on_changed)
         self._chk_supplier.toggled.connect(self._on_supplier_toggled)
+        self._chk_asymmetric.toggled.connect(self._on_asymmetric_toggled)
+        self._spn_sigma_upper.valueChanged.connect(self._on_asym_changed)
+        self._spn_sigma_lower.valueChanged.connect(self._on_asym_changed)
+        self._chk_one_sided.toggled.connect(self._on_one_sided_toggled)
+        self._cmb_one_sided_dir.currentIndexChanged.connect(self._on_asym_changed)
 
     def _on_supplier_toggled(self, checked):
         self._spn_sample.setEnabled(not checked)
         if checked:
             self._spn_sample.setValue(0)
         self._on_changed()
+
+    def _on_asymmetric_toggled(self, checked):
+        self._asym_frame.setVisible(checked)
+        # When asymmetric is ON, hide the symmetric σ row
+        self._spn_sigma.setVisible(not checked)
+        if not checked:
+            self._on_changed()
+        else:
+            self._on_asym_changed()
+
+    def _on_one_sided_toggled(self, checked):
+        self._cmb_one_sided_dir.setEnabled(checked)
+        if checked:
+            # Disable the non-tested direction spinner
+            direction = self._cmb_one_sided_dir.currentText()
+            self._spn_sigma_upper.setEnabled(direction == "upper")
+            self._spn_sigma_lower.setEnabled(direction == "lower")
+        else:
+            self._spn_sigma_upper.setEnabled(True)
+            self._spn_sigma_lower.setEnabled(True)
+        self._on_asym_changed()
+
+    def _on_asym_changed(self):
+        sp = self._spn_sigma_upper.value()
+        sm = self._spn_sigma_lower.value()
+        if self._chk_one_sided.isChecked():
+            direction = self._cmb_one_sided_dir.currentText()
+            if direction == "upper":
+                sm = sp  # mirror
+                self._spn_sigma_upper.setEnabled(True)
+                self._spn_sigma_lower.setEnabled(False)
+            else:
+                sp = sm  # mirror
+                self._spn_sigma_upper.setEnabled(False)
+                self._spn_sigma_lower.setEnabled(True)
+        eff = float(np.sqrt((sp ** 2 + sm ** 2) / 2.0))
+        self._lbl_eff_sigma.setText(f"{eff:.6g}")
+        self.value_changed.emit()
 
     def _on_changed(self):
         raw = self._spn_sigma.value()
@@ -2922,6 +3940,39 @@ class _SigmaValuePanel(QWidget):
     def get_converted_sigma(self) -> float:
         return sigma_from_basis(self._spn_sigma.value(),
                                 self._cmb_basis.currentText())
+
+    # -- asymmetric public API --
+    def is_asymmetric(self) -> bool:
+        return self._chk_asymmetric.isChecked()
+
+    def set_asymmetric(self, val: bool):
+        self._chk_asymmetric.setChecked(val)
+
+    def get_sigma_upper(self) -> float:
+        return self._spn_sigma_upper.value()
+
+    def set_sigma_upper(self, val: float):
+        self._spn_sigma_upper.setValue(val)
+
+    def get_sigma_lower(self) -> float:
+        return self._spn_sigma_lower.value()
+
+    def set_sigma_lower(self, val: float):
+        self._spn_sigma_lower.setValue(val)
+
+    def is_one_sided(self) -> bool:
+        return self._chk_one_sided.isChecked()
+
+    def set_one_sided(self, val: bool):
+        self._chk_one_sided.setChecked(val)
+
+    def get_one_sided_direction(self) -> str:
+        return self._cmb_one_sided_dir.currentText()
+
+    def set_one_sided_direction(self, val: str):
+        idx = self._cmb_one_sided_dir.findText(val)
+        if idx >= 0:
+            self._cmb_one_sided_dir.setCurrentIndex(idx)
 
 
 class _TolerancePanel(QWidget):
@@ -3306,15 +4357,17 @@ class UncertaintySourcesTab(QWidget):
 
         # Source table
         self._source_table = QTableWidget()
-        self._source_table.setColumnCount(6)
+        self._source_table.setColumnCount(8)
         self._source_table.setHorizontalHeaderLabels(
-            ["Name", "Category", "\u03c3 (1\u03c3)", "Unit", "DOF", "% Contrib."]
+            ["Name", "Category", "\u03c3 (1\u03c3)", "Unit", "DOF",
+             "% Contrib.", "Class", "Reducibility"]
         )
         self._source_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._source_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self._source_table.setAlternatingRowColors(True)
         style_table(self._source_table,
-                    column_widths={0: 170, 1: 140, 2: 80, 3: 60, 4: 65, 5: 90},
+                    column_widths={0: 150, 1: 120, 2: 75, 3: 55, 4: 55,
+                                   5: 80, 6: 80, 7: 90},
                     stretch_col=0)
         self._source_table.setMinimumWidth(420)
         left_layout.addWidget(self._source_table)
@@ -3422,6 +4475,45 @@ class UncertaintySourcesTab(QWidget):
         self._cmb_unit.setToolTip("Engineering unit for this uncertainty source.")
         form.addRow("Unit:", self._cmb_unit)
 
+        # Correlation Group
+        self._edt_corr_group = QLineEdit()
+        self._edt_corr_group.setPlaceholderText("Leave blank = independent")
+        self._edt_corr_group.setToolTip(
+            "Correlation group label. Sources sharing the same non-empty\n"
+            "group label AND category are treated as correlated in both RSS\n"
+            "and Monte Carlo computations. Cross-category correlation terms\n"
+            "are intentionally not applied. Leave blank for independent sources.\n"
+            "[ASME V&V 20-2009 §4.3.3]"
+        )
+        form.addRow("Corr. Group:", self._edt_corr_group)
+
+        # Correlation Coefficient
+        self._spn_corr_coeff = QDoubleSpinBox()
+        self._spn_corr_coeff.setRange(-1.0, 1.0)
+        self._spn_corr_coeff.setSingleStep(0.05)
+        self._spn_corr_coeff.setDecimals(2)
+        self._spn_corr_coeff.setValue(0.0)
+        self._spn_corr_coeff.setToolTip(
+            "Pairwise correlation coefficient ρ with the group reference source.\n"
+            "ρ = 1.0 = fully correlated, ρ = 0.0 = independent (uncorrelated),\n"
+            "ρ = −1.0 = fully anti-correlated.\n"
+            "The reference source (first alphabetically in each group) always\n"
+            "has ρ = 1.0 enforced automatically. Other sources specify their\n"
+            "correlation with the reference. Pairwise: ρ(a,b) = ρ_a × ρ_b.\n"
+            "Range: −1.0 to +1.0. [ASME V&V 20-2009 §4.3.3]"
+        )
+        form.addRow("Corr. ρ:", self._spn_corr_coeff)
+
+        # Reference source hint (shown when this source is the group reference)
+        self._lbl_corr_ref_hint = QLabel("")
+        self._lbl_corr_ref_hint.setStyleSheet(
+            f"color: {DARK_COLORS['yellow']}; font-size: 11px; "
+            f"padding: 2px 0;"
+        )
+        self._lbl_corr_ref_hint.setWordWrap(True)
+        self._lbl_corr_ref_hint.hide()
+        form.addRow("", self._lbl_corr_ref_hint)
+
         # Notes
         self._edt_notes = QLineEdit()
         self._edt_notes.setPlaceholderText("Optional notes or reference...")
@@ -3440,6 +4532,73 @@ class UncertaintySourcesTab(QWidget):
         form.addRow(self._chk_enabled)
 
         self._right_layout.addWidget(grp)
+
+        # --- Classification group (epistemic/aleatoric, Section 6.2) ---
+        class_grp = QGroupBox("Uncertainty Classification")
+        class_form = QFormLayout(class_grp)
+        class_form.setSpacing(6)
+
+        self._cmb_uclass = QComboBox()
+        self._cmb_uclass.addItems(["aleatoric", "epistemic", "mixed"])
+        self._cmb_uclass.setToolTip(
+            "Uncertainty nature:\n"
+            "  • aleatoric — inherent randomness (irreducible)\n"
+            "  • epistemic — lack of knowledge (reducible)\n"
+            "  • mixed — both components present\n\n"
+            "Practical rule:\n"
+            "  • Sensor-based BCs (e.g., inlet mass flow) are often MIXED\n"
+            "    unless random and bias parts are separated.\n"
+            "  • Grid/discretization uncertainty is usually epistemic or mixed.\n"
+            "    If over-refined/asymptotic, reducibility may be low."
+        )
+        class_form.addRow("Class:", self._cmb_uclass)
+
+        self._cmb_representation = QComboBox()
+        self._cmb_representation.addItems([
+            "distribution", "interval", "scenario_set", "model_ensemble"
+        ])
+        self._cmb_representation.setToolTip(
+            "How this uncertainty is represented:\n"
+            "  • distribution — probabilistic (PDF/CDF)\n"
+            "  • interval — bounded range [low, high]\n"
+            "  • scenario_set — discrete scenarios\n"
+            "  • model_ensemble — spread of model runs"
+        )
+        class_form.addRow("Representation:", self._cmb_representation)
+
+        self._cmb_basis_type = QComboBox()
+        self._cmb_basis_type.addItems([
+            "measured", "spec_limit", "expert_judgment",
+            "standard_reference", "assumed"
+        ])
+        self._cmb_basis_type.setToolTip(
+            "Evidential basis for this uncertainty value.\n"
+            "Type A/Type B describe HOW value was obtained, not whether\n"
+            "it is aleatoric or epistemic."
+        )
+        class_form.addRow("Basis:", self._cmb_basis_type)
+
+        self._cmb_reducibility = QComboBox()
+        self._cmb_reducibility.addItems(["low", "medium", "high"])
+        self._cmb_reducibility.setToolTip(
+            "Potential for reducing this uncertainty:\n"
+            "  • low — irreducible or near-irreducible\n"
+            "  • medium — reducible with moderate effort\n"
+            "  • high — readily reducible with additional data/testing\n\n"
+            "If class='epistemic' but reducibility='low', add evidence note\n"
+            "explaining why it is currently not reducible in your program."
+        )
+        class_form.addRow("Reducibility:", self._cmb_reducibility)
+
+        self._edt_evidence = QLineEdit()
+        self._edt_evidence.setPlaceholderText("Traceability reference...")
+        self._edt_evidence.setToolTip(
+            "Concise traceability note (e.g., calibration cert #, "
+            "test report ID, standard section)."
+        )
+        class_form.addRow("Evidence:", self._edt_evidence)
+
+        self._right_layout.addWidget(class_grp)
 
     # -- Input-Type-Specific Panels --
     def _build_input_type_panels(self):
@@ -3493,6 +4652,10 @@ class UncertaintySourcesTab(QWidget):
     def _connect_signals(self):
         # Source table selection
         self._source_table.currentCellChanged.connect(self._on_source_selected)
+        self._source_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._source_table.customContextMenuRequested.connect(
+            self._on_source_table_context_menu
+        )
 
         # Buttons
         self._btn_add.clicked.connect(self._add_source)
@@ -3585,6 +4748,85 @@ class UncertaintySourcesTab(QWidget):
         self.sources_changed.emit()
 
     # =================================================================
+    # CONTEXT MENU
+    # =================================================================
+    def _on_source_table_context_menu(self, pos):
+        """Right-click context menu for sort/filter by class or reducibility."""
+        from PySide6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+
+        # Sort actions
+        sort_menu = menu.addMenu("Sort by")
+        sort_menu.addAction("Name (A\u2192Z)").triggered.connect(
+            lambda: self._sort_sources_by('name'))
+        sort_menu.addAction("\u03c3 (descending)").triggered.connect(
+            lambda: self._sort_sources_by('sigma'))
+        sort_menu.addAction("Class").triggered.connect(
+            lambda: self._sort_sources_by('class'))
+        sort_menu.addAction("Reducibility").triggered.connect(
+            lambda: self._sort_sources_by('reducibility'))
+
+        # Filter (highlight) actions
+        filter_menu = menu.addMenu("Highlight class")
+        filter_menu.addAction("All (clear highlight)").triggered.connect(
+            lambda: self._highlight_by_class(None))
+        filter_menu.addAction("Aleatoric").triggered.connect(
+            lambda: self._highlight_by_class('aleatoric'))
+        filter_menu.addAction("Epistemic").triggered.connect(
+            lambda: self._highlight_by_class('epistemic'))
+        filter_menu.addAction("Mixed").triggered.connect(
+            lambda: self._highlight_by_class('mixed'))
+
+        menu.exec(self._source_table.viewport().mapToGlobal(pos))
+
+    def _sort_sources_by(self, key: str):
+        """Sort the source list by the given key and refresh."""
+        if key == 'name':
+            self._sources.sort(key=lambda s: s.name.lower())
+        elif key == 'sigma':
+            self._sources.sort(key=lambda s: s.get_standard_uncertainty(),
+                               reverse=True)
+        elif key == 'class':
+            order = {'aleatoric': 0, 'mixed': 1, 'epistemic': 2}
+            self._sources.sort(
+                key=lambda s: order.get(
+                    getattr(s, 'uncertainty_class', 'aleatoric'), 3
+                )
+            )
+        elif key == 'reducibility':
+            order = {'low': 0, 'medium': 1, 'high': 2}
+            self._sources.sort(
+                key=lambda s: order.get(
+                    getattr(s, 'reducibility', 'low'), 3
+                )
+            )
+        self._refresh_table()
+        self.sources_changed.emit()
+
+    def _highlight_by_class(self, cls: Optional[str]):
+        """Highlight rows matching the given class; None clears all highlights."""
+        for i in range(self._source_table.rowCount()):
+            if i >= len(self._sources):
+                break
+            src = self._sources[i]
+            match = (cls is None or
+                     getattr(src, 'uncertainty_class', 'aleatoric') == cls)
+            for col in range(self._source_table.columnCount()):
+                item = self._source_table.item(i, col)
+                if item is None:
+                    continue
+                if match or cls is None:
+                    # Reset to default
+                    if src.enabled:
+                        item.setForeground(QColor(DARK_COLORS['fg']))
+                    else:
+                        item.setForeground(QColor(DARK_COLORS['fg_dim']))
+                else:
+                    # Dim non-matching rows
+                    item.setForeground(QColor(DARK_COLORS['fg_dim']))
+
+    # =================================================================
     # TABLE REFRESH
     # =================================================================
     def _refresh_table(self):
@@ -3595,6 +4837,8 @@ class UncertaintySourcesTab(QWidget):
             dof = src.get_dof()
             dof_str = "\u221e" if np.isinf(dof) else f"{dof:.1f}"
 
+            u_class = getattr(src, 'uncertainty_class', 'aleatoric')
+            reducibility = getattr(src, 'reducibility', 'low')
             items = [
                 src.name,
                 src.category.split(" (")[0],  # short form
@@ -3602,6 +4846,8 @@ class UncertaintySourcesTab(QWidget):
                 src.unit,
                 dof_str,
                 "\u2014",  # placeholder for % contribution
+                u_class.capitalize() if u_class else "",
+                reducibility.capitalize() if reducibility else "",
             ]
             for col, text in enumerate(items):
                 item = QTableWidgetItem(text)
@@ -3610,6 +4856,18 @@ class UncertaintySourcesTab(QWidget):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 if not src.enabled:
                     item.setForeground(QColor(DARK_COLORS['fg_dim']))
+                # Highlight unit column if mismatched with first enabled source
+                if col == 3 and src.enabled:
+                    ref_unit = next(
+                        (s.unit for s in self._sources if s.enabled), None
+                    )
+                    if ref_unit and src.unit != ref_unit:
+                        item.setBackground(QColor(DARK_COLORS['yellow']))
+                        item.setForeground(QColor("#1e1e2e"))
+                        item.setToolTip(
+                            f"Unit mismatch: this source uses '{src.unit}' "
+                            f"but other sources use '{ref_unit}'."
+                        )
                 self._source_table.setItem(i, col, item)
 
     # =================================================================
@@ -3635,8 +4893,39 @@ class UncertaintySourcesTab(QWidget):
             self._cmb_input_type.setCurrentText(src.input_type)
             self._cmb_distribution.setCurrentText(src.distribution)
             self._cmb_unit.setCurrentText(src.unit)
+            self._edt_corr_group.setText(src.correlation_group)
+            self._spn_corr_coeff.setValue(src.correlation_coefficient)
+
+            # Update reference-source hint
+            grp = src.correlation_group.strip()
+            if grp:
+                # Find alphabetically-first enabled source in the same group
+                group_names = sorted(
+                    (s.name for s in self._sources
+                     if s.enabled and s.correlation_group.strip() == grp),
+                    key=str.lower,
+                )
+                if group_names and src.name == group_names[0]:
+                    self._lbl_corr_ref_hint.setText(
+                        "\u26a0 This source is the group reference "
+                        "(1st alphabetically). Its \u03c1 will be "
+                        "set to 1.0 during computation."
+                    )
+                    self._lbl_corr_ref_hint.show()
+                else:
+                    self._lbl_corr_ref_hint.hide()
+            else:
+                self._lbl_corr_ref_hint.hide()
+
             self._edt_notes.setText(src.notes)
             self._chk_enabled.setChecked(src.enabled)
+
+            # Classification fields
+            self._cmb_uclass.setCurrentText(src.uncertainty_class)
+            self._cmb_representation.setCurrentText(src.representation)
+            self._cmb_basis_type.setCurrentText(src.basis_type)
+            self._cmb_reducibility.setCurrentText(src.reducibility)
+            self._edt_evidence.setText(src.evidence_note)
 
             # Switch stacked widget
             stack_idx = self._input_type_index.get(src.input_type, 1)
@@ -3651,6 +4940,11 @@ class UncertaintySourcesTab(QWidget):
                 self._panel_sigma.set_basis(src.sigma_basis)
                 self._panel_sigma.set_sample_size(src.sample_size)
                 self._panel_sigma.set_supplier(src.is_supplier)
+                self._panel_sigma.set_asymmetric(src.asymmetric)
+                self._panel_sigma.set_sigma_upper(src.sigma_upper)
+                self._panel_sigma.set_sigma_lower(src.sigma_lower)
+                self._panel_sigma.set_one_sided(src.one_sided)
+                self._panel_sigma.set_one_sided_direction(src.one_sided_direction)
             elif src.input_type == "Tolerance/Expanded Value":
                 self._panel_tolerance.set_tolerance(src.tolerance_value)
                 self._panel_tolerance.set_k(src.tolerance_k)
@@ -3680,8 +4974,17 @@ class UncertaintySourcesTab(QWidget):
         src.input_type = self._cmb_input_type.currentText()
         src.distribution = self._cmb_distribution.currentText()
         src.unit = self._cmb_unit.currentText()
+        src.correlation_group = self._edt_corr_group.text().strip()
+        src.correlation_coefficient = self._spn_corr_coeff.value()
         src.notes = self._edt_notes.text()
         src.enabled = self._chk_enabled.isChecked()
+
+        # Classification fields
+        src.uncertainty_class = self._cmb_uclass.currentText()
+        src.representation = self._cmb_representation.currentText()
+        src.basis_type = self._cmb_basis_type.currentText()
+        src.reducibility = self._cmb_reducibility.currentText()
+        src.evidence_note = self._edt_evidence.text()
 
         # Input-type-specific
         if src.input_type == "Tabular Data":
@@ -3716,6 +5019,19 @@ class UncertaintySourcesTab(QWidget):
             src.sigma_value = self._panel_sigma.get_converted_sigma()
             src.sample_size = self._panel_sigma.get_sample_size()
             src.is_supplier = self._panel_sigma.is_supplier()
+            # Asymmetric fields
+            src.asymmetric = self._panel_sigma.is_asymmetric()
+            src.sigma_upper = self._panel_sigma.get_sigma_upper()
+            src.sigma_lower = self._panel_sigma.get_sigma_lower()
+            src.one_sided = self._panel_sigma.is_one_sided()
+            src.one_sided_direction = self._panel_sigma.get_one_sided_direction()
+            src.mirror_assumed = True  # always true in current UI
+            if src.asymmetric and src.one_sided:
+                src.evidence_note = (
+                    src.evidence_note or
+                    f"One-sided ({src.one_sided_direction}); "
+                    f"mirror assumption applied."
+                )
             if src.is_supplier:
                 src.dof = float('inf')
             elif src.sample_size > 1:
@@ -3824,6 +5140,64 @@ class UncertaintySourcesTab(QWidget):
             warnings_list.append(
                 "Standard uncertainty is zero. Verify that data has been "
                 "entered correctly."
+            )
+            if severity != 'red':
+                severity = 'yellow'
+
+        # Classification guardrails (prevent common misuse in early-stage teams)
+        uclass = (getattr(src, 'uncertainty_class', 'aleatoric') or 'aleatoric').lower()
+        reducibility = (getattr(src, 'reducibility', 'low') or 'low').lower()
+        basis_type = (getattr(src, 'basis_type', 'measured') or 'measured').lower()
+        cat_key = src.get_category_key()
+        name_l = (src.name or "").lower()
+        evidence_l = (src.evidence_note or "").lower()
+
+        if uclass == "epistemic" and reducibility == "low":
+            warnings_list.append(
+                "Class/reducibility mismatch: epistemic uncertainty is usually "
+                "reducible. If this is a true measurement floor, classify as "
+                "'mixed' or 'aleatoric' and document evidence."
+            )
+            if severity != 'red':
+                severity = 'yellow'
+
+        if uclass == "epistemic" and basis_type in (
+            "measured", "spec_limit", "standard_reference"
+        ):
+            warnings_list.append(
+                "Measured/spec-based uncertainty often contains both random "
+                "(aleatoric) and bias (epistemic) parts. Consider 'mixed' "
+                "unless those parts were separated explicitly."
+            )
+            if severity != 'red':
+                severity = 'yellow'
+
+        if cat_key == "u_num" and uclass == "aleatoric":
+            warnings_list.append(
+                "Numerical uncertainty is usually epistemic or mixed in V&V "
+                "practice. Use purely aleatoric classification only when an "
+                "irreducible numerical floor has been demonstrated."
+            )
+            if severity != 'red':
+                severity = 'yellow'
+
+        if ("mass flow" in name_l or "massflow" in name_l or "mdot" in name_l) and uclass == "epistemic":
+            warnings_list.append(
+                "Inlet mass-flow sensor uncertainty is often mixed "
+                "(repeatability/noise + calibration bias). Consider class "
+                "'mixed' unless you have isolated one component."
+            )
+            if severity != 'red':
+                severity = 'yellow'
+
+        if cat_key == "u_num" and (
+            "over-refin" in name_l or "over-refin" in evidence_l
+            or "grid-independent" in evidence_l or "asymptotic" in evidence_l
+        ) and uclass == "epistemic":
+            warnings_list.append(
+                "If the mesh study already shows asymptotic/grid-independent "
+                "behavior, residual numerical uncertainty may be low-reducibility "
+                "mixed/aleatoric-like. Document rationale and consider 'mixed'."
             )
             if severity != 'red':
                 severity = 'yellow'
@@ -4083,8 +5457,10 @@ class AnalysisSettingsTab(QWidget):
         )
         self._rb_k_tol.setToolTip(
             "Uses the non-central t-distribution to determine a one-sided "
-            "tolerance factor that accounts for both sample size and desired "
-            "coverage/confidence. [ISO 16269-6, ASME PTC 19.1]"
+            "tolerance factor. This accounts for both the desired coverage "
+            "AND the extra uncertainty from having a limited sample size "
+            "(the fewer data points you have, the larger k must be to "
+            "maintain the same confidence). [ISO 16269-6, ASME PTC 19.1]"
         )
         self._bg_k_method.addButton(self._rb_k_tol, 2)
         layout.addWidget(self._rb_k_tol)
@@ -4198,8 +5574,9 @@ class AnalysisSettingsTab(QWidget):
             "Latin Hypercube (LHS): stratified sampling that divides each\n"
             "source's probability space into N equal intervals and draws\n"
             "exactly one sample per interval.  Produces the same result\n"
-            "distributions with ~10× fewer samples needed for convergence.\n"
-            "[McKay et al. 1979; JCGM 101:2008 §6.4; ASME V&V 20 §4.4]"
+            "distributions and often stabilizes percentile estimates faster\n"
+            "than random MC for the same N.\n"
+            "[McKay et al. 1979; JCGM 101:2008 MC framework; ASME V&V 20 §4.4]"
         )
         form.addRow("Sampling method:", self._cmb_mc_sampling)
 
@@ -4317,6 +5694,26 @@ class AnalysisSettingsTab(QWidget):
         desc_both.setWordWrap(True)
         layout.addWidget(desc_both)
 
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Validation metric mode:"))
+        self._cmb_validation_mode = QComboBox()
+        self._cmb_validation_mode.addItem(
+            "Standard scalar (V&V 20)",
+            "Standard scalar (V&V 20)",
+        )
+        self._cmb_validation_mode.addItem(
+            "Multivariate supplement (covariance-aware)",
+            "Multivariate supplement (covariance-aware)",
+        )
+        self._cmb_validation_mode.setToolTip(
+            "Standard scalar keeps the classic V&V 20 metric.\n"
+            "Multivariate supplement additionally reports a covariance-aware\n"
+            "global metric for multi-location datasets."
+        )
+        mode_row.addWidget(self._cmb_validation_mode)
+        mode_row.addStretch()
+        layout.addLayout(mode_row)
+
         self._main_layout.addWidget(grp)
 
     # =================================================================
@@ -4361,6 +5758,9 @@ class AnalysisSettingsTab(QWidget):
         # Bound type
         self._bg_bound.idToggled.connect(
             lambda *_: self._emit_settings_changed()
+        )
+        self._cmb_validation_mode.currentIndexChanged.connect(
+            self._emit_settings_changed
         )
 
     def _emit_settings_changed(self, *_args):
@@ -4411,6 +5811,7 @@ class AnalysisSettingsTab(QWidget):
             2: "Both (for comparison)",
         }
         bound_type = bound_map.get(bound_id, "Both (for comparison)")
+        validation_mode = self._cmb_validation_mode.currentData()
 
         return AnalysisSettings(
             coverage=coverage,
@@ -4423,6 +5824,7 @@ class AnalysisSettingsTab(QWidget):
             mc_bootstrap=mc_bootstrap,
             mc_sampling_method=mc_sampling_method,
             bound_type=bound_type,
+            validation_mode=validation_mode,
         )
 
     def set_settings(self, settings: AnalysisSettings):
@@ -4499,6 +5901,12 @@ class AnalysisSettingsTab(QWidget):
             bound_btn = self._bg_bound.button(bound_id)
             if bound_btn:
                 bound_btn.setChecked(True)
+
+            val_mode = getattr(settings, 'validation_mode', "Standard scalar (V&V 20)")
+            for idx in range(self._cmb_validation_mode.count()):
+                if self._cmb_validation_mode.itemData(idx) == val_mode:
+                    self._cmb_validation_mode.setCurrentIndex(idx)
+                    break
         finally:
             self.blockSignals(False)
             self._loading = False
@@ -4620,14 +6028,16 @@ class RSSResultsTab(QWidget):
         lay = QVBoxLayout(grp)
 
         self._budget_table = QTableWidget()
-        self._budget_table.setColumnCount(8)
+        self._budget_table.setColumnCount(10)
         self._budget_table.setHorizontalHeaderLabels([
             "Source", "Category", "\u03c3 [unit]", "\u03c3\u00b2 [unit\u00b2]",
-            "\u03bd (DOF)", "% of u_val\u00b2", "Distribution", "Data Basis"
+            "\u03bd (DOF)", "% of u_val\u00b2", "Distribution", "Data Basis",
+            "Class", "Reducibility"
         ])
         style_table(self._budget_table,
-                    column_widths={0: 180, 1: 130, 2: 90, 3: 100,
-                                   4: 70, 5: 100, 6: 110, 7: 120},
+                    column_widths={0: 160, 1: 110, 2: 80, 3: 90,
+                                   4: 65, 5: 90, 6: 100, 7: 100,
+                                   8: 80, 9: 85},
                     stretch_col=0)
         self._budget_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._budget_table.setAlternatingRowColors(True)
@@ -4699,6 +6109,10 @@ class RSSResultsTab(QWidget):
         )
         self._left_layout.addWidget(self._guidance_bias)
 
+        self._guidance_unit_mismatch = GuidancePanel("Unit Consistency Check")
+        self._guidance_unit_mismatch.setVisible(False)
+        self._left_layout.addWidget(self._guidance_unit_mismatch)
+
     # -- Plot Section --
     def _build_plot_section(self):
         plt.rcParams.update(PLOT_STYLE)
@@ -4710,7 +6124,9 @@ class RSSResultsTab(QWidget):
         self._canvas.setMinimumWidth(400)
         self._canvas.setMinimumHeight(550)
 
-        toolbar_row = make_plot_toolbar_with_copy(self._canvas, self._fig, self)
+        toolbar_row = make_plot_toolbar_with_copy(
+            self._canvas, self._fig, self,
+            method_context="RSS ASME V&V 20")
 
         # Wrap canvas in a scroll area for horizontal scrolling
         plot_scroll = QScrollArea()
@@ -4764,7 +6180,7 @@ class RSSResultsTab(QWidget):
             all_sigmas.append(sigma)
             all_dofs.append(dof)
 
-            contributions.append({
+            contrib_entry = {
                 'name': src.name,
                 'category': src.category,
                 'category_key': cat_key,
@@ -4773,7 +6189,17 @@ class RSSResultsTab(QWidget):
                 'dof': dof,
                 'distribution': src.distribution,
                 'data_basis': src.sigma_basis,
-            })
+                'uncertainty_class': src.uncertainty_class,
+                'basis_type': src.basis_type,
+                'reducibility': src.reducibility,
+            }
+            if src.asymmetric:
+                contrib_entry['asymmetric'] = True
+                contrib_entry['sigma_upper'] = src.get_sigma_upper()
+                contrib_entry['sigma_lower'] = src.get_sigma_lower()
+                contrib_entry['one_sided'] = src.one_sided
+                contrib_entry['mirror_assumed'] = src.mirror_assumed
+            contributions.append(contrib_entry)
 
         audit_log.log_computation(
             "RSS_SOURCES",
@@ -4782,22 +6208,143 @@ class RSSResultsTab(QWidget):
         )
 
         # ----------------------------------------------------------
-        # 2. Compute category-level RSS
+        # 2. Compute category-level RSS (correlation-aware)
         # ----------------------------------------------------------
-        u_num = np.sqrt(sum(s ** 2 for s in cat_sigmas["u_num"])) if cat_sigmas["u_num"] else 0.0
-        u_input = np.sqrt(sum(s ** 2 for s in cat_sigmas["u_input"])) if cat_sigmas["u_input"] else 0.0
-        u_D = np.sqrt(sum(s ** 2 for s in cat_sigmas["u_D"])) if cat_sigmas["u_D"] else 0.0
+        # Build per-category lists of (sigma, correlation_group, rho, name)
+        cat_sources: dict[str, list] = {"u_num": [], "u_input": [], "u_D": []}
+        for src in sources:
+            cat_key = src.get_category_key()
+            sigma = src.get_standard_uncertainty()
+            cat_sources[cat_key].append(
+                (sigma, src.correlation_group.strip(), src.correlation_coefficient, src.name)
+            )
+
+        def _correlated_rss(entries: list) -> tuple[float, bool, list]:
+            """Compute RSS with correlation support.
+
+            Returns (combined_sigma, has_correlations, corr_matrices).
+            entries: list of (sigma, group, rho, name).
+            corr_matrices: list of (group_name, source_names, C_submatrix).
+            When a non-empty correlation group exists, build the full
+            correlation matrix C and compute sqrt(σᵀ · C · σ).
+            Falls back to independent sqrt(Σσ²) when all groups are empty.
+            """
+            if not entries:
+                return 0.0, False, []
+            sigmas = np.array([e[0] for e in entries])
+            groups = [e[1] for e in entries]
+            rhos = [e[2] for e in entries]
+
+            has_corr = any(g != "" for g in groups)
+            if not has_corr:
+                # Standard independent quadrature
+                return float(np.sqrt(np.sum(sigmas ** 2))), False, []
+
+            # Build correlation matrix
+            n = len(entries)
+            C = np.eye(n)
+            # Group sources by correlation group
+            group_indices: dict[str, list[int]] = {}
+            for i, g in enumerate(groups):
+                if g:
+                    group_indices.setdefault(g, []).append(i)
+
+            # Within each group, assign pairwise correlations
+            # Reference source = first alphabetically (ρ_ref = 1.0 implicitly)
+            # Other sources have ρ_i with reference, and ρ_ij ≈ ρ_i · ρ_j
+            for g_name, indices in group_indices.items():
+                if len(indices) < 2:
+                    continue
+                # Sort alphabetically by source name for deterministic reference
+                indices.sort(key=lambda i: entries[i][3].lower())
+                group_rhos = [rhos[i] for i in indices]
+                # Reference source (first alphabetically) has ρ = 1.0 implicitly
+                group_rhos[0] = 1.0
+                ref_name = entries[indices[0]][3]
+                audit_log.log_computation(
+                    "CORR_REF",
+                    f"Group '{g_name}': reference source = '{ref_name}' "
+                    f"(first alphabetically, ρ = 1.0)"
+                )
+                # Warn about rho=0.0 in a group (effectively independent)
+                for k_idx, rho_k in zip(indices[1:], group_rhos[1:]):
+                    if rho_k == 0.0:
+                        src_name = entries[k_idx][3]
+                        audit_log.log_assumption(
+                            f"Source '{src_name}' is in correlation group '{g_name}' "
+                            f"but has ρ = 0.0 — effectively independent of group members."
+                        )
+                # Build pairwise correlations via transitivity
+                for a_pos, a_idx in enumerate(indices):
+                    for b_pos, b_idx in enumerate(indices):
+                        if a_idx == b_idx:
+                            continue
+                        # ρ(a,b) = ρ_a * ρ_b for transitivity
+                        rho_a = group_rhos[a_pos]
+                        rho_b = group_rhos[b_pos]
+                        C[a_idx, b_idx] = rho_a * rho_b
+
+            # Collect per-group sub-matrices for reporting
+            corr_detail: list[tuple] = []
+            for g_name, indices in group_indices.items():
+                if len(indices) < 2:
+                    continue
+                names = [entries[i][3] for i in indices]
+                sub = np.eye(len(indices))
+                for ap, ai in enumerate(indices):
+                    for bp, bi in enumerate(indices):
+                        if ai != bi:
+                            sub[ap, bp] = C[ai, bi]
+                corr_detail.append((g_name, names, sub))
+
+            # Ensure positive semi-definiteness
+            eigvals = np.linalg.eigvalsh(C)
+            if np.any(eigvals < -1e-10):
+                audit_log.log_computation(
+                    "RSS_CORR_WARNING",
+                    f"Correlation matrix has negative eigenvalues "
+                    f"(min={float(eigvals.min()):.4g}). Falling back "
+                    f"to independent RSS."
+                )
+                return float(np.sqrt(np.sum(sigmas ** 2))), False, []
+
+            # σᵀ · C · σ
+            var = float(sigmas @ C @ sigmas)
+            return float(np.sqrt(max(var, 0.0))), True, corr_detail
+
+        u_num, corr_num, cm_num = _correlated_rss(cat_sources["u_num"])
+        u_input, corr_inp, cm_inp = _correlated_rss(cat_sources["u_input"])
+        u_D, corr_D, cm_D = _correlated_rss(cat_sources["u_D"])
+        has_any_correlation = corr_num or corr_inp or corr_D
+        all_corr_matrices = cm_num + cm_inp + cm_D
 
         # ----------------------------------------------------------
         # 3. Combined standard uncertainty
         # ----------------------------------------------------------
         u_val = np.sqrt(u_num ** 2 + u_input ** 2 + u_D ** 2)
 
+        corr_label = ("with correlation" if has_any_correlation
+                       else "independent (no correlations)")
         audit_log.log_computation(
             "RSS_COMBINED",
             f"u_num={u_num:.6g}, u_input={u_input:.6g}, u_D={u_D:.6g}, "
-            f"u_val={u_val:.6g} [{unit}]"
+            f"u_val={u_val:.6g} [{unit}] ({corr_label})"
         )
+        if has_any_correlation:
+            corr_groups = set(
+                src.correlation_group.strip() for src in sources
+                if src.correlation_group.strip()
+            )
+            audit_log.log_assumption(
+                f"Correlation matrix applied for groups: "
+                f"{', '.join(sorted(corr_groups))}. "
+                f"Cross-category correlations assumed zero."
+            )
+        else:
+            audit_log.log_assumption(
+                "All uncertainty sources treated as independent — "
+                "no correlation groups defined."
+            )
 
         # ----------------------------------------------------------
         # 4. Effective DOF via Welch-Satterthwaite
@@ -4839,6 +6386,20 @@ class RSSResultsTab(QWidget):
                 )
         elif settings.k_method == K_METHOD_MANUAL:
             k_factor = settings.manual_k
+            if k_factor <= 0:
+                audit_log.log_warning(
+                    "MANUAL_K_INVALID",
+                    f"Manual k = {k_factor:.4f} is not valid (must be > 0). "
+                    f"Falling back to k = 2.0."
+                )
+                k_factor = 2.0
+            elif k_factor < 1.0:
+                audit_log.log_warning(
+                    "MANUAL_K_LOW",
+                    f"Manual k = {k_factor:.4f} is unusually low. "
+                    f"Typical values range from 1.5 to 3.0. A low k-factor "
+                    f"may produce a non-conservative expanded uncertainty."
+                )
         else:
             k_factor = 2.0
 
@@ -4869,16 +6430,47 @@ class RSSResultsTab(QWidget):
             p5 = 0.0
             p95 = 0.0
 
+        validation_mode = getattr(settings, 'validation_mode', "Standard scalar (V&V 20)")
+        mv_enabled = "multivariate" in validation_mode.lower()
+        if mv_enabled:
+            mv = compute_multivariate_validation(comp_data)
+            audit_log.log_computation(
+                "RSS_MULTIVARIATE",
+                (
+                    f"enabled={mv_enabled}, computed={mv.get('computed', False)}, "
+                    f"score={mv.get('score', 0.0):.4g}, p={mv.get('pvalue', 1.0):.4g}, "
+                    f"locations={mv.get('n_locations', 0)}, "
+                    f"conditions={mv.get('n_conditions', 0)}"
+                ),
+            )
+        else:
+            mv = {
+                'computed': False,
+                'score': 0.0,
+                't2': 0.0,
+                'pvalue': 1.0,
+                'n_locations': 0,
+                'n_conditions': 0,
+                'note': "Multivariate supplement disabled.",
+            }
+
         # ----------------------------------------------------------
         # 8. Validation assessment (V&V 20 Eq. 1)
         # ----------------------------------------------------------
-        bias_explained = abs(E_mean) <= U_val
-
-        audit_log.log_computation(
-            "RSS_VALIDATION",
-            f"|E_mean| = {abs(E_mean):.6g} vs U_val = {U_val:.6g} => "
-            f"Bias {'IS' if bias_explained else 'IS NOT'} explained"
-        )
+        if n_data > 0:
+            bias_explained = abs(E_mean) <= U_val
+            audit_log.log_computation(
+                "RSS_VALIDATION",
+                f"|E_mean| = {abs(E_mean):.6g} vs U_val = {U_val:.6g} => "
+                f"Bias {'IS' if bias_explained else 'IS NOT'} explained"
+            )
+        else:
+            bias_explained = None  # Cannot determine without comparison data
+            audit_log.log_computation(
+                "RSS_VALIDATION_SKIPPED",
+                "No comparison data loaded — validation verdict "
+                "cannot be determined."
+            )
 
         # ----------------------------------------------------------
         # 9. Model form uncertainty estimate
@@ -4891,18 +6483,47 @@ class RSSResultsTab(QWidget):
             model_form_pct = 0.0
 
         # ----------------------------------------------------------
-        # 10. Prediction bounds
+        # 10. Prediction bounds (gated by bound_type setting)
         # ----------------------------------------------------------
         lower_bound_uval = E_mean - k_factor * u_val
         upper_bound_uval = E_mean + k_factor * u_val
         lower_bound_sE = E_mean - k_factor * s_E
         upper_bound_sE = E_mean + k_factor * s_E
 
+        bound_type = getattr(settings, 'bound_type', 'Both (for comparison)')
+        bt_lower = bound_type.lower()
+        if 'both' not in bt_lower:
+            if 'u_val' in bt_lower and 's_e' not in bt_lower:
+                # "Known uncertainties only (u_val)" — suppress s_E bounds
+                lower_bound_sE = float('nan')
+                upper_bound_sE = float('nan')
+            elif 's_e' in bt_lower and 'u_val' not in bt_lower:
+                # "Total observed scatter (s_E)" — suppress u_val bounds
+                lower_bound_uval = float('nan')
+                upper_bound_uval = float('nan')
+        # else: "Both (for comparison)" — keep both
+
         audit_log.log_computation(
             "RSS_BOUNDS",
+            f"Bound mode: {bound_type}. "
             f"u_val bounds: [{lower_bound_uval:.6g}, {upper_bound_uval:.6g}], "
             f"s_E bounds: [{lower_bound_sE:.6g}, {upper_bound_sE:.6g}] [{unit}]"
         )
+
+        # ----------------------------------------------------------
+        # Compute uncertainty class split (U_A, U_E, U_mixed)
+        # ----------------------------------------------------------
+        class_sigmas = {'aleatoric': [], 'epistemic': [], 'mixed': []}
+        for c in contributions:
+            cls = c.get('uncertainty_class', 'aleatoric')
+            if cls not in ('aleatoric', 'epistemic', 'mixed'):
+                cls = 'aleatoric'
+            class_sigmas[cls].append(c['sigma'])
+        u_aleatoric = float(np.sqrt(sum(s**2 for s in class_sigmas['aleatoric'])))
+        u_epistemic = float(np.sqrt(sum(s**2 for s in class_sigmas['epistemic'])))
+        u_mixed_val = float(np.sqrt(sum(s**2 for s in class_sigmas['mixed'])))
+        u_val_sq_for_pct = u_val ** 2 if u_val > 0 else 1.0
+        pct_epistemic = (u_epistemic ** 2 / u_val_sq_for_pct * 100.0) if u_val > 0 else 0.0
 
         # ----------------------------------------------------------
         # Store results
@@ -4928,8 +6549,24 @@ class RSSResultsTab(QWidget):
             bias_explained=bias_explained,
             source_contributions=contributions,
             computed=True,
-            _coverage=settings.coverage,
-            _one_sided=settings.one_sided,
+            has_correlations=has_any_correlation,
+            correlation_groups=sorted(set(
+                s.correlation_group.strip() for s in sources
+                if s.correlation_group.strip()
+            )),
+            correlation_matrices=all_corr_matrices,
+            u_aleatoric=u_aleatoric,
+            u_epistemic=u_epistemic,
+            u_mixed=u_mixed_val,
+            pct_epistemic=pct_epistemic,
+            multivariate_enabled=mv_enabled,
+            multivariate_computed=bool(mv.get('computed', False)),
+            multivariate_score=float(mv.get('score', 0.0)),
+            multivariate_t2=float(mv.get('t2', 0.0)),
+            multivariate_pvalue=float(mv.get('pvalue', 1.0)),
+            multivariate_n_locations=int(mv.get('n_locations', 0)),
+            multivariate_n_conditions=int(mv.get('n_conditions', 0)),
+            multivariate_note=str(mv.get('note', "")),
         )
 
         # Build budget table data
@@ -4962,6 +6599,28 @@ class RSSResultsTab(QWidget):
         for gp in [self._guidance_dominant, self._guidance_dof,
                     self._guidance_model, self._guidance_bias]:
             gp.set_guidance("", "green")
+        self._guidance_unit_mismatch.setVisible(False)
+
+    def show_unit_mismatch(self, mismatched: list, global_unit: str):
+        """Show a prominent unit mismatch warning on the RSS tab."""
+        names = ", ".join(mismatched[:5])
+        if len(mismatched) > 5:
+            names += f", ... (+{len(mismatched) - 5} more)"
+        self._guidance_unit_mismatch.set_guidance(
+            f"UNIT MISMATCH: {len(mismatched)} source(s) use different "
+            f"units than the global setting '{global_unit}':\n"
+            f"{names}\n\n"
+            f"The RSS combination assumes all sigma values are in the "
+            f"same unit. Mixing units (e.g., °F and K) will produce "
+            f"incorrect results. Fix the mismatched sources on Tab 2 "
+            f"or change the global unit on Tab 3.",
+            'yellow'
+        )
+        self._guidance_unit_mismatch.setVisible(True)
+
+    def hide_unit_mismatch(self):
+        """Hide the unit mismatch warning."""
+        self._guidance_unit_mismatch.setVisible(False)
 
     def get_budget_table_data(self) -> list:
         """Return the budget table data for export."""
@@ -4994,7 +6653,7 @@ class RSSResultsTab(QWidget):
 
             for item in items:
                 pct = (item['sigma_sq'] / u_val_sq * 100.0) if u_val_sq > 0 else 0.0
-                budget.append({
+                entry = {
                     'name': item['name'],
                     'category': item['category'],
                     'sigma': item['sigma'],
@@ -5003,9 +6662,17 @@ class RSSResultsTab(QWidget):
                     'pct': pct,
                     'distribution': item['distribution'],
                     'data_basis': item['data_basis'],
+                    'uncertainty_class': item.get('uncertainty_class', 'aleatoric'),
+                    'basis_type': item.get('basis_type', 'measured'),
+                    'reducibility': item.get('reducibility', 'low'),
                     'is_subtotal': False,
                     'is_total': False,
-                })
+                }
+                if item.get('asymmetric'):
+                    entry['asymmetric'] = True
+                    entry['sigma_upper'] = item['sigma_upper']
+                    entry['sigma_lower'] = item['sigma_lower']
+                budget.append(entry)
 
             # Subtotal row
             sub_sigma_sq = sum(it['sigma_sq'] for it in items)
@@ -5056,11 +6723,23 @@ class RSSResultsTab(QWidget):
         self._budget_table.setRowCount(len(self._budget_data))
 
         # Update column headers with unit
+        has_corr = (self._results is not None
+                    and getattr(self._results, 'has_correlations', False))
+        pct_header = "% of u_val\u00b2 \u2020" if has_corr else "% of u_val\u00b2"
         self._budget_table.setHorizontalHeaderLabels([
             "Source", "Category",
-            f"\u03c3 [{unit}]", f"\u03c3\u00b2 [{unit}\u00b2]",
-            "\u03bd (DOF)", "% of u_val\u00b2", "Distribution", "Data Basis"
+            f"\u03c3 (Sigma) [{unit}]", f"\u03c3\u00b2 (Variance) [{unit}\u00b2]",
+            "DOF (\u03bd)", pct_header, "Distribution", "Data Basis",
+            "Class", "Reducibility"
         ])
+        if has_corr:
+            h5 = self._budget_table.horizontalHeaderItem(5)
+            if h5:
+                h5.setToolTip(
+                    "\u2020 With correlated sources, percentages do not sum\n"
+                    "to 100% because cross-correlation terms also\n"
+                    "contribute to u_val\u00b2."
+                )
 
         for row, item in enumerate(self._budget_data):
             is_special = item['is_subtotal'] or item['is_total']
@@ -5076,9 +6755,23 @@ class RSSResultsTab(QWidget):
             # Category
             self._budget_table.setItem(row, 1, QTableWidgetItem(item['category']))
 
-            # Sigma
-            sigma_item = QTableWidgetItem(f"{item['sigma']:.4g}")
+            # Sigma (with asymmetric indicator)
+            if item.get('asymmetric'):
+                sp = item.get('sigma_upper', 0)
+                sm = item.get('sigma_lower', 0)
+                sigma_text = f"{item['sigma']:.4g} (\u03c3\u207a={sp:.3g} / \u03c3\u207b={sm:.3g})"
+            else:
+                sigma_text = f"{item['sigma']:.4g}"
+            sigma_item = QTableWidgetItem(sigma_text)
             sigma_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if item.get('asymmetric'):
+                sigma_item.setToolTip(
+                    f"\u03c3\u207a (upper) = {item.get('sigma_upper', 0):.6g}\n"
+                    f"\u03c3\u207b (lower) = {item.get('sigma_lower', 0):.6g}\n"
+                    f"Effective \u03c3 = \u221a((\u03c3\u207a\u00b2 + \u03c3\u207b\u00b2) / 2)"
+                    f" = {item['sigma']:.6g}\n"
+                    f"[GUM \u00a74.3.8]"
+                )
             if is_special:
                 font = sigma_item.font()
                 font.setBold(True)
@@ -5129,14 +6822,20 @@ class RSSResultsTab(QWidget):
             # Data basis
             self._budget_table.setItem(row, 7, QTableWidgetItem(item['data_basis']))
 
+            # Class and Reducibility
+            self._budget_table.setItem(row, 8, QTableWidgetItem(
+                item.get('uncertainty_class', '')))
+            self._budget_table.setItem(row, 9, QTableWidgetItem(
+                item.get('reducibility', '')))
+
             # Style subtotal/total rows
             if item['is_subtotal']:
-                for col in range(8):
+                for col in range(10):
                     cell = self._budget_table.item(row, col)
                     if cell:
                         cell.setBackground(QColor(DARK_COLORS['bg_alt']))
             elif item['is_total']:
-                for col in range(8):
+                for col in range(10):
                     cell = self._budget_table.item(row, col)
                     if cell:
                         cell.setBackground(QColor(DARK_COLORS['accent']))
@@ -5165,6 +6864,95 @@ class RSSResultsTab(QWidget):
         lines.append(f"Effective DOF (Welch-Satterthwaite): \u03bd_eff = {nu_str}")
         lines.append(f"Coverage Factor: k = {r.k_factor:.4f}  [method: {r.k_method_used}]")
         lines.append(f"Expanded Uncertainty: U_val = {r.U_val:.4f} [{unit}]")
+        bound_type = getattr(settings, 'bound_type', 'Both (for comparison)')
+        lines.append(f"Bound mode: {bound_type}")
+        if r.has_correlations:
+            lines.append(
+                f"Source correlation: Applied (groups: "
+                f"{', '.join(r.correlation_groups)})"
+            )
+            # Effective pairwise correlation matrices
+            for grp_name, names, C_mat in r.correlation_matrices:
+                lines.append("")
+                lines.append(f"  Group \"{grp_name}\" effective \u03c1 matrix:")
+                # Header row
+                max_name = max(len(n) for n in names)
+                pad = max(max_name, 8)
+                hdr = " " * (pad + 4) + "  ".join(
+                    f"{n:>{pad}}" for n in names
+                )
+                lines.append(f"  {hdr}")
+                # Data rows
+                for row_idx, row_name in enumerate(names):
+                    vals = "  ".join(
+                        f"{C_mat[row_idx, col_idx]:>{pad}.2f}"
+                        for col_idx in range(len(names))
+                    )
+                    lines.append(f"    {row_name:>{pad}}  {vals}")
+        else:
+            lines.append("Source correlation: Independent (no correlations)")
+        lines.append("")
+
+        # Uncertainty class split
+        lines.append(
+            f"Uncertainty class split: U_A={r.u_aleatoric:.4f}, "
+            f"U_E={r.u_epistemic:.4f}, U_mixed={r.u_mixed:.4f} [{unit}]"
+        )
+        lines.append(
+            f"  Epistemic fraction: {r.pct_epistemic:.1f}% of total variance"
+        )
+        lines.append(
+            "  Note: class labels guide prioritization/reporting; the RSS and "
+            "MC combination math still includes all enabled sources."
+        )
+        lines.append(
+            "  ASME V&V 20 compliance: The RSS combination of all sources "
+            "(regardless of epistemic/aleatory class) follows ASME V&V 20-2009 "
+            "(R2021) Section 9 and the GUM (JCGM 100:2008) framework. V&V 20 "
+            "converts all uncertainty sources to standard uncertainties (1-sigma) "
+            "before RSS combination."
+        )
+        if r.pct_epistemic > 50:
+            lines.append(
+                "  Caveat: Epistemic sources dominate this budget (>50%). The RSS "
+                "assumption of random cancellation may be non-conservative for "
+                "systematic/knowledge-gap uncertainties. For stricter separation, "
+                "frameworks such as Oberkampf & Roy (2010) recommend double-loop "
+                "Monte Carlo producing probability boxes (p-boxes). This tool "
+                "follows V&V 20's pragmatic engineering approach."
+            )
+
+        # Dominant drivers by class
+        u_val_sq_for_drv = r.u_val ** 2 if r.u_val > 0 else 1.0
+        _dom_a_name = _dom_e_name = ""
+        _dom_a_pct = _dom_e_pct = 0.0
+        _dom_e_red = ""
+        for c in r.source_contributions:
+            cpct = (c['sigma'] ** 2 / u_val_sq_for_drv * 100.0) if r.u_val > 0 else 0.0
+            cls = c.get('uncertainty_class', 'aleatoric')
+            if cls == 'aleatoric' and cpct > _dom_a_pct:
+                _dom_a_pct = cpct
+                _dom_a_name = c['name']
+            elif cls == 'epistemic' and cpct > _dom_e_pct:
+                _dom_e_pct = cpct
+                _dom_e_name = c['name']
+                _dom_e_red = c.get('reducibility', '')
+        if _dom_a_name:
+            lines.append(
+                f"  Dominant aleatoric driver: {_dom_a_name} ({_dom_a_pct:.1f}%)"
+            )
+        if _dom_e_name:
+            red_tag = f", reducibility: {_dom_e_red}" if _dom_e_red else ""
+            lines.append(
+                f"  Dominant epistemic gap: {_dom_e_name} "
+                f"({_dom_e_pct:.1f}%{red_tag})"
+            )
+
+        if r.pct_epistemic > 50.0:
+            lines.append(
+                "  \u26a0 Epistemic uncertainty dominates \u2014 consider "
+                "knowledge-reduction actions before making compliance claims."
+            )
         lines.append("")
 
         lines.append("-" * 60)
@@ -5178,13 +6966,56 @@ class RSSResultsTab(QWidget):
         lines.append("-" * 60)
         lines.append("  Validation Assessment  [V&V 20 Eq. (1)]")
         lines.append("-" * 60)
-        bias_result = "Bias IS explained by known uncertainties" if r.bias_explained \
-            else "Bias IS NOT explained by known uncertainties"
-        lines.append(
-            f"  |\u0112| vs U_val: {abs(r.E_mean):.4f} vs {r.U_val:.4f} "
-            f"\u2192 [{bias_result}]"
-        )
+        if r.bias_explained is None:
+            lines.append(
+                "  Validation assessment not available (no comparison data)."
+            )
+            lines.append(
+                "  Load experimental comparison data on Tab 1 to enable "
+                "the V&V 20 validation verdict."
+            )
+        else:
+            bias_result = ("Bias IS explained by known uncertainties"
+                           if r.bias_explained else
+                           "Bias IS NOT explained by known uncertainties")
+            lines.append(
+                f"  |\u0112| vs U_val: {abs(r.E_mean):.4f} vs {r.U_val:.4f} "
+                f"\u2192 [{bias_result}]"
+            )
         lines.append("")
+
+        if getattr(r, 'multivariate_enabled', False):
+            lines.append("-" * 60)
+            lines.append("  Multivariate Supplemental Validation (covariance-aware)")
+            lines.append("-" * 60)
+            if getattr(r, 'multivariate_computed', False):
+                mv_pass = getattr(r, 'multivariate_pvalue', 1.0) >= 0.05
+                mv_verdict = (
+                    "Consistent with zero-bias hypothesis (p >= 0.05)"
+                    if mv_pass else
+                    "Potential structured multivariate bias (p < 0.05)"
+                )
+                lines.append(
+                    f"  Normalized multivariate score: {r.multivariate_score:.4f}"
+                )
+                lines.append(
+                    f"  Approx. Hotelling-style T\u00b2: {r.multivariate_t2:.4f}"
+                )
+                lines.append(
+                    f"  Chi-square p-value: {r.multivariate_pvalue:.4f} "
+                    f"\u2192 [{mv_verdict}]"
+                )
+                lines.append(
+                    f"  Coverage of dataset: {r.multivariate_n_locations} locations "
+                    f"x {r.multivariate_n_conditions} conditions"
+                )
+                if r.multivariate_note:
+                    lines.append(f"  Note: {r.multivariate_note}")
+            else:
+                lines.append("  Multivariate supplement enabled but not computable.")
+                if r.multivariate_note:
+                    lines.append(f"  Note: {r.multivariate_note}")
+            lines.append("")
 
         lines.append("-" * 60)
         lines.append("  Estimated Model Form Uncertainty")
@@ -5220,29 +7051,32 @@ class RSSResultsTab(QWidget):
             f"{conf_pct:.0f}% confidence"
         )
         lines.append("")
-        lines.append("  Using u_val only:")
-        lines.append(
-            f"    Lower bound = \u0112 - k \u00d7 u_val = "
-            f"{r.E_mean:+.4f} - {r.k_factor:.4f} \u00d7 {r.u_val:.4f} = "
-            f"{r.lower_bound_uval:+.4f} [{unit}]"
-        )
-        lines.append(
-            f"    Upper bound = \u0112 + k \u00d7 u_val = "
-            f"{r.E_mean:+.4f} + {r.k_factor:.4f} \u00d7 {r.u_val:.4f} = "
-            f"{r.upper_bound_uval:+.4f} [{unit}]"
-        )
-        lines.append("")
-        lines.append("  Using s_E (includes model form):")
-        lines.append(
-            f"    Lower bound = \u0112 - k \u00d7 s_E = "
-            f"{r.E_mean:+.4f} - {r.k_factor:.4f} \u00d7 {r.s_E:.4f} = "
-            f"{r.lower_bound_sE:+.4f} [{unit}]"
-        )
-        lines.append(
-            f"    Upper bound = \u0112 + k \u00d7 s_E = "
-            f"{r.E_mean:+.4f} + {r.k_factor:.4f} \u00d7 {r.s_E:.4f} = "
-            f"{r.upper_bound_sE:+.4f} [{unit}]"
-        )
+        if not np.isnan(r.lower_bound_uval):
+            lines.append("  Using u_val only:")
+            lines.append(
+                f"    Lower bound = \u0112 - k \u00d7 u_val = "
+                f"{r.E_mean:+.4f} - {r.k_factor:.4f} \u00d7 {r.u_val:.4f} = "
+                f"{r.lower_bound_uval:+.4f} [{unit}]"
+            )
+            lines.append(
+                f"    Upper bound = \u0112 + k \u00d7 u_val = "
+                f"{r.E_mean:+.4f} + {r.k_factor:.4f} \u00d7 {r.u_val:.4f} = "
+                f"{r.upper_bound_uval:+.4f} [{unit}]"
+            )
+            lines.append("")
+        if not np.isnan(r.lower_bound_sE):
+            lines.append("  Using s_E (includes model form):")
+            lines.append(
+                f"    Lower bound = \u0112 - k \u00d7 s_E = "
+                f"{r.E_mean:+.4f} - {r.k_factor:.4f} \u00d7 {r.s_E:.4f} = "
+                f"{r.lower_bound_sE:+.4f} [{unit}]"
+            )
+            lines.append(
+                f"    Upper bound = \u0112 + k \u00d7 s_E = "
+                f"{r.E_mean:+.4f} + {r.k_factor:.4f} \u00d7 {r.s_E:.4f} = "
+                f"{r.upper_bound_sE:+.4f} [{unit}]"
+            )
+            lines.append("")
         lines.append("")
         lines.append("  Empirical percentiles:")
         lines.append(f"    5th percentile  = {p5:+.4f} [{unit}]")
@@ -5257,7 +7091,7 @@ class RSSResultsTab(QWidget):
     # -----------------------------------------------------------------
     def _update_guidance_panels(self, contributions: List[dict],
                                 u_val: float, nu_eff: float,
-                                s_E: float, bias_explained: bool,
+                                s_E: float, bias_explained: Optional[bool],
                                 E_mean: float, U_val: float, unit: str):
         """Update all guidance panels based on computation results."""
         u_val_sq = u_val ** 2 if u_val > 0 else 1.0
@@ -5365,6 +7199,11 @@ class RSSResultsTab(QWidget):
 
         # -- Validation assessment --
         n_data = getattr(self._results, 'n_data', 0) if self._results else 0
+        mv_enabled = bool(getattr(self._results, 'multivariate_enabled', False)) if self._results else False
+        mv_computed = bool(getattr(self._results, 'multivariate_computed', False)) if self._results else False
+        mv_p = float(getattr(self._results, 'multivariate_pvalue', 1.0)) if self._results else 1.0
+        mv_warn = mv_enabled and mv_computed and mv_p < 0.05
+
         if n_data == 0:
             self._guidance_bias.set_guidance(
                 "\u26a0 No comparison data loaded. The validation assessment "
@@ -5373,24 +7212,53 @@ class RSSResultsTab(QWidget):
                 "before interpreting these results.",
                 'yellow'
             )
-        elif bias_explained:
+        elif bias_explained is None:
+            # bias_explained is None when n_data == 0 — already handled above
+            # but guard explicitly in case this path is reached differently
             self._guidance_bias.set_guidance(
-                f"|\u0112| = {abs(E_mean):.4f} \u2264 U_val = {U_val:.4f} [{unit}] "
-                f"\u2014 The mean comparison error is within the expanded "
-                f"uncertainty. The model is validated at the specified "
-                f"coverage level for this comparison metric. "
-                f"[ASME V&V 20 \u00a76, Eq. (1)]",
-                'green'
+                "\u26a0 Validation verdict cannot be determined — no "
+                "comparison data available.",
+                'yellow'
             )
+        elif bias_explained:
+            if mv_warn:
+                self._guidance_bias.set_guidance(
+                    f"|\u0112| = {abs(E_mean):.4f} \u2264 U_val = {U_val:.4f} [{unit}] "
+                    f"\u2014 Scalar V&V 20 validation passes, but the covariance-aware "
+                    f"multivariate supplement reports p = {mv_p:.4f} (< 0.05). "
+                    f"This suggests residual structured bias across locations/conditions. "
+                    f"Review model-form assumptions before closing validation.",
+                    'yellow'
+                )
+            else:
+                self._guidance_bias.set_guidance(
+                    f"|\u0112| = {abs(E_mean):.4f} \u2264 U_val = {U_val:.4f} [{unit}] "
+                    f"\u2014 The mean comparison error is within the expanded "
+                    f"uncertainty. The model is validated at the specified "
+                    f"coverage level for this comparison metric. "
+                    f"[ASME V&V 20 \u00a76, Eq. (1)]",
+                    'green'
+                )
         else:
             self._guidance_bias.set_guidance(
-                f"|\u0112| = {abs(E_mean):.4f} > U_val = {U_val:.4f} [{unit}] "
-                f"\u2014 The mean comparison error EXCEEDS the expanded "
-                f"uncertainty. The model has a statistically significant "
-                f"bias that is not explained by the known uncertainty "
-                f"sources. Recommendation: investigate systematic errors "
-                f"in the simulation (boundary conditions, grid convergence, "
-                f"turbulence model) or identify missing uncertainty sources. "
+                f"RESULT: NOT VALIDATED \u2014 the comparison error exceeds "
+                f"the known uncertainty.\n"
+                f"|Ē| = {abs(E_mean):.4f} > U_val = {U_val:.4f} [{unit}]\n\n"
+                f"This means either:\n"
+                f"1. The CFD model has a deficiency that produces bias "
+                f"beyond what uncertainties explain\n"
+                f"2. One or more uncertainty sources were underestimated\n"
+                f"3. Both\n\n"
+                f"RECOMMENDED NEXT STEPS:\n"
+                f"\u2022 Review each uncertainty source \u2014 is anything "
+                f"missing or underestimated?\n"
+                f"\u2022 Check if the dominant source can be reduced "
+                f"(epistemic sources are reducible)\n"
+                f"\u2022 Consider running additional validation points "
+                f"to confirm the trend\n"
+                f"\u2022 If bias is consistent, consider a bias correction "
+                f"approach\n"
+                f"\u2022 Document the gap and flag for model improvement\n"
                 f"[ASME V&V 20 \u00a76, Eq. (1)]",
                 'red'
             )
@@ -5526,16 +7394,26 @@ class RSSResultsTab(QWidget):
         ax.axvline(E_mean, color=DARK_COLORS['fg'], linewidth=1.0,
                     linestyle='-', alpha=0.7, label=f"\u0112 = {E_mean:+.3g}")
 
-        # u_val bounds
-        lb_uval = E_mean - k_factor * u_val
-        ub_uval = E_mean + k_factor * u_val
-        ax.axvline(lb_uval, color="#89b4fa", linewidth=1.2, linestyle=':',
-                    alpha=0.9, label=f"\u0112 \u00b1 k\u00b7u_val = [{lb_uval:+.3g}, {ub_uval:+.3g}]")
-        ax.axvline(ub_uval, color="#89b4fa", linewidth=1.2, linestyle=':',
-                    alpha=0.9)
+        # u_val bounds (gated by bound_type setting)
+        bound_type = getattr(settings, 'bound_type', 'Both (for comparison)')
+        bt_lower = bound_type.lower()
+        if 'both' in bt_lower:
+            show_uval = True
+            show_sE = True
+        else:
+            show_uval = 'u_val' in bt_lower
+            show_sE = 's_e' in bt_lower
 
-        # s_E bounds
-        if s_E > 0:
+        if show_uval:
+            lb_uval = E_mean - k_factor * u_val
+            ub_uval = E_mean + k_factor * u_val
+            ax.axvline(lb_uval, color="#89b4fa", linewidth=1.2, linestyle=':',
+                        alpha=0.9, label=f"\u0112 \u00b1 k\u00b7u_val = [{lb_uval:+.3g}, {ub_uval:+.3g}]")
+            ax.axvline(ub_uval, color="#89b4fa", linewidth=1.2, linestyle=':',
+                        alpha=0.9)
+
+        # s_E bounds (gated by bound_type setting)
+        if show_sE and s_E > 0:
             lb_sE = E_mean - k_factor * s_E
             ub_sE = E_mean + k_factor * s_E
             ax.axvline(lb_sE, color="#a6e3a1", linewidth=1.2, linestyle='--',
@@ -5648,13 +7526,163 @@ class _MCWorkerThread(QThread):
 
         # ----------------------------------------------------------
         # 1. Draw samples from each uncertainty source and sum them.
+        #    Correlation-aware: sources sharing a non-empty correlation_group
+        #    within the same V&V category and using Normal distributions are
+        #    sampled jointly via multivariate normal + Cholesky decomposition.
         # ----------------------------------------------------------
         combined = np.zeros(n_trials, dtype=np.float64)
         n_sources = len(self._sources)
 
+        # Identify correlation groups (category-scoped to match RSS assumptions)
+        corr_groups: dict[tuple[str, str], list[int]] = {}
+        group_to_categories: dict[str, set[str]] = {}
+        for idx, src in enumerate(self._sources):
+            grp = src.correlation_group.strip()
+            if grp:
+                cat_key = src.get_category_key()
+                corr_groups.setdefault((cat_key, grp), []).append(idx)
+                group_to_categories.setdefault(grp, set()).add(cat_key)
+
+        # Track which source indices are handled via multivariate sampling
+        handled_mv: set[int] = set()
+
+        # User-facing Monte Carlo notes (shown in Tab 5 / report)
+        mc_notes: List[str] = []
+        _mc_note_set = set()
+
+        def _add_mc_note(message: str):
+            if message and message not in _mc_note_set:
+                _mc_note_set.add(message)
+                mc_notes.append(message)
+
+        cat_labels = {
+            "u_num": "Numerical (u_num)",
+            "u_input": "Input/BC (u_input)",
+            "u_D": "Experimental (u_D)",
+        }
+        for grp_name, cat_set in sorted(group_to_categories.items()):
+            if len(cat_set) > 1:
+                cat_list = ", ".join(
+                    cat_labels.get(c, c) for c in sorted(cat_set)
+                )
+                _add_mc_note(
+                    f"Correlation group '{grp_name}' appears in multiple "
+                    f"categories ({cat_list}); cross-category correlation was "
+                    "not applied to stay consistent with RSS assumptions."
+                )
+                audit_log.log_warning(
+                    "MC_CORR_CROSS_CATEGORY",
+                    f"Group '{grp_name}' spans categories ({cat_list}); "
+                    "cross-category correlation terms were not applied."
+                )
+
+        # Process correlated groups first (multivariate normal)
+        for (cat_key, grp_name), indices in corr_groups.items():
+            if len(indices) < 2:
+                continue  # single-source group → treat as independent
+            # Sort alphabetically by source name for deterministic reference
+            indices.sort(key=lambda i: self._sources[i].name.lower())
+            grp_sources = [self._sources[i] for i in indices]
+            cat_label = cat_labels.get(cat_key, cat_key)
+            # Only use multivariate sampling for all-Normal groups
+            all_normal = all(s.distribution == "Normal" for s in grp_sources)
+            if not all_normal:
+                _add_mc_note(
+                    f"Correlation group '{grp_name}' ({cat_label}) includes "
+                    "non-Normal sources; Monte Carlo treated that group as independent."
+                )
+                audit_log.log_warning(
+                    "MC_CORR_FALLBACK_NONNORMAL",
+                    f"Group '{grp_name}' ({cat_label}) contains non-Normal "
+                    "distributions; "
+                    "falling back to independent sampling."
+                )
+                continue  # mixed distributions → independent sampling
+
+            sigmas = np.array([s.get_standard_uncertainty() for s in grp_sources])
+            means = np.array([
+                0.0 if s.is_centered_on_zero else s.mean_value
+                for s in grp_sources
+            ])
+            rhos = [s.correlation_coefficient for s in grp_sources]
+            # Reference source (first alphabetically) has ρ = 1.0 implicitly
+            rhos[0] = 1.0
+
+            # Warn about rho=0.0 in a group (effectively independent)
+            for mc_idx, (mc_src, mc_rho) in enumerate(
+                    zip(grp_sources[1:], rhos[1:])):
+                if mc_rho == 0.0:
+                    audit_log.log_assumption(
+                        f"MC: Source '{mc_src.name}' is in correlation group "
+                        f"'{grp_name}' ({cat_label}) but has ρ = 0.0 — "
+                        "effectively independent."
+                    )
+
+            # Build correlation matrix for this group
+            n_g = len(indices)
+            C = np.eye(n_g)
+            for a in range(n_g):
+                for b in range(n_g):
+                    if a == b:
+                        continue
+                    rho_a = rhos[a]
+                    rho_b = rhos[b]
+                    C[a, b] = rho_a * rho_b
+
+            # Validate positive semi-definiteness
+            eigvals = np.linalg.eigvalsh(C)
+            if np.any(eigvals < -1e-10):
+                # Fall back to independent for this group
+                _add_mc_note(
+                    f"Correlation group '{grp_name}' ({cat_label}) produced a non-PSD "
+                    "correlation matrix; Monte Carlo used independent sampling."
+                )
+                audit_log.log_warning(
+                    "MC_CORR_FALLBACK_PSD",
+                    f"Group '{grp_name}' ({cat_label}) correlation matrix is not positive "
+                    "semi-definite; falling back to independent sampling."
+                )
+                continue
+
+            # Build covariance matrix: Σ = diag(σ) · C · diag(σ)
+            cov = np.outer(sigmas, sigmas) * C
+
+            # Cholesky decomposition for sampling
+            try:
+                # Ensure PSD by clamping small negative eigenvalues
+                cov = (cov + cov.T) / 2.0
+                L = np.linalg.cholesky(cov)
+            except np.linalg.LinAlgError:
+                _add_mc_note(
+                    f"Correlation group '{grp_name}' ({cat_label}) covariance factorization "
+                    "failed; Monte Carlo used independent sampling."
+                )
+                audit_log.log_warning(
+                    "MC_CORR_FALLBACK_CHOLESKY",
+                    f"Group '{grp_name}' ({cat_label}) covariance Cholesky failed; "
+                    "falling back to independent sampling."
+                )
+                continue  # not PSD → fall back to independent
+
+            # Generate multivariate normal samples
+            z = rng.standard_normal((n_trials, n_g))
+            mv_samples = z @ L.T + means[np.newaxis, :]
+
+            # Sum all correlated source contributions
+            for col_idx in range(n_g):
+                combined += mv_samples[:, col_idx]
+                handled_mv.add(indices[col_idx])
+
+        # Process remaining independent sources
+        processed = 0
         for idx, src in enumerate(self._sources):
             if self._abort_event.is_set():
                 return
+            if idx in handled_mv:
+                processed += 1
+                pct = int(50 * processed / max(n_sources, 1))
+                self.progress_updated.emit(pct)
+                continue
             sigma = src.get_standard_uncertainty()
             mean = 0.0 if src.is_centered_on_zero else src.mean_value
             raw_data = (
@@ -5662,13 +7690,25 @@ class _MCWorkerThread(QThread):
                 if src.input_type == "Tabular Data" and len(src.tabular_data) > 1
                 else None
             )
+            # Asymmetric bifurcated Gaussian support
+            kw_asym = {}
+            if src.asymmetric:
+                kw_asym['sigma_upper'] = src.get_sigma_upper()
+                kw_asym['sigma_lower'] = src.get_sigma_lower()
             samples = _sample_fn(
                 src.distribution, sigma, mean, n_trials, raw_data=raw_data,
-                rng=rng,
+                rng=rng, **kw_asym,
             )
             combined += samples
-            pct = int(50 * (idx + 1) / max(n_sources, 1))
+            processed += 1
+            pct = int(50 * processed / max(n_sources, 1))
             self.progress_updated.emit(pct)
+
+        if use_lhs and handled_mv:
+            _add_mc_note(
+                "LHS stratification was applied to independent sources. "
+                "Correlated Normal groups used multivariate Normal sampling."
+            )
 
         # ----------------------------------------------------------
         # 2. Offset by comparison-error mean (E_mean).
@@ -5723,6 +7763,7 @@ class _MCWorkerThread(QThread):
         mc.lower_bound = mc.pct_5
         mc.upper_bound = mc.pct_95
         mc.samples = combined
+        mc.notes = mc_notes
 
         self.progress_updated.emit(75)
 
@@ -5758,6 +7799,279 @@ class _MCWorkerThread(QThread):
         mc.computed = True
         self.progress_updated.emit(100)
         self.finished_result.emit(mc)
+
+
+# =====================================================================
+# Double-Loop Monte Carlo Worker Thread
+# (Oberkampf & Roy 2010 — epistemic/aleatory separation → p-box)
+# =====================================================================
+
+class _DoubleLoopMCWorkerThread(QThread):
+    """Background worker for double-loop (nested) Monte Carlo propagation.
+
+    Outer loop samples epistemic parameters; inner loop propagates aleatory
+    uncertainty.  The result is a family of CDFs whose envelope forms a
+    probability box (p-box).
+
+    Two sub-modes:
+      * **corners** — enumerate 2^n worst-case corners of the epistemic space
+      * **full** — stochastically sample the epistemic space (N_outer draws)
+
+    References:
+        Oberkampf & Roy (2010), Chapter 5
+        Ferson et al. (2003), Probability boxes
+        SAND2007-0939
+    """
+
+    progress_updated = Signal(int)
+    finished_result = Signal(object)
+    error_occurred = Signal(str)
+
+    def __init__(self, sources, comp_data, settings, parent=None):
+        super().__init__(parent)
+        self._sources = sources
+        self._comp_data = comp_data
+        self._settings = settings
+        self._abort_event = threading.Event()
+
+    def abort(self):
+        self._abort_event.set()
+
+    def run(self):
+        try:
+            self._execute()
+        except Exception as exc:
+            self.error_occurred.emit(f"Double-loop MC error: {exc}")
+            traceback.print_exc()
+
+    # -----------------------------------------------------------------
+    def _execute(self):
+        settings = self._settings
+        rng = np.random.default_rng(
+            settings.mc_seed if settings.mc_seed else None
+        )
+
+        # ---- Step 1: classify sources into epistemic vs aleatory ----
+        epistemic_srcs = []
+        aleatory_srcs = []
+        for src in self._sources:
+            if src.get_standard_uncertainty() <= 0 and src.representation != "interval":
+                continue  # skip zero-sigma non-interval sources
+            cls = src.uncertainty_class
+            if cls == "mixed":
+                if settings.mc_mixed_treatment == "Treat as aleatory":
+                    cls = "aleatoric"
+                else:
+                    cls = "epistemic"
+            if cls == "epistemic":
+                epistemic_srcs.append(src)
+            else:
+                aleatory_srcs.append(src)
+
+        n_epi = len(epistemic_srcs)
+        n_ale = len(aleatory_srcs)
+        notes: List[str] = []
+
+        # ---- Degenerate case: no epistemic sources ----
+        if n_epi == 0:
+            notes.append(
+                "No epistemic sources found after classification. "
+                "Double-loop degenerates to a single inner-loop CDF (no p-box). "
+                "Consider classifying sources or using Single-Loop mode."
+            )
+
+        # ---- Step 2: determine outer-loop realizations ----
+        is_corners = settings.mc_mode == "Double-Loop (Corners)"
+        n_inner = settings.mc_n_inner
+
+        if is_corners:
+            if n_epi > 15:
+                self.error_occurred.emit(
+                    f"Corners mode requires 2^N_epistemic evaluations. "
+                    f"With {n_epi} epistemic sources that is "
+                    f"{2**n_epi:,} corners — too many. "
+                    f"Use 'Double-Loop (Full)' mode instead, or reduce "
+                    f"the number of epistemic sources to ≤15."
+                )
+                return
+
+            # Build corner values for each epistemic source
+            corner_pairs = []  # list of (low, high) per epistemic source
+            for src in epistemic_srcs:
+                if src.representation == "interval":
+                    lo = src.interval_lower
+                    hi = src.interval_upper
+                    if lo > hi:
+                        lo, hi = hi, lo
+                        notes.append(
+                            f"Interval bounds for '{src.name}' were inverted; "
+                            f"auto-swapped to [{lo}, {hi}]."
+                        )
+                    if lo == hi:
+                        # Degenerate interval — treat as single point
+                        corner_pairs.append((lo, lo))
+                        notes.append(
+                            f"Interval for '{src.name}' has zero width "
+                            f"(lower = upper = {lo}). Using as fixed value."
+                        )
+                    else:
+                        corner_pairs.append((lo, hi))
+                else:
+                    # Distribution-represented epistemic: use ±2σ as corners
+                    sigma = src.get_standard_uncertainty()
+                    mean = src.mean_value if not src.is_centered_on_zero else 0.0
+                    corner_pairs.append((mean - 2.0 * sigma, mean + 2.0 * sigma))
+
+            if n_epi > 0:
+                corner_combos = list(itertools.product(*corner_pairs))
+            else:
+                corner_combos = [()]  # single "empty corner"
+            n_outer = len(corner_combos)
+        else:
+            # Full stochastic mode
+            n_outer = settings.mc_n_outer
+            corner_combos = None  # not used
+
+        # Choose sampling function
+        if settings.mc_sampling_method == "Latin Hypercube (LHS)":
+            _sample_fn = generate_lhs_samples
+        else:
+            _sample_fn = generate_mc_samples
+
+        # ---- Step 3: comparison-error offset ----
+        E_mean = float(np.nanmean(self._comp_data.data)) if (
+            self._comp_data.data is not None and len(self._comp_data.data) > 0
+        ) else 0.0
+
+        # ---- Step 4: coverage-matched percentile levels ----
+        coverage = settings.coverage
+        if settings.one_sided:
+            lower_pct = (1.0 - coverage) * 100.0
+            upper_pct = coverage * 100.0
+        else:
+            alpha = 1.0 - coverage
+            lower_pct = (alpha / 2.0) * 100.0
+            upper_pct = (1.0 - alpha / 2.0) * 100.0
+
+        # ---- Step 5: outer loop ----
+        real_lower_bounds = np.zeros(n_outer)
+        real_upper_bounds = np.zeros(n_outer)
+        real_means = np.zeros(n_outer)
+        # Store sorted inner-loop samples for p-box construction
+        # (keep only quantile summaries to limit memory)
+        n_pbox_pts = 500
+        pbox_quantile_levels = np.linspace(0.0, 1.0, n_pbox_pts)
+        # Each row = quantiles for one realization
+        quantile_matrix = np.zeros((n_outer, n_pbox_pts))
+
+        for i_outer in range(n_outer):
+            if self._abort_event.is_set():
+                return
+
+            # --- Determine epistemic offsets for this realization ---
+            epi_offsets = np.zeros(n_epi)
+            if is_corners and n_epi > 0:
+                # Use the corner combination
+                combo = corner_combos[i_outer]
+                epi_offsets = np.array(combo, dtype=float)
+            elif n_epi > 0:
+                # Stochastic: draw one sample per epistemic source
+                for j, src in enumerate(epistemic_srcs):
+                    if src.representation == "interval":
+                        lo = src.interval_lower
+                        hi = src.interval_upper
+                        if lo > hi:
+                            lo, hi = hi, lo
+                        epi_offsets[j] = rng.uniform(lo, hi)
+                    else:
+                        sigma = src.get_standard_uncertainty()
+                        mean = src.mean_value if not src.is_centered_on_zero else 0.0
+                        sample = _sample_fn(
+                            src.distribution, sigma, mean, 1,
+                            rng=rng,
+                        )
+                        epi_offsets[j] = float(sample[0])
+
+            total_epi_offset = float(np.sum(epi_offsets))
+
+            # --- Inner loop: sample aleatory sources ---
+            combined = np.zeros(n_inner)
+            for src in aleatory_srcs:
+                sigma = src.get_standard_uncertainty()
+                if sigma <= 0:
+                    continue
+                mean = src.mean_value if not src.is_centered_on_zero else 0.0
+                su = src.get_sigma_upper() if src.asymmetric else None
+                sl = src.get_sigma_lower() if src.asymmetric else None
+                samples = _sample_fn(
+                    src.distribution, sigma, mean, n_inner,
+                    rng=rng,
+                    sigma_upper=su,
+                    sigma_lower=sl,
+                )
+                combined += samples
+
+            # Add fixed epistemic offset + comparison-error mean
+            combined += total_epi_offset + E_mean
+
+            # --- Inner-loop statistics ---
+            real_means[i_outer] = float(np.mean(combined))
+            lb = float(np.percentile(combined, lower_pct))
+            ub = float(np.percentile(combined, upper_pct))
+            real_lower_bounds[i_outer] = lb
+            real_upper_bounds[i_outer] = ub
+
+            # Store quantiles for p-box envelope construction
+            quantile_matrix[i_outer, :] = np.quantile(
+                combined, pbox_quantile_levels
+            )
+
+            # Progress
+            pct = int((i_outer + 1) / n_outer * 95)  # reserve 5% for postproc
+            self.progress_updated.emit(pct)
+
+        # ---- Step 6: p-box construction ----
+        # At each quantile level, the p-box envelope is the min/max across
+        # all realizations.  We report the envelope as lower/upper CDF
+        # bounds on a shared x-grid.
+        pbox_x_lower = np.min(quantile_matrix, axis=0)  # most-left CDF
+        pbox_x_upper = np.max(quantile_matrix, axis=0)  # most-right CDF
+
+        # ---- Step 7: validation fraction ----
+        brackets_zero = (real_lower_bounds <= 0.0) & (real_upper_bounds >= 0.0)
+        val_frac = float(np.mean(brackets_zero))
+
+        # ---- Step 8: assemble results ----
+        dl = DoubleLoopMCResults(
+            mode="corners" if is_corners else "full",
+            n_outer=n_outer,
+            n_inner=n_inner,
+            n_epistemic_sources=n_epi,
+            n_aleatory_sources=n_ale,
+            pbox_x=np.concatenate([pbox_x_lower, pbox_x_upper[::-1]]),
+            pbox_cdf_lower=pbox_x_lower,
+            pbox_cdf_upper=pbox_x_upper,
+            lower_bound_min=float(np.min(real_lower_bounds)) if n_outer > 0 else 0.0,
+            lower_bound_max=float(np.max(real_lower_bounds)) if n_outer > 0 else 0.0,
+            upper_bound_min=float(np.min(real_upper_bounds)) if n_outer > 0 else 0.0,
+            upper_bound_max=float(np.max(real_upper_bounds)) if n_outer > 0 else 0.0,
+            mean_of_means=float(np.mean(real_means)) if n_outer > 0 else 0.0,
+            std_of_means=float(np.std(real_means, ddof=1)) if n_outer > 1 else 0.0,
+            validation_fraction=val_frac,
+            _coverage=coverage,
+            _one_sided=settings.one_sided,
+            _lower_pct=lower_pct,
+            _upper_pct=upper_pct,
+            realization_lower_bounds=real_lower_bounds,
+            realization_upper_bounds=real_upper_bounds,
+            realization_means=real_means,
+            epistemic_source_names=[s.name for s in epistemic_srcs],
+            notes=notes,
+            computed=True,
+        )
+
+        self.progress_updated.emit(100)
+        self.finished_result.emit(dl)
 
 
 class MonteCarloResultsTab(QWidget):
@@ -5999,7 +8313,9 @@ class MonteCarloResultsTab(QWidget):
         self._canvas.setMinimumWidth(400)
         self._canvas.setMinimumHeight(550)
 
-        toolbar_row = make_plot_toolbar_with_copy(self._canvas, self._fig, self)
+        toolbar_row = make_plot_toolbar_with_copy(
+            self._canvas, self._fig, self,
+            method_context="Monte Carlo JCGM 101:2008")
 
         # Wrap canvas in a scroll area for horizontal scrolling
         plot_scroll = QScrollArea()
@@ -6101,6 +8417,12 @@ class MonteCarloResultsTab(QWidget):
                 f"  P{hi_pct:.4g}: {p95_mean:+.4f} \u00b1 {p95_std:.4f}"
                 f"  (95% CI: [{p95_ci_lo:+.4f}, {p95_ci_hi:+.4f}])"
             )
+
+        if getattr(mc, 'notes', None):
+            lines.append("")
+            lines.append("Important Notes:")
+            for note in mc.notes:
+                lines.append(f"  - {note}")
 
         self._results_text.setPlainText("\n".join(lines))
 
@@ -6206,10 +8528,10 @@ class MonteCarloResultsTab(QWidget):
             )
             return
 
-        # Determine the coverage probability used by the RSS k-factor
-        # so we can extract the matching MC percentiles.
-        coverage = getattr(rss, '_coverage', 0.95)
-        one_sided = getattr(rss, '_one_sided', True)
+        # Determine the coverage probability used by the MC run
+        # so we can extract the matching percentiles for comparison.
+        coverage = getattr(mc, '_coverage', 0.95)
+        one_sided = getattr(mc, '_one_sided', True)
 
         samples = mc.samples
         if samples.size == 0:
@@ -6701,6 +9023,27 @@ class ComparisonRollUpTab(QWidget):
         )
         vbox = QVBoxLayout(group)
 
+        # Audience mode toolbar
+        audience_toolbar = QHBoxLayout()
+        self._cmb_audience = QComboBox()
+        self._cmb_audience.addItems([
+            "Internal Engineering",
+            "External Technical Report",
+            "Regulatory Submission",
+        ])
+        self._cmb_audience.setCurrentIndex(0)  # default: Internal
+        self._cmb_audience.setToolTip(
+            "Statement audience mode:\n"
+            "  \u2022 Internal Engineering \u2014 terse, numeric-heavy (current format)\n"
+            "  \u2022 External Technical Report \u2014 adds method references and scope context\n"
+            "  \u2022 Regulatory Submission \u2014 adds full assumptions, conditional language, standards citations"
+        )
+        self._cmb_audience.currentIndexChanged.connect(self._generate_findings)
+        audience_toolbar.addWidget(QLabel("Audience:"))
+        audience_toolbar.addWidget(self._cmb_audience)
+        audience_toolbar.addStretch()
+        vbox.addLayout(audience_toolbar)
+
         self._findings_edit = QTextEdit()
         self._findings_edit.setReadOnly(False)  # user may append notes
         self._findings_edit.setMinimumHeight(180)
@@ -6826,8 +9169,10 @@ class ComparisonRollUpTab(QWidget):
             _set(0, 1, f"{rss.u_val:.4f}")
             _set(1, 1, f"{rss.k_factor:.3f}")
             _set(2, 1, f"{rss.U_val:.4f}")
-            _set(3, 1, f"{rss.lower_bound_uval:.4f}")
-            _set(4, 1, f"{rss.upper_bound_uval:.4f}")
+            _set(3, 1, f"{rss.lower_bound_uval:.4f}"
+                 if not np.isnan(rss.lower_bound_uval) else "\u2014")
+            _set(4, 1, f"{rss.upper_bound_uval:.4f}"
+                 if not np.isnan(rss.upper_bound_uval) else "\u2014")
             _set(5, 1, f"{rss.E_mean:.4f}")
             # Validation verdict
             if rss.U_val > 0:
@@ -6853,8 +9198,10 @@ class ComparisonRollUpTab(QWidget):
             _set(0, 2, f"{rss.s_E:.4f}")
             _set(1, 2, f"{rss.k_factor:.3f}")
             _set(2, 2, f"{U_sE:.4f}")
-            _set(3, 2, f"{rss.lower_bound_sE:.4f}")
-            _set(4, 2, f"{rss.upper_bound_sE:.4f}")
+            _set(3, 2, f"{rss.lower_bound_sE:.4f}"
+                 if not np.isnan(rss.lower_bound_sE) else "\u2014")
+            _set(4, 2, f"{rss.upper_bound_sE:.4f}"
+                 if not np.isnan(rss.upper_bound_sE) else "\u2014")
             _set(5, 2, f"{rss.E_mean:.4f}")
             if U_sE > 0:
                 ratio_sE = abs(rss.E_mean) / U_sE
@@ -6954,37 +9301,44 @@ class ComparisonRollUpTab(QWidget):
 
         # --- Mean bias --------------------------------------------------
         if rss is not None and rss.computed:
-            bias = rss.E_mean
-            direction = "overprediction" if bias > 0 else "underprediction"
-            lines.append(
-                f"1. MEAN BIAS: The mean comparison error is "
-                f"\u0112 = {bias:+.4f} ({direction})."
-            )
-            if rss.U_val > 0:
-                ratio = abs(bias) / rss.U_val
-                if ratio < 1.0:
-                    lines.append(
-                        f"   |\u0112| / U_val = {ratio:.3f} < 1.0 \u2014 "
-                        f"the model IS validated at the {settings.coverage*100:.0f}% / "
-                        f"{settings.confidence*100:.0f}% level."
-                    )
-                else:
-                    lines.append(
-                        f"   |\u0112| / U_val = {ratio:.3f} \u2265 1.0 \u2014 "
-                        f"the model is NOT validated at the {settings.coverage*100:.0f}% / "
-                        f"{settings.confidence*100:.0f}% level."
-                    )
+            if rss.n_data == 0:
+                lines.append(
+                    "1. MEAN BIAS: Not available — no comparison data loaded."
+                )
+            else:
+                bias = rss.E_mean
+                direction = "overprediction" if bias > 0 else "underprediction"
+                lines.append(
+                    f"1. MEAN BIAS: The mean comparison error is "
+                    f"\u0112 = {bias:+.4f} ({direction})."
+                )
+                if rss.U_val > 0:
+                    ratio = abs(bias) / rss.U_val
+                    if ratio < 1.0:
+                        lines.append(
+                            f"   |\u0112| / U_val = {ratio:.3f} < 1.0 \u2014 "
+                            f"the model IS validated at the {settings.coverage*100:.0f}% / "
+                            f"{settings.confidence*100:.0f}% level."
+                        )
+                    else:
+                        lines.append(
+                            f"   |\u0112| / U_val = {ratio:.3f} \u2265 1.0 \u2014 "
+                            f"the model is NOT validated at the {settings.coverage*100:.0f}% / "
+                            f"{settings.confidence*100:.0f}% level."
+                        )
             lines.append("")
 
         # --- Underprediction bounds from each method --------------------
         lines.append("2. UNDERPREDICTION BOUNDS:")
         if rss is not None and rss.computed:
-            lines.append(
-                f"   RSS (u_val basis):  {rss.lower_bound_uval:+.4f}"
-            )
-            lines.append(
-                f"   RSS (s_E basis):    {rss.lower_bound_sE:+.4f}"
-            )
+            if not np.isnan(rss.lower_bound_uval):
+                lines.append(
+                    f"   RSS (u_val basis):  {rss.lower_bound_uval:+.4f}"
+                )
+            if not np.isnan(rss.lower_bound_sE):
+                lines.append(
+                    f"   RSS (s_E basis):    {rss.lower_bound_sE:+.4f}"
+                )
         if mc is not None and mc.computed:
             lines.append(
                 f"   Monte Carlo:        {mc.lower_bound:+.4f}"
@@ -7046,16 +9400,37 @@ class ComparisonRollUpTab(QWidget):
 
         # --- 5a. RSS Validation Assessment (ASME V&V 20) ---
         lines.append("5a. RSS VALIDATION ASSESSMENT (ASME V&V 20):")
-        if rss is not None and rss.computed and rss.U_val > 0:
+        if rss is not None and rss.computed and rss.n_data == 0:
+            lines.append("    VALIDATION VERDICT: Not available — no comparison data loaded.")
+            lines.append("    Load experimental comparison data (E = S − D) on Tab 1")
+            lines.append("    to enable the ASME V&V 20 validation assessment.")
+        elif rss is not None and rss.computed and rss.U_val > 0:
             ratio = abs(rss.E_mean) / rss.U_val
-            lines.append(f"    Method:           Root-Sum-Square (RSS) per ASME V&V 20-2009 (R2016)")
+            bound_type = getattr(settings, 'bound_type', 'Both (for comparison)')
+            corr_info = ("Independent" if not rss.has_correlations
+                         else f"Correlated (groups: {', '.join(rss.correlation_groups)})")
+            lines.append(f"    Method:           Root-Sum-Square (RSS) per ASME V&V 20-2009 (R2021)")
             lines.append(f"    Coverage:         {cov_pct} / {conf_pct} ({sided_label})")
             lines.append(f"    k-factor:         {rss.k_factor:.4f}  (method: {rss.k_method_used})")
+            lines.append(f"    Bound basis:      {bound_type}")
+            lines.append(f"    Correlation:      {corr_info}")
+            lines.append(f"    Sample size:      n_data = {rss.n_data}")
+            if rss.n_data >= 30:
+                suff_label = "adequate"
+            elif rss.n_data >= 10:
+                suff_label = "marginal"
+            else:
+                suff_label = "insufficient per GUM \u00a7G.3"
+            lines.append(f"    Data sufficiency: {suff_label}  (n = {rss.n_data})")
             lines.append(f"    u_val:            {rss.u_val:.4f} [{unit}]  (combined standard uncertainty)")
             lines.append(f"    U_val:            {rss.U_val:.4f} [{unit}]  (expanded uncertainty = k \u00d7 u_val)")
             lines.append(f"    |\u0112|:              {abs(rss.E_mean):.4f} [{unit}]  (mean comparison error magnitude)")
             lines.append(f"    |\u0112| / U_val:      {ratio:.4f}")
-            lines.append(f"    Prediction band:  [{rss.lower_bound_uval:+.4f}, {rss.upper_bound_uval:+.4f}] [{unit}]")
+            lines.append(f"    Class split:      U_A = {rss.u_aleatoric:.4f}, U_E = {rss.u_epistemic:.4f} (epistemic: {rss.pct_epistemic:.1f}%)")
+            if not np.isnan(rss.lower_bound_uval):
+                lines.append(f"    Prediction band (u_val):  [{rss.lower_bound_uval:+.4f}, {rss.upper_bound_uval:+.4f}] [{unit}]")
+            if not np.isnan(rss.lower_bound_sE):
+                lines.append(f"    Prediction band (s_E):    [{rss.lower_bound_sE:+.4f}, {rss.upper_bound_sE:+.4f}] [{unit}]")
             if ratio <= 1.0:
                 lines.append(f"")
                 lines.append(f"    \u2713 VALIDATED: The mean comparison error (|\u0112| = {abs(rss.E_mean):.4f}) is")
@@ -7071,6 +9446,40 @@ class ComparisonRollUpTab(QWidget):
                 lines.append(f"      Recommendation: investigate systematic errors in boundary")
                 lines.append(f"      conditions, grid convergence, or turbulence modelling, or")
                 lines.append(f"      identify additional uncertainty sources.")
+
+            # --- 8b. Conditional finding caveats ---
+            _enabled_sources = [s for s in (sources or []) if s.enabled]
+            assumed_sources = [s for s in _enabled_sources
+                               if getattr(s, 'basis_type', '') == 'assumed']
+            high_red_sources = [s for s in _enabled_sources
+                                if getattr(s, 'reducibility', '') == 'high']
+            if assumed_sources or high_red_sources or rss.pct_epistemic > 50.0:
+                lines.append("")
+                lines.append("    --- Conditional Finding Caveats ---")
+                if assumed_sources:
+                    lines.append(
+                        f"    Note: {len(assumed_sources)} source(s) rely on assumed "
+                        "uncertainty estimates."
+                    )
+                if high_red_sources:
+                    lines.append(
+                        f"    Note: {len(high_red_sources)} source(s) have high "
+                        "reducibility \u2014 additional testing could narrow the "
+                        "uncertainty budget."
+                    )
+                # --- 8c. Epistemic dominance caveat ---
+                if rss.pct_epistemic > 50.0:
+                    lines.append("")
+                    lines.append(
+                        "    \u26a0 CONDITIONAL FINDING: Epistemic uncertainty contributes "
+                        f">{rss.pct_epistemic:.0f}% of the"
+                    )
+                    lines.append(
+                        "      total variance. This validation conclusion should be interpreted with"
+                    )
+                    lines.append(
+                        "      caution. Reducing epistemic sources would strengthen the assessment."
+                    )
         else:
             lines.append("    RSS analysis not available or U_val = 0.")
         lines.append("")
@@ -7087,7 +9496,8 @@ class ComparisonRollUpTab(QWidget):
             mc_method_name = getattr(mc, 'sampling_method', 'Monte Carlo (Random)')
             if "LHS" in mc_method_name:
                 method_line = ("Monte Carlo propagation (Latin Hypercube "
-                               "sampling) per JCGM 101:2008 §6.4")
+                               "stratified sampling; McKay et al. 1979; "
+                               "JCGM 101 framework)")
             else:
                 method_line = "Monte Carlo propagation (random sampling) per JCGM 101:2008"
             lines.append(f"    Method:           {method_line}")
@@ -7152,10 +9562,17 @@ class ComparisonRollUpTab(QWidget):
         lines.append("5d. RECOMMENDED CFD ACCURACY STATEMENT:")
         lines.append("    (Copy/adapt the following for the VVUQ report conclusion)")
         lines.append("")
-        if rss is not None and rss.computed and rss.U_val > 0:
+        if rss is not None and rss.computed and rss.n_data == 0:
+            lines.append('    "The uncertainty budget has been quantified per ASME V&V 20-2009 (R2021)')
+            lines.append(f'     using {len([s for s in (sources or []) if s.enabled])} identified uncertainty sources.')
+            lines.append(f'     Expanded uncertainty: U_val = \u00b1{rss.U_val:.4f} [{unit}]')
+            lines.append(f'       ({cov_pct} coverage / {conf_pct} confidence, {sided_label})')
+            lines.append(f'     RESULT: Validation verdict not available \u2014 no comparison data loaded.')
+            lines.append(f'     Load comparison data (E = S \u2212 D) to complete the validation assessment."')
+        elif rss is not None and rss.computed and rss.U_val > 0:
             ratio = abs(rss.E_mean) / rss.U_val
             validated = ratio <= 1.0
-            lines.append(f'    "The CFD model has been assessed per ASME V&V 20-2009 (R2016)')
+            lines.append(f'    "The CFD model has been assessed per ASME V&V 20-2009 (R2021)')
             lines.append(f'     using {len([s for s in (sources or []) if s.enabled])} identified uncertainty sources.')
             if mc is not None and mc.computed:
                 mc_lo_s = f"P{mc._lower_pct:.4g}" if hasattr(mc, '_lower_pct') else "P5"
@@ -7181,6 +9598,100 @@ class ComparisonRollUpTab(QWidget):
         else:
             lines.append("    Insufficient data to generate a certification statement.")
         lines.append("")
+
+        # --- Audience-mode additions ---
+        audience_idx = (self._cmb_audience.currentIndex()
+                        if hasattr(self, '_cmb_audience') else 0)
+        # 0 = Internal Engineering (terse — already done above)
+        # 1 = External Technical Report
+        # 2 = Regulatory Submission
+
+        if audience_idx >= 1 and rss is not None and rss.computed:
+            # External: add method references and scope context
+            lines.append("=" * 60)
+            lines.append("  SCOPE & METHOD CONTEXT")
+            lines.append("=" * 60)
+            lines.append("")
+            n_enabled = len([s for s in (sources or []) if s.enabled])
+            lines.append(f"  Validation methodology: ASME V&V 20-2009 (R2021) §4–§6")
+            lines.append(f"  Uncertainty combination: Root-Sum-Square (RSS) with Welch-Satterthwaite DOF")
+            if mc is not None and mc.computed:
+                lines.append(f"  Independent check: Monte Carlo propagation (JCGM 101:2008)")
+            lines.append(f"  Number of uncertainty sources: {n_enabled}")
+            lines.append(f"  Number of comparison data points: {rss.n_data}")
+            if rss.n_data >= 30:
+                _ds_label = "adequate"
+            elif rss.n_data >= 10:
+                _ds_label = "marginal"
+            else:
+                _ds_label = "insufficient per GUM §G.3"
+            lines.append(f"  Data sufficiency: {_ds_label}  (n = {rss.n_data})")
+            if rss.has_correlations:
+                lines.append(f"  Correlation groups: {', '.join(rss.correlation_groups)}")
+                lines.append(f"  Correlation model: Pairwise transitivity ρ(a,b) = ρ_a × ρ_b")
+            else:
+                lines.append(f"  Source correlations: All sources treated as independent")
+            bound_type = getattr(settings, 'bound_type', 'Both (for comparison)')
+            lines.append(f"  Bound type: {bound_type}")
+            lines.append(f"  Epistemic fraction: {rss.pct_epistemic:.1f}% of total variance")
+            lines.append("")
+
+        if audience_idx >= 2 and rss is not None and rss.computed:
+            # Regulatory: add full assumptions section and conditional language
+            lines.append("=" * 60)
+            lines.append("  ASSUMPTIONS & LIMITATIONS")
+            lines.append("=" * 60)
+            lines.append("")
+            lines.append("  The following assumptions apply to this validation assessment:")
+            lines.append("  1. Uncertainty sources are assumed to be independently distributed")
+            if rss.has_correlations:
+                lines.append("     except where explicit correlation groups have been defined.")
+            else:
+                lines.append("     (no correlation groups defined).")
+            lines.append("  2. The RSS method assumes Gaussian combination per GUM §5.1;")
+            lines.append("     departures are checked via Monte Carlo comparison (JCGM 101:2008).")
+            lines.append("  3. Coverage factors are derived from Student's t-distribution")
+            lines.append("     with effective degrees of freedom per Welch-Satterthwaite formula.")
+            lines.append("  4. Validation is limited to the tested operating conditions and")
+            lines.append("     geometry; extrapolation requires additional assessment.")
+            lines.append("")
+
+            # Source basis classification
+            _enabled = [s for s in (sources or []) if s.enabled]
+            assumed_srcs = [s for s in _enabled
+                           if getattr(s, 'basis_type', '') == 'assumed']
+            expert_srcs = [s for s in _enabled
+                           if getattr(s, 'basis_type', '') == 'expert_judgment']
+            high_red = [s for s in _enabled
+                        if getattr(s, 'reducibility', '') == 'high']
+            if assumed_srcs or expert_srcs or high_red:
+                lines.append("  Source Classification Notes:")
+                if assumed_srcs:
+                    names = ", ".join(s.name for s in assumed_srcs)
+                    lines.append(
+                        f"    - Assumed uncertainty estimates ({len(assumed_srcs)}): {names}"
+                    )
+                if expert_srcs:
+                    names = ", ".join(s.name for s in expert_srcs)
+                    lines.append(
+                        f"    - Expert judgment basis ({len(expert_srcs)}): {names}"
+                    )
+                if high_red:
+                    names = ", ".join(s.name for s in high_red)
+                    lines.append(
+                        f"    - High reducibility ({len(high_red)}): {names}"
+                    )
+                lines.append("")
+
+            lines.append("  Standards Citations:")
+            lines.append("    - ASME V&V 20-2009 (R2021): Standard for Verification and")
+            lines.append("      Validation in Computational Fluid Dynamics and Heat Transfer")
+            lines.append("    - JCGM 100:2008 (GUM): Evaluation of measurement data — Guide to")
+            lines.append("      the expression of uncertainty in measurement")
+            lines.append("    - JCGM 101:2008: Evaluation of measurement data — Supplement 1 to")
+            lines.append('      the "Guide to the expression of uncertainty in measurement" —')
+            lines.append("      Propagation of distributions using a Monte Carlo method")
+            lines.append("")
 
         self._findings_edit.setPlainText("\n".join(lines))
 
@@ -7429,16 +9940,24 @@ class ComparisonRollUpTab(QWidget):
             _set(2, col_delta, f"{delta_U:+.4f}",
                  DARK_COLORS['green'] if abs(delta_U) < 0.01
                  else DARK_COLORS['yellow'])
-            # Row 3: lower bound delta
-            delta_lb = self._rss.lower_bound_uval - comp_rss.lower_bound_uval
-            _set(3, col_delta, f"{delta_lb:+.4f}",
-                 DARK_COLORS['green'] if abs(delta_lb) < 0.01
-                 else DARK_COLORS['yellow'])
-            # Row 4: upper bound delta
-            delta_ub = self._rss.upper_bound_uval - comp_rss.upper_bound_uval
-            _set(4, col_delta, f"{delta_ub:+.4f}",
-                 DARK_COLORS['green'] if abs(delta_ub) < 0.01
-                 else DARK_COLORS['yellow'])
+            # Row 3: lower bound delta (guard NaN from bound_type gating)
+            if (not np.isnan(self._rss.lower_bound_uval)
+                    and not np.isnan(comp_rss.lower_bound_uval)):
+                delta_lb = self._rss.lower_bound_uval - comp_rss.lower_bound_uval
+                _set(3, col_delta, f"{delta_lb:+.4f}",
+                     DARK_COLORS['green'] if abs(delta_lb) < 0.01
+                     else DARK_COLORS['yellow'])
+            else:
+                _set(3, col_delta, "\u2014")
+            # Row 4: upper bound delta (guard NaN from bound_type gating)
+            if (not np.isnan(self._rss.upper_bound_uval)
+                    and not np.isnan(comp_rss.upper_bound_uval)):
+                delta_ub = self._rss.upper_bound_uval - comp_rss.upper_bound_uval
+                _set(4, col_delta, f"{delta_ub:+.4f}",
+                     DARK_COLORS['green'] if abs(delta_ub) < 0.01
+                     else DARK_COLORS['yellow'])
+            else:
+                _set(4, col_delta, "\u2014")
             # Row 5: mean error delta
             delta_E = self._rss.E_mean - comp_rss.E_mean
             _set(5, col_delta, f"{delta_E:+.4f}",
@@ -7691,6 +10210,8 @@ class ReferenceTab(QWidget):
         tabs.addTab(self._build_k_factor_tab(), "k-Factor Tables")
         tabs.addTab(self._build_welch_satterthwaite_tab(), "Welch-Satterthwaite")
         tabs.addTab(self._build_distribution_guide_tab(), "Distribution Guide")
+        tabs.addTab(self._build_uncertainty_classification_tab(),
+                     "Uncertainty Classification")
         tabs.addTab(self._build_distribution_free_tab(), "Distribution-Free Bounds")
         tabs.addTab(self._build_monte_carlo_tab(), "Monte Carlo Method")
         tabs.addTab(self._build_glossary_tab(), "Glossary")
@@ -7800,7 +10321,7 @@ class ReferenceTab(QWidget):
             is to provide an honest assessment of model accuracy.
         </div>
 
-        <p class="cite">Ref: ASME V&amp;V 20-2009 (R2016), Sections 2, 3, and 9.<br>
+        <p class="cite">Ref: ASME V&amp;V 20-2009 (R2021), Sections 2, 3, and 9.<br>
         Ref: AIAA G-077-1998, Section 5.</p>
         """
         return self._make_text_browser(html)
@@ -8153,7 +10674,240 @@ class ReferenceTab(QWidget):
         return self._make_text_browser(html)
 
     # =================================================================
-    # Sub-tab 5: Distribution-Free (Non-Parametric) Bounds
+    # Sub-tab 5: Uncertainty Classification Guide
+    # =================================================================
+    def _build_uncertainty_classification_tab(self):
+        c = DARK_COLORS
+        html = f"""
+        <h1>Aleatory vs Epistemic Uncertainty</h1>
+
+        <h2>Definitions</h2>
+        <table>
+        <tr>
+            <th style="text-align:left; width:120px;">Class</th>
+            <th style="text-align:left;">Description</th>
+            <th style="text-align:left; width:140px;">Also Known As</th>
+            <th style="text-align:left; width:100px;">Reducible?</th>
+        </tr>
+        <tr>
+            <td style="text-align:left; color:{c['green']}; font-weight:bold;">
+                Aleatory</td>
+            <td style="text-align:left;">Inherent randomness in the physical
+                process. Cannot be reduced by collecting more data or
+                improving models.</td>
+            <td style="text-align:left;">Stochastic variability,
+                irreducible floor</td>
+            <td style="text-align:left; color:{c['red']};">No</td>
+        </tr>
+        <tr>
+            <td style="text-align:left; color:{c['yellow']}; font-weight:bold;">
+                Epistemic</td>
+            <td style="text-align:left;">Due to lack of knowledge. Can be
+                reduced with better data, finer grids, or improved models.
+            </td>
+            <td style="text-align:left;">Knowledge/model uncertainty,
+                reducible bias</td>
+            <td style="text-align:left; color:{c['green']};">Yes</td>
+        </tr>
+        </table>
+
+        <div class="note">
+        <strong>Key distinction:</strong> Aleatory uncertainty reflects
+        what we <em>cannot</em> know (nature is random); epistemic reflects
+        what we <em>do not yet</em> know (knowledge gaps we can close).
+        </div>
+        <div class="note">
+        <strong>Important:</strong> GUM Type A / Type B labels describe how
+        uncertainty is quantified (data vs non-statistical information). They
+        are not the same as aleatory/epistemic classes.
+        </div>
+
+        <h2>Practical Examples for CFD Validation</h2>
+        <table>
+        <tr>
+            <th style="text-align:left;">Uncertainty Source</th>
+            <th>Class</th>
+            <th style="text-align:left;">Rationale</th>
+            <th>Reducible?</th>
+        </tr>
+        <tr>
+            <td style="text-align:left;">Iterative convergence scatter</td>
+            <td style="color:{c['green']};">Aleatory</td>
+            <td style="text-align:left;">Inherent solver noise at a given
+                residual tolerance</td>
+            <td>Low</td>
+        </tr>
+        <tr>
+            <td style="text-align:left;">Discretization error (GCI u_num)</td>
+            <td style="color:{c['orange']};">Mixed</td>
+            <td style="text-align:left;">Usually epistemic while refining;
+                near asymptotic/grid-independent behavior the residual acts
+                like a low-reducibility floor</td>
+            <td>Medium</td>
+        </tr>
+        <tr>
+            <td style="text-align:left;">Thermocouple measurement error</td>
+            <td style="color:{c['orange']};">Mixed</td>
+            <td style="text-align:left;">Repeatability/noise is aleatory;
+                calibration and installation bias are epistemic</td>
+            <td>Medium</td>
+        </tr>
+        <tr>
+            <td style="text-align:left;">Inlet mass flow uncertainty</td>
+            <td style="color:{c['orange']};">Mixed</td>
+            <td style="text-align:left;">Often a combination of sensor noise
+                (aleatory) and calibration/setup bias (epistemic). Split if
+                possible; otherwise classify mixed.</td>
+            <td>Medium</td>
+        </tr>
+        <tr>
+            <td style="text-align:left;">Over-refined/asymptotic mesh residual</td>
+            <td style="color:{c['orange']};">Mixed</td>
+            <td style="text-align:left;">Model/discretization origin is
+                epistemic, but once further refinement gives negligible
+                improvement the remaining floor has low reducibility</td>
+            <td>Low</td>
+        </tr>
+        <tr>
+            <td style="text-align:left;">Turbulence model form error</td>
+            <td style="color:{c['yellow']};">Epistemic</td>
+            <td style="text-align:left;">Model limitation; use LES/DNS or
+                model-form uncertainty methods</td>
+            <td>High</td>
+        </tr>
+        <tr>
+            <td style="text-align:left;">Material property uncertainty</td>
+            <td style="color:{c['orange']};">Mixed</td>
+            <td style="text-align:left;">Published tolerance bands (aleatory)
+                plus limited characterization (epistemic)</td>
+            <td>Medium</td>
+        </tr>
+        <tr>
+            <td style="text-align:left;">Geometry tolerance</td>
+            <td style="color:{c['yellow']};">Epistemic</td>
+            <td style="text-align:left;">Manufacturing variation; reducible
+                with tighter specs or as-built measurement</td>
+            <td>Medium</td>
+        </tr>
+        <tr>
+            <td style="text-align:left;">Boundary condition sensitivity</td>
+            <td style="color:{c['orange']};">Mixed</td>
+            <td style="text-align:left;">Both measurement uncertainty
+                (epistemic) and physical variability (aleatory)</td>
+            <td>Medium</td>
+        </tr>
+        </table>
+
+        <div class="note">
+        <strong>Decision rule for common edge cases:</strong><br>
+        1) <em>Inlet mass flow from sensors</em>: if random repeatability/noise
+        dominates, treat mostly aleatoric; if calibration/setup bias dominates,
+        treat mostly epistemic; if both are present and not separated, use mixed.<br>
+        2) <em>Over-refined mesh</em>: if additional refinement no longer reduces
+        the numerical term, keep the source as mixed with low reducibility and
+        document the asymptotic evidence (do not force it to purely epistemic).
+        </div>
+
+        <h2>Uncertainty Combination Diagram</h2>
+        <p>The V&amp;V 20 validation uncertainty combines multiple sources
+        via root-sum-square (RSS):</p>
+        <pre>
+  Numerical (usually epistemic, sometimes mixed near asymptotic floor)
+  ├── u_num  (discretization / GCI)  ──┐
+  └── u_iter (iterative convergence)   │
+                                       ├──► u_val = sqrt(u_num² + u_input² + u_D²)
+  Input (mixed)                        │
+  ├── u_input (boundary conditions)  ──┤       ├── U_E  (epistemic component)
+  └── u_param (material properties)    │       ├── U_A  (aleatory component)
+                                       │       └── Class split for interpretation
+  Experimental (aleatory)              │
+  ├── u_D   (measurement data)      ──┘
+  └── u_cal (calibration)
+        </pre>
+        <div class="note">
+        <strong>Classification split:</strong> When building the uncertainty
+        budget in the Sources tab, marking each source as primarily
+        "aleatory" or "epistemic" enables class-split analysis. The
+        RSS Results tab shows the total broken down by class. This supports
+        prioritization; it does not remove any enabled source from the total
+        u_val combination.
+        </div>
+
+        <h2>One-Sided (Asymmetric) Uncertainty</h2>
+        <p>Sometimes a sensitivity study yields different magnitudes in the
+        positive and negative directions. For example, a +10&deg;F inlet
+        temperature perturbation causes +5 PSI change in exit pressure,
+        while &minus;10&deg;F causes only &minus;3 PSI change.</p>
+
+        <table>
+        <tr>
+            <th style="text-align:left;">Situation</th>
+            <th style="text-align:left;">Recommended Approach</th>
+        </tr>
+        <tr>
+            <td style="text-align:left;">Both directions tested,
+                different magnitudes</td>
+            <td style="text-align:left;">Use asymmetric &sigma;&#8314;
+                / &sigma;&#8315; fields.
+                Effective &sigma; = &radic;((&sigma;&#8314;&sup2; +
+                &sigma;&#8315;&sup2;) / 2) per GUM &sect;4.3.8</td>
+        </tr>
+        <tr>
+            <td style="text-align:left;">Only one direction tested</td>
+            <td style="text-align:left;">Mirror assumption: assume
+                &sigma;_missing = &sigma;_observed. Flag with note in
+                evidence. Conservative but standard practice.</td>
+        </tr>
+        <tr>
+            <td style="text-align:left;">Physical bound exists
+                (e.g., temperature &gt; 0 K)</td>
+            <td style="text-align:left;">Use bounded distribution (e.g.,
+                truncated normal, log-normal). Note physical justification
+                in evidence.</td>
+        </tr>
+        </table>
+
+        <div class="cite">References: JCGM 100:2008 (GUM) &sect;4.3.8;
+        Barlow, R. (2004) "Asymmetric Statistical Errors";
+        ASME V&amp;V 20-2009 &sect;4.3; AIAA G-077-1998 &sect;4.2</div>
+
+        <h2>Why It Matters</h2>
+        <table>
+        <tr>
+            <th style="text-align:left;">Budget Dominance</th>
+            <th style="text-align:left;">Interpretation</th>
+            <th style="text-align:left;">Action</th>
+        </tr>
+        <tr>
+            <td style="text-align:left; color:{c['yellow']};">
+                Epistemic-dominant</td>
+            <td style="text-align:left;">The analysis can be improved.
+                Knowledge gaps are the main contributor.</td>
+            <td style="text-align:left;">Refine grid, improve BCs, use
+                better turbulence model, collect more data</td>
+        </tr>
+        <tr>
+            <td style="text-align:left; color:{c['green']};">
+                Aleatory-dominant</td>
+            <td style="text-align:left;">The analysis is near the
+                irreducible floor. Physical randomness dominates.</td>
+            <td style="text-align:left;">Report result with confidence
+                interval; no further model improvement will help</td>
+        </tr>
+        <tr>
+            <td style="text-align:left; color:{c['orange']};">
+                Balanced</td>
+            <td style="text-align:left;">Both classes contribute
+                meaningfully.</td>
+            <td style="text-align:left;">Prioritize reducing the largest
+                individual source regardless of class</td>
+        </tr>
+        </table>
+        """
+        return self._make_text_browser(html)
+
+    # =================================================================
+    # Sub-tab 6: Distribution-Free (Non-Parametric) Bounds
     # =================================================================
     def _build_distribution_free_tab(self):
         # Build the minimum-n table dynamically
@@ -8482,7 +11236,7 @@ class ReferenceTab(QWidget):
 
         <p class="cite">
         Ref: JCGM 100:2008 (GUM).<br>
-        Ref: ASME V&amp;V 20-2009 (R2016).<br>
+        Ref: ASME V&amp;V 20-2009 (R2021).<br>
         Ref: ASME PTC 19.1-2018.<br>
         Ref: ISO 16269-6:2014.<br>
         Ref: Krishnamoorthy &amp; Mathew (2009), <i>Statistical Tolerance
@@ -8536,6 +11290,7 @@ class HTMLReportGenerator:
         figures: Dict[str, Figure],
         audit_entries: list,
         rollup_headers: list = None,
+        project_metadata: Optional[dict] = None,
     ) -> str:
         """
         Build and return a complete self-contained HTML report string.
@@ -8567,6 +11322,9 @@ class HTMLReportGenerator:
             ``'comparison_plots'``, ``'rss_plots'``, ``'mc_plots'``.
         audit_entries : list
             List of audit-log entry dicts from ``audit_log.to_dict()``.
+        project_metadata : dict, optional
+            Program/analyst/date/notes and decision consequence metadata
+            from the project info panel.
 
         Returns
         -------
@@ -8575,6 +11333,10 @@ class HTMLReportGenerator:
         """
         now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         unit = settings.global_unit
+        project_meta = project_metadata or {}
+        consequence = normalize_decision_consequence(
+            project_meta.get("decision_consequence", "Medium")
+        )
 
         sections_html: List[str] = []
 
@@ -8582,23 +11344,28 @@ class HTMLReportGenerator:
         sections_html.append(self._build_header(now_str))
 
         # ---- Table of Contents ----------------------------------------
-        toc_entries = [
-            ("section-config", "1. Analysis Configuration"),
-            ("section-compdata", "2. Comparison Data Summary"),
-            ("section-budget", "3. Uncertainty Budget"),
-            ("section-rss", "4. RSS Results"),
-        ]
+        toc_entries = []
+        n = 0
+        n += 1; toc_entries.append(("section-config", f"{n}. Analysis Configuration"))
+        n += 1; toc_entries.append(("section-compdata", f"{n}. Comparison Data Summary"))
+        n += 1; toc_entries.append(("section-budget", f"{n}. Uncertainty Budget"))
+        n += 1; toc_entries.append(("section-rss", f"{n}. RSS Results"))
         if mc_results is not None and mc_results.computed:
-            toc_entries.append(("section-mc", "5. Monte Carlo Results"))
-        toc_entries.extend([
-            ("section-rollup", "6. Comparison Roll-Up"),
-            ("section-assumptions", "7. Assumptions &amp; Engineering Judgments"),
-            ("section-audit", "8. Audit Trail"),
-        ])
+            n += 1
+            toc_entries.append(("section-mc", f"{n}. Monte Carlo Results"))
+        n += 1; toc_entries.append(("section-rollup", f"{n}. Comparison Roll-Up"))
+        n += 1; toc_entries.append(("section-assumptions", f"{n}. Assumptions &amp; Engineering Judgments"))
+        n += 1; toc_entries.append(("section-audit", f"{n}. Audit Trail"))
+        n += 1; toc_entries.append(("section-decision-card", f"{n}. Decision Card"))
+        n += 1; toc_entries.append(("section-credibility", f"{n}. Credibility Framing"))
+        n += 1; toc_entries.append(("section-vvuq-glossary", f"{n}. VVUQ Terminology Panel"))
+        n += 1; toc_entries.append(("section-conformity", f"{n}. Conformity Assessment Template"))
         sections_html.append(self._build_toc(toc_entries))
 
         # ---- 1. Analysis Configuration --------------------------------
-        sections_html.append(self._build_config_section(settings))
+        sections_html.append(self._build_config_section(
+            settings, project_meta=project_meta
+        ))
 
         # ---- 2. Comparison Data Summary --------------------------------
         sections_html.append(self._build_comp_data_section(
@@ -8606,7 +11373,7 @@ class HTMLReportGenerator:
 
         # ---- 3. Uncertainty Budget ------------------------------------
         sections_html.append(self._build_budget_section(
-            budget_table, sources, unit))
+            budget_table, sources, unit, rss_results))
 
         # ---- 4. RSS Results -------------------------------------------
         if rss_results is not None and rss_results.computed:
@@ -8631,6 +11398,18 @@ class HTMLReportGenerator:
         # ---- 8. Audit Trail -------------------------------------------
         sections_html.append(self._build_audit_section(audit_entries))
 
+        # ---- 9+. Decision guidance + credibility framing --------------
+        sections_html.append(self._build_decision_card_section(
+            rss_results, mc_results, settings, unit
+        ))
+        sections_html.append(self._build_credibility_section(
+            rss_results, settings, sources, project_meta, consequence
+        ))
+        sections_html.append(render_vvuq_glossary_html())
+        sections_html.append(self._build_conformity_section(
+            rss_results, consequence
+        ))
+
         # ---- Footer ---------------------------------------------------
         sections_html.append(self._build_footer(now_str))
 
@@ -8648,13 +11427,67 @@ class HTMLReportGenerator:
     # -----------------------------------------------------------------
     @staticmethod
     def _figure_to_base64(fig: Figure) -> str:
-        """Render a matplotlib *Figure* to a PNG data-URI string."""
-        buf = io.BytesIO()
-        fig.savefig(buf, format="png", dpi=150, bbox_inches="tight",
-                    facecolor="white", edgecolor="none")
-        buf.seek(0)
-        encoded = base64.b64encode(buf.read()).decode("ascii")
-        buf.close()
+        """Render a matplotlib *Figure* to a PNG data-URI with light theme.
+
+        Temporarily applies REPORT_PLOT_STYLE to all axes for
+        print-ready appearance, then restores original properties.
+        """
+        # Save original properties
+        orig_props = []
+        for ax in fig.get_axes():
+            orig_props.append({
+                'facecolor': ax.get_facecolor(),
+                'title_color': ax.title.get_color() if ax.title else None,
+                'xlabel_color': ax.xaxis.label.get_color(),
+                'ylabel_color': ax.yaxis.label.get_color(),
+                'spine_colors': {s: ax.spines[s].get_edgecolor() for s in ax.spines},
+            })
+            # Apply light theme
+            ax.set_facecolor(REPORT_PLOT_STYLE['axes.facecolor'])
+            ax.title.set_color(REPORT_PLOT_STYLE['text.color'])
+            ax.xaxis.label.set_color(REPORT_PLOT_STYLE['axes.labelcolor'])
+            ax.yaxis.label.set_color(REPORT_PLOT_STYLE['axes.labelcolor'])
+            ax.tick_params(axis='x', colors=REPORT_PLOT_STYLE['xtick.color'])
+            ax.tick_params(axis='y', colors=REPORT_PLOT_STYLE['ytick.color'])
+            for spine in ax.spines.values():
+                spine.set_edgecolor(REPORT_PLOT_STYLE['axes.edgecolor'])
+            leg = ax.get_legend()
+            if leg:
+                leg.get_frame().set_facecolor(REPORT_PLOT_STYLE['legend.facecolor'])
+                leg.get_frame().set_edgecolor(REPORT_PLOT_STYLE['legend.edgecolor'])
+                for text in leg.get_texts():
+                    text.set_color(REPORT_PLOT_STYLE['text.color'])
+
+        orig_fig_fc = fig.get_facecolor()
+        fig.set_facecolor('#ffffff')
+
+        try:
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=300, bbox_inches="tight",
+                        facecolor="white", edgecolor="none")
+            buf.seek(0)
+            encoded = base64.b64encode(buf.read()).decode("ascii")
+            buf.close()
+        finally:
+            # Restore original properties (always runs, even on savefig error)
+            fig.set_facecolor(orig_fig_fc)
+            for ax, props in zip(fig.get_axes(), orig_props):
+                ax.set_facecolor(props['facecolor'])
+                if props['title_color']:
+                    ax.title.set_color(props['title_color'])
+                ax.xaxis.label.set_color(props['xlabel_color'])
+                ax.yaxis.label.set_color(props['ylabel_color'])
+                ax.tick_params(axis='x', colors=PLOT_STYLE['xtick.color'])
+                ax.tick_params(axis='y', colors=PLOT_STYLE['ytick.color'])
+                for s_name, s_color in props['spine_colors'].items():
+                    ax.spines[s_name].set_edgecolor(s_color)
+                leg = ax.get_legend()
+                if leg:
+                    leg.get_frame().set_facecolor(PLOT_STYLE['legend.facecolor'])
+                    leg.get_frame().set_edgecolor(PLOT_STYLE['legend.edgecolor'])
+                    for text in leg.get_texts():
+                        text.set_color(PLOT_STYLE['text.color'])
+
         return f"data:image/png;base64,{encoded}"
 
     @staticmethod
@@ -8714,13 +11547,23 @@ class HTMLReportGenerator:
         """)
 
     # -- 1. Configuration -----------------------------------------------
-    def _build_config_section(self, s: AnalysisSettings) -> str:
+    def _build_config_section(self, s: AnalysisSettings,
+                              project_meta: Optional[dict] = None) -> str:
+        project_meta = project_meta or {}
         sided_label = "One-Sided" if s.one_sided else "Two-Sided"
+        consequence = normalize_decision_consequence(
+            project_meta.get("decision_consequence", "Medium")
+        )
         rows = [
+            ("Program / Project", _esc(project_meta.get("program", "—"))),
+            ("Analyst", _esc(project_meta.get("analyst", "—"))),
+            ("Date", _esc(project_meta.get("date", "—"))),
+            ("Decision consequence", _esc(consequence)),
             ("Coverage probability", f"{s.coverage*100:.1f}%"),
             ("Confidence level", f"{s.confidence*100:.1f}%"),
             ("Interval type", sided_label),
             ("k-factor method", _esc(s.k_method)),
+            ("Validation metric mode", _esc(getattr(s, 'validation_mode', "Standard scalar (V&V 20)"))),
             ("Bound type", _esc(s.bound_type)),
             ("Units", _esc(s.global_unit)),
             ("MC sampling method", _esc(getattr(s, 'mc_sampling_method',
@@ -8803,8 +11646,12 @@ class HTMLReportGenerator:
     # -- 3. Uncertainty Budget ------------------------------------------
     def _build_budget_section(self, budget_table: list,
                                sources: List[UncertaintySource],
-                               unit: str) -> str:
+                               unit: str,
+                               rss: Optional[RSSResults] = None) -> str:
         # Build HTML table from budget_table (list of dicts)
+        _has_corr = rss is not None and getattr(rss, 'has_correlations', False)
+        _pct_th = ("% Contribution<sup>&dagger;</sup>"
+                   if _has_corr else "% Contribution")
         header = (
             "<tr>"
             "<th>Source</th>"
@@ -8812,9 +11659,11 @@ class HTMLReportGenerator:
             "<th>&sigma; (1&sigma;)</th>"
             "<th>&sigma;&sup2;</th>"
             "<th>DOF (&nu;)</th>"
-            "<th>% Contribution</th>"
+            f"<th>{_pct_th}</th>"
             "<th>Distribution</th>"
             "<th>Data Basis</th>"
+            "<th>Class</th>"
+            "<th>Reducibility</th>"
             "</tr>"
         )
 
@@ -8833,6 +11682,8 @@ class HTMLReportGenerator:
             pct = row.get("pct", 0.0)
             dist = _esc(str(row.get("distribution", "")))
             basis = _esc(str(row.get("data_basis", "")))
+            u_class = _esc(str(row.get("uncertainty_class", "")))
+            reducibility = _esc(str(row.get("reducibility", "")))
 
             # Track dominant source (skip subtotals/totals)
             if not is_sub and not is_tot and pct > dominant_pct:
@@ -8851,16 +11702,30 @@ class HTMLReportGenerator:
             elif is_sub:
                 row_class = ' class="subtotal-row"'
 
+            # Asymmetric annotation on sigma
+            if row.get('asymmetric'):
+                sp = row.get('sigma_upper', 0)
+                sm = row.get('sigma_lower', 0)
+                sigma_html = (
+                    f"{sigma:.6g}<br>"
+                    f"<small>&sigma;&sup1; = {sp:.4g} / "
+                    f"&sigma;&sub; = {sm:.4g}</small>"
+                )
+            else:
+                sigma_html = f"{sigma:.6g}"
+
             body_rows.append(
                 f"            <tr{row_class}>"
                 f"<td>{name}</td>"
                 f"<td>{category}</td>"
-                f"<td>{sigma:.6g}</td>"
+                f"<td>{sigma_html}</td>"
                 f"<td>{sigma_sq:.6g}</td>"
                 f"<td>{dof_str}</td>"
                 f"<td>{pct:.2f}%</td>"
                 f"<td>{dist}</td>"
                 f"<td>{basis}</td>"
+                f"<td>{u_class}</td>"
+                f"<td>{reducibility}</td>"
                 f"</tr>"
             )
 
@@ -8892,6 +11757,75 @@ class HTMLReportGenerator:
                 f'({dominant_pct:.1f}% of total variance).</p>'
             )
 
+        # --- Uncertainty class-split summary ---
+        # Use engine-computed values (correlation-aware) when available;
+        # fall back to independent recomputation only if rss is unavailable.
+        if rss is not None and rss.computed:
+            u_a = rss.u_aleatoric
+            u_e = rss.u_epistemic
+            u_m = rss.u_mixed
+            pct_epi = rss.pct_epistemic
+        else:
+            class_sigmas_fb: Dict[str, List[float]] = {
+                'aleatoric': [], 'epistemic': [], 'mixed': []
+            }
+            for row in budget_table:
+                if row.get("is_subtotal") or row.get("is_total"):
+                    continue
+                cls = row.get("uncertainty_class", "aleatoric")
+                if cls not in ('aleatoric', 'epistemic', 'mixed'):
+                    cls = 'aleatoric'
+                class_sigmas_fb[cls].append(row.get("sigma", 0.0))
+            u_a = float(np.sqrt(sum(s ** 2 for s in class_sigmas_fb['aleatoric'])))
+            u_e = float(np.sqrt(sum(s ** 2 for s in class_sigmas_fb['epistemic'])))
+            u_m = float(np.sqrt(sum(s ** 2 for s in class_sigmas_fb['mixed'])))
+            u_total_fb = float(np.sqrt(u_a ** 2 + u_e ** 2 + u_m ** 2))
+            pct_epi = (u_e ** 2 / (u_total_fb ** 2) * 100.0) if u_total_fb > 0 else 0.0
+        u_total_class = float(np.sqrt(u_a ** 2 + u_e ** 2 + u_m ** 2))
+
+        class_split_html = (
+            f'<p><strong>Uncertainty class split:</strong> '
+            f'U<sub>A</sub>&nbsp;=&nbsp;{u_a:.4g}&nbsp;{_esc(unit)}, '
+            f'U<sub>E</sub>&nbsp;=&nbsp;{u_e:.4g}&nbsp;{_esc(unit)}, '
+            f'U<sub>total</sub>&nbsp;=&nbsp;{u_total_class:.4g}&nbsp;{_esc(unit)}. '
+            f'Epistemic fraction: {pct_epi:.1f}% of total variance.</p>'
+        )
+
+        # Dominant drivers by class
+        driver_html_parts = []
+        for cls_key, cls_label in [('aleatoric', 'aleatoric'),
+                                    ('epistemic', 'epistemic')]:
+            best_name = ""
+            best_pct = 0.0
+            best_red = ""
+            for row in budget_table:
+                if row.get("is_subtotal") or row.get("is_total"):
+                    continue
+                if row.get("uncertainty_class", "aleatoric") == cls_key:
+                    rpct = row.get("pct", 0.0)
+                    if rpct > best_pct:
+                        best_pct = rpct
+                        best_name = row.get("name", "")
+                        best_red = row.get("reducibility", "")
+            if best_name:
+                extra = (f", reducibility: {_esc(best_red)}"
+                         if cls_key == "epistemic" and best_red else "")
+                driver_html_parts.append(
+                    f"Dominant {cls_label} driver: "
+                    f"<strong>{_esc(best_name)}</strong> ({best_pct:.1f}%{extra})"
+                )
+
+        if driver_html_parts:
+            class_split_html += "<p>" + ". ".join(driver_html_parts) + ".</p>"
+
+        # Epistemic dominance warning
+        if pct_epi > 50.0:
+            class_split_html += (
+                '<p class="highlight">&#9888; Epistemic uncertainty dominates '
+                f'({pct_epi:.1f}% of total variance) &mdash; consider '
+                'knowledge-reduction actions before making compliance claims.</p>'
+            )
+
         return textwrap.dedent(f"""\
         <div class="section" id="section-budget">
             <h2>3. Uncertainty Budget</h2>
@@ -8905,8 +11839,14 @@ class HTMLReportGenerator:
                 </tbody>
             </table>
             </div>
+            {('<p style="font-size:0.85em;color:#666;">'
+              '<sup>&dagger;</sup> With correlated sources, individual '
+              'percentages do not sum to 100% because cross-correlation '
+              'terms also contribute to u<sub>val</sub>&sup2;.</p>'
+              ) if _has_corr else ''}
             {subtotal_html}
             {dominant_html}
+            {class_split_html}
         </div>
         """)
 
@@ -8932,15 +11872,69 @@ class HTMLReportGenerator:
             ("Comparison scatter (s<sub>E</sub>)",
              f"{r.s_E:.6g} {_esc(unit)}"),
             ("Number of data points", f"{r.n_data}"),
+            ("Data sufficiency",
+             "adequate" if r.n_data >= 30
+             else ("marginal" if r.n_data >= 10
+                   else "insufficient per GUM &sect;G.3")),
         ]
 
-        if r.lower_bound_uval != 0.0 or r.upper_bound_uval != 0.0:
+        if getattr(r, "multivariate_enabled", False):
+            results_rows.append(
+                ("Multivariate supplement", "Enabled (covariance-aware)")
+            )
+            if getattr(r, "multivariate_computed", False):
+                mv_txt = (
+                    f"score={r.multivariate_score:.4g}, "
+                    f"T<sup>2</sup>={r.multivariate_t2:.4g}, "
+                    f"p={r.multivariate_pvalue:.4g}, "
+                    f"n={r.multivariate_n_locations}&times;{r.multivariate_n_conditions}"
+                )
+                results_rows.append(("Multivariate summary", mv_txt))
+            else:
+                results_rows.append(("Multivariate summary", _esc(r.multivariate_note or "Not computable")))
+
+        # Correlation disclosure
+        corr_html_extra = ""
+        if r.has_correlations:
+            results_rows.append(
+                ("Source correlation",
+                 f"Applied (groups: {', '.join(r.correlation_groups)})")
+            )
+            # Build HTML correlation matrix tables
+            for grp_name, names, C_mat in r.correlation_matrices:
+                th_cells = "".join(
+                    f"<th>{_esc(n)}</th>" for n in names
+                )
+                rows_html = ""
+                for ri, rn in enumerate(names):
+                    td_cells = "".join(
+                        f"<td>{C_mat[ri, ci]:.2f}</td>"
+                        for ci in range(len(names))
+                    )
+                    rows_html += (
+                        f"<tr><th>{_esc(rn)}</th>{td_cells}</tr>\n"
+                    )
+                corr_html_extra += (
+                    f'<h4>Group &ldquo;{_esc(grp_name)}&rdquo; '
+                    f'effective &rho; matrix</h4>\n'
+                    f'<table class="stats-table"><thead><tr>'
+                    f'<th></th>{th_cells}</tr></thead>\n'
+                    f'<tbody>{rows_html}</tbody></table>\n'
+                )
+        else:
+            results_rows.append(
+                ("Source correlation", "Independent (no correlations)")
+            )
+
+        if (not np.isnan(r.lower_bound_uval)
+                and (r.lower_bound_uval != 0.0 or r.upper_bound_uval != 0.0)):
             results_rows.append(
                 ("U<sub>val</sub> bounds",
                  f"[{r.lower_bound_uval:.6g}, {r.upper_bound_uval:.6g}] "
                  f"{_esc(unit)}")
             )
-        if r.lower_bound_sE != 0.0 or r.upper_bound_sE != 0.0:
+        if (not np.isnan(r.lower_bound_sE)
+                and (r.lower_bound_sE != 0.0 or r.upper_bound_sE != 0.0)):
             results_rows.append(
                 ("s<sub>E</sub> bounds",
                  f"[{r.lower_bound_sE:.6g}, {r.upper_bound_sE:.6g}] "
@@ -8977,6 +11971,29 @@ class HTMLReportGenerator:
                 'u<sub>val</sub> = 0.</p>'
             )
 
+        mv_verdict = ""
+        if getattr(r, "multivariate_enabled", False):
+            if getattr(r, "multivariate_computed", False):
+                mv_pass = r.multivariate_pvalue >= 0.05
+                cls = "pass" if mv_pass else "fail"
+                txt = (
+                    "multivariate residual structure is consistent with expected noise."
+                    if mv_pass else
+                    "multivariate residual structure suggests unresolved systematic pattern."
+                )
+                mv_verdict = (
+                    f'<p class="verdict {cls}">Multivariate supplement: '
+                    f'p = {r.multivariate_pvalue:.4f} '
+                    f'&mdash; <strong>{txt}</strong></p>'
+                )
+            else:
+                mv_verdict = (
+                    '<p class="verdict neutral">Multivariate supplement enabled '
+                    'but not computable for the current dataset.</p>'
+                )
+            if r.multivariate_note:
+                mv_verdict += f"<p><em>{_esc(r.multivariate_note)}</em></p>"
+
         img_html = self._embed_figure(fig, "RSS result plots")
 
         return textwrap.dedent(f"""\
@@ -8990,7 +12007,9 @@ class HTMLReportGenerator:
         {body}
                 </tbody>
             </table>
+            {corr_html_extra}
             {verdict}
+            {mv_verdict}
             {img_html}
         </div>
         """)
@@ -9026,6 +12045,17 @@ class HTMLReportGenerator:
                 (f"Bootstrap 95% CI envelope (lower on {lo_h}, upper on {hi_h})",
                  f"[{mc.bootstrap_ci_low:.6g}, {mc.bootstrap_ci_high:.6g}] "
                  f"{_esc(unit)}")
+            )
+
+        notes_html = ""
+        mc_notes = getattr(mc, 'notes', None)
+        if mc_notes:
+            note_items = "\n".join(
+                f"<li>{_esc(str(n))}</li>" for n in mc_notes
+            )
+            notes_html = (
+                "<h3>Monte Carlo Notes</h3>"
+                f"<ul>{note_items}</ul>"
             )
 
         body = "\n".join(
@@ -9065,6 +12095,7 @@ class HTMLReportGenerator:
                 </tbody>
             </table>
             {comparison_html}
+            {notes_html}
             {img_html}
         </div>
         """)
@@ -9228,6 +12259,139 @@ class HTMLReportGenerator:
             </div>
         </div>
         """)
+
+    def _build_decision_card_section(
+        self,
+        rss: Optional[RSSResults],
+        mc: Optional[MCResults],
+        settings: AnalysisSettings,
+        unit: str,
+    ) -> str:
+        """Render novice-first final decision card."""
+        if not rss or not rss.computed:
+            card = render_decision_card_html(
+                title="Decision Card (Final Validation Summary)",
+                use_value="No valid result. Run RSS first.",
+                use_distribution="N/A",
+                use_combination="N/A",
+                stop_checks=["RSS analysis not computed"],
+                notes="No carry decision can be made yet.",
+            )
+            return card.replace(
+                '<div class="section">',
+                '<div class="section" id="section-decision-card">',
+                1,
+            )
+
+        use_value = f"U_val = {rss.U_val:.6g} {unit}"
+        if mc is not None and mc.computed:
+            use_value += (
+                f"; MC interval = [{mc.lower_bound:.6g}, {mc.upper_bound:.6g}] {unit}"
+            )
+        use_distribution = (
+            "Normal (RSS basis) plus sampled source distributions in Monte Carlo"
+            if mc is not None and mc.computed else
+            "Normal (RSS basis)"
+        )
+        use_combination = (
+            "RSS for formal scalar check; Monte Carlo as distribution-shape cross-check"
+            if mc is not None and mc.computed else
+            "RSS"
+        )
+
+        stop_checks = [
+            "No comparison data loaded (n = 0)",
+            "Scalar validation fails: |Ebar| > U_val",
+            "Effective DOF below 5 (k-factor instability)",
+            "Any unresolved unit mismatch between source and global unit",
+        ]
+        if getattr(rss, "multivariate_enabled", False):
+            stop_checks.append(
+                "Multivariate supplement fails (p < 0.05) without documented justification"
+            )
+
+        card = render_decision_card_html(
+            title="Decision Card (Final Validation Summary)",
+            use_value=use_value,
+            use_distribution=use_distribution,
+            use_combination=use_combination,
+            stop_checks=stop_checks,
+            notes=(
+                f"Configured for {settings.coverage*100:.0f}% coverage and "
+                f"{settings.confidence*100:.0f}% confidence."
+            ),
+        )
+        return card.replace(
+            '<div class="section">',
+            '<div class="section" id="section-decision-card">',
+            1,
+        )
+
+    def _build_credibility_section(
+        self,
+        rss: Optional[RSSResults],
+        settings: AnalysisSettings,
+        sources: List[UncertaintySource],
+        project_meta: dict,
+        consequence: str,
+    ) -> str:
+        """Render deterministic credibility checklist section."""
+        enabled_sources = [
+            s for s in sources
+            if getattr(s, "enabled", True) and s.get_standard_uncertainty() > 0
+        ]
+        unit_ok = all(
+            (not getattr(s, "unit", "").strip())
+            or s.unit == settings.global_unit
+            for s in enabled_sources
+        )
+        diagnostics_pass = bool(rss and rss.computed)
+        if rss and rss.computed:
+            diagnostics_pass = (
+                (rss.nu_eff >= 5 or np.isinf(rss.nu_eff))
+                and (rss.bias_explained is not False)
+            )
+            if (
+                getattr(rss, "multivariate_enabled", False)
+                and getattr(rss, "multivariate_computed", False)
+                and getattr(rss, "multivariate_pvalue", 1.0) < 0.05
+            ):
+                diagnostics_pass = False
+
+        evidence = {
+            'inputs_documented': bool(project_meta.get("program", "").strip())
+            and bool(project_meta.get("analyst", "").strip()),
+            'method_selected': True,
+            'units_consistent': unit_ok,
+            'data_quality': bool(rss and rss.n_data >= 10),
+            'diagnostics_pass': diagnostics_pass,
+            'independent_review': str(
+                project_meta.get("independent_review", "")
+            ).strip().lower() in ("1", "true", "yes", "y"),
+            'conservative_bound': (
+                settings.coverage >= 0.95
+                and (settings.one_sided or "s_E" in str(settings.bound_type))
+            ),
+            'validation_plan': bool(rss and rss.n_data > 0),
+        }
+        return render_credibility_html(consequence, evidence)
+
+    def _build_conformity_section(
+        self,
+        rss: Optional[RSSResults],
+        consequence: str,
+    ) -> str:
+        """Render optional conformity wording template section."""
+        if rss is None or not rss.computed or rss.U_val <= 0:
+            metric_value = "Not available (run RSS first)"
+        else:
+            ratio = abs(rss.E_mean) / rss.U_val if rss.U_val > 0 else float("inf")
+            metric_value = f"{ratio:.4f}"
+        return render_conformity_template_html(
+            metric_name="Validation ratio |Ebar| / U_val",
+            metric_value=metric_value,
+            consequence=consequence,
+        )
 
     # -- Footer ---------------------------------------------------------
     def _build_footer(self, now_str: str) -> str:
@@ -9509,6 +12673,7 @@ class ProjectManager:
             payload: Dict[str, Any] = {
                 'app_version': APP_VERSION,
                 'save_date': datetime.datetime.now().isoformat(),
+                'project_name': project_name,
                 'comparison_data': comp_data.to_dict(),
                 'sources': [s.to_dict() for s in sources],
                 'settings': settings.to_dict(),
@@ -9700,8 +12865,8 @@ def generate_synthetic_demo() -> Tuple['ComparisonData', List['UncertaintySource
     sensor_names = [f"TC-{i+1:02d}" for i in range(n_locations)]
     condition_names = [f"FC-{j+1:03d}" for j in range(n_conditions)]
 
-    np.random.seed(42)
-    base_errors = np.random.normal(loc=5.0, scale=6.0, size=(n_locations, n_conditions))
+    rng = np.random.default_rng(42)
+    base_errors = rng.normal(loc=5.0, scale=6.0, size=(n_locations, n_conditions))
 
     # Per-location offsets to introduce systematic biases
     location_offsets = np.array([-2, -1, 0, 1, 2, -1, 0, 1], dtype=float)
@@ -9824,6 +12989,198 @@ def generate_synthetic_demo() -> Tuple['ComparisonData', List['UncertaintySource
     return comp_data, sources, settings
 
 
+def generate_advanced_demo() -> Tuple['ComparisonData', List['UncertaintySource'], 'AnalysisSettings']:
+    """
+    Generate an advanced demonstration dataset exercising non-Normal
+    distributions, asymmetric uncertainties, and correlated sources.
+
+    The comparison data is constructed with a deliberate systematic bias
+    of ~15 degF (CFD hotter than test) so the validation metric will show
+    a **NOT VALIDATED** result, illustrating what failure looks like.
+
+    Returns
+    -------
+    tuple
+        (ComparisonData, List[UncertaintySource], AnalysisSettings)
+    """
+
+    # ---- Comparison Data (6 locations x 4 conditions) ----
+    n_locations = 6
+    n_conditions = 4
+
+    sensor_names = [
+        "LE-Stag",      # leading-edge stagnation point
+        "Suc-25%",      # suction side 25% chord
+        "Suc-50%",      # suction side 50% chord
+        "Suc-75%",      # suction side 75% chord
+        "Prs-50%",      # pressure side 50% chord
+        "TE-Slot",      # trailing-edge cooling slot
+    ]
+    condition_names = [
+        "Cruise-Lo",    # cruise, low-power
+        "Cruise-Hi",    # cruise, high-power
+        "Climb",        # max-climb
+        "Takeoff",      # takeoff / max-power
+    ]
+
+    # Build a repeatable comparison-error matrix with ~15 degF mean bias.
+    # Values represent E = T_CFD - T_test (positive = CFD hotter).
+    rng = np.random.default_rng(2024)
+
+    # The *errors* vary around +15 degF with realistic scatter.
+    base_bias = 15.0  # systematic CFD over-prediction
+    location_scatter = np.array([1.0, -0.5, 0.2, -0.8, 0.6, -0.3])
+    condition_scatter = np.array([-1.0, 0.5, 1.2, -0.7])
+
+    errors = np.empty((n_locations, n_conditions), dtype=float)
+    for i in range(n_locations):
+        for j in range(n_conditions):
+            errors[i, j] = (base_bias
+                            + location_scatter[i]
+                            + condition_scatter[j]
+                            + rng.normal(0.0, 2.0))
+
+    comp_data = ComparisonData(
+        data=errors,
+        sensor_names=sensor_names,
+        condition_names=condition_names,
+        unit="\u00b0F",
+        is_pooled=True,
+    )
+
+    # ---- Uncertainty Sources ----
+    sources: List[UncertaintySource] = []
+
+    # 1. Grid convergence -- standard Normal numerical uncertainty
+    sources.append(UncertaintySource(
+        name="Grid convergence u_num",
+        category="Numerical (u_num)",
+        input_type="Sigma Value Only",
+        distribution="Normal",
+        sigma_basis="Confirmed 1\u03c3",
+        sigma_value=2.5,
+        raw_sigma_value=2.5,
+        mean_value=0.0,
+        sample_size=60,
+        dof=59.0,
+        is_supplier=False,
+        unit="\u00b0F",
+        notes="Richardson extrapolation on 3-grid sequence",
+        enabled=True,
+    ))
+
+    # 2. Inlet temperature uncertainty -- asymmetric (upper > lower)
+    sources.append(UncertaintySource(
+        name="Inlet temperature uncertainty",
+        category="Input/BC (u_input)",
+        input_type="Sigma Value Only",
+        distribution="Normal",
+        sigma_basis="Confirmed 1\u03c3",
+        sigma_value=0.0,           # not used when asymmetric=True
+        raw_sigma_value=0.0,
+        mean_value=0.0,
+        sample_size=30,
+        dof=29.0,
+        is_supplier=False,
+        unit="\u00b0F",
+        notes="Thermocouple rake; asymmetric due to radiation correction",
+        enabled=True,
+        asymmetric=True,
+        sigma_upper=3.0,
+        sigma_lower=1.5,
+    ))
+
+    # 3a. Thermocouple bias A -- correlated with 3b
+    sources.append(UncertaintySource(
+        name="Thermocouple bias A",
+        category="Experimental (u_D)",
+        input_type="Sigma Value Only",
+        distribution="Normal",
+        sigma_basis="Confirmed 1\u03c3",
+        sigma_value=1.2,
+        raw_sigma_value=1.2,
+        mean_value=0.0,
+        sample_size=50,
+        dof=49.0,
+        is_supplier=False,
+        unit="\u00b0F",
+        notes="Common-lot TC, correlated with TC bias B",
+        enabled=True,
+        correlation_group="TC_bias",
+        correlation_coefficient=0.8,
+    ))
+
+    # 3b. Thermocouple bias B -- correlated with 3a
+    sources.append(UncertaintySource(
+        name="Thermocouple bias B",
+        category="Experimental (u_D)",
+        input_type="Sigma Value Only",
+        distribution="Normal",
+        sigma_basis="Confirmed 1\u03c3",
+        sigma_value=1.4,
+        raw_sigma_value=1.4,
+        mean_value=0.0,
+        sample_size=50,
+        dof=49.0,
+        is_supplier=False,
+        unit="\u00b0F",
+        notes="Common-lot TC, correlated with TC bias A",
+        enabled=True,
+        correlation_group="TC_bias",
+        correlation_coefficient=0.8,
+    ))
+
+    # 4. Positioning uncertainty -- Uniform distribution
+    sources.append(UncertaintySource(
+        name="Positioning uncertainty",
+        category="Experimental (u_D)",
+        input_type="Sigma Value Only",
+        distribution="Uniform",
+        sigma_basis="Confirmed 1\u03c3",
+        sigma_value=1.0,
+        raw_sigma_value=1.0,
+        mean_value=0.0,
+        sample_size=0,
+        dof=float('inf'),
+        is_supplier=True,
+        unit="\u00b0F",
+        notes="TC bead location on airfoil surface; +/-0.020 in temperature effect",
+        enabled=True,
+    ))
+
+    # 5. Material property scatter -- Lognormal distribution
+    sources.append(UncertaintySource(
+        name="Material property scatter",
+        category="Input/BC (u_input)",
+        input_type="Sigma Value Only",
+        distribution="Lognormal",
+        sigma_basis="Confirmed 1\u03c3",
+        sigma_value=2.0,
+        raw_sigma_value=2.0,
+        mean_value=0.0,
+        sample_size=15,
+        dof=14.0,
+        is_supplier=False,
+        unit="\u00b0F",
+        notes="TBC thermal conductivity lot-to-lot variation",
+        enabled=True,
+    ))
+
+    # ---- Analysis Settings ----
+    settings = AnalysisSettings(
+        coverage=0.95,
+        confidence=0.95,
+        one_sided=True,
+        k_method=K_METHOD_VV20,
+        global_unit="\u00b0F",
+        mc_n_trials=100000,
+        mc_bootstrap=True,
+        bound_type="Both (for comparison)",
+    )
+
+    return comp_data, sources, settings
+
+
 # =============================================================================
 # SECTION 17: MAIN APPLICATION WINDOW + ENTRY POINT
 # =============================================================================
@@ -9878,7 +13235,7 @@ class MainWindow(QMainWindow):
         # Toggle button row
         bar_top = QHBoxLayout()
         bar_top.setSpacing(8)
-        self._btn_toggle_info = QPushButton("▼ Project Info")
+        self._btn_toggle_info = QPushButton("▶ Project Info")
         self._btn_toggle_info.setFlat(True)
         self._btn_toggle_info.setStyleSheet(
             f"QPushButton {{ color: {DARK_COLORS['accent']}; font-weight: bold; "
@@ -9936,7 +13293,16 @@ class MainWindow(QMainWindow):
         detail_layout.addWidget(self._edit_date, 0, 5)
 
         detail_layout.addWidget(
-            self._make_label("Notes:", lbl_style), 1, 0)
+            self._make_label("Decision Consequence:", lbl_style), 1, 0)
+        self._cmb_consequence = QComboBox()
+        self._cmb_consequence.addItems(["Low", "Medium", "High"])
+        self._cmb_consequence.setCurrentText("Medium")
+        self._cmb_consequence.setStyleSheet(val_style)
+        self._cmb_consequence.currentTextChanged.connect(self._mark_unsaved)
+        detail_layout.addWidget(self._cmb_consequence, 1, 1)
+
+        detail_layout.addWidget(
+            self._make_label("Notes:", lbl_style), 2, 0)
         self._edit_notes = QTextEdit()
         self._edit_notes.setStyleSheet(
             f"QTextEdit {{ {val_style} }}"
@@ -9947,7 +13313,7 @@ class MainWindow(QMainWindow):
         )
         self._edit_notes.setMaximumHeight(80)
         self._edit_notes.textChanged.connect(self._mark_unsaved)
-        detail_layout.addWidget(self._edit_notes, 1, 1, 1, 5)
+        detail_layout.addWidget(self._edit_notes, 2, 1, 1, 5)
 
         # Column stretch: fields get more space than labels
         detail_layout.setColumnStretch(1, 3)
@@ -9955,8 +13321,8 @@ class MainWindow(QMainWindow):
         detail_layout.setColumnStretch(5, 2)
 
         bar_layout.addWidget(self._project_detail_frame)
-        self._project_detail_frame.setVisible(True)
-        self._project_info_visible = True
+        self._project_detail_frame.setVisible(False)
+        self._project_info_visible = False
 
         central_layout.addWidget(self._project_bar)
 
@@ -10024,6 +13390,7 @@ class MainWindow(QMainWindow):
             'analyst': self._edit_analyst.text().strip(),
             'date': self._edit_date.text().strip(),
             'notes': self._edit_notes.toPlainText().strip(),
+            'decision_consequence': self._cmb_consequence.currentText().strip(),
         }
 
     def set_project_metadata(self, meta: dict):
@@ -10032,6 +13399,10 @@ class MainWindow(QMainWindow):
         self._edit_analyst.setText(meta.get('analyst', ''))
         self._edit_date.setText(meta.get('date', ''))
         self._edit_notes.setPlainText(meta.get('notes', ''))
+        dc = normalize_decision_consequence(meta.get('decision_consequence', 'Medium'))
+        idx = self._cmb_consequence.findText(dc)
+        if idx >= 0:
+            self._cmb_consequence.setCurrentIndex(idx)
 
     # =================================================================
     # MENU BAR
@@ -10065,9 +13436,13 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
 
         act_export = QAction("&Export HTML Report...", self)
-        act_export.setShortcut(QKeySequence("Ctrl+E"))
+        act_export.setShortcut(QKeySequence("Ctrl+H"))
         act_export.triggered.connect(self._export_html_report)
         file_menu.addAction(act_export)
+
+        act_manifest = QAction("Export &Reproducibility Manifest...", self)
+        act_manifest.triggered.connect(self._export_reproducibility_manifest)
+        file_menu.addAction(act_manifest)
 
         file_menu.addSeparator()
 
@@ -10100,6 +13475,10 @@ class MainWindow(QMainWindow):
         act_example = QAction("&Load Example Data", self)
         act_example.triggered.connect(self._load_example_data)
         tools_menu.addAction(act_example)
+
+        act_adv_example = QAction("Load &Advanced Example", self)
+        act_adv_example.triggered.connect(self._load_advanced_example_data)
+        tools_menu.addAction(act_adv_example)
 
         act_clear = QAction("&Clear All Data", self)
         act_clear.triggered.connect(self._clear_all)
@@ -10160,10 +13539,32 @@ class MainWindow(QMainWindow):
                 s for s in sources if s.get_standard_uncertainty() > 0
             ]
             if not valid_sources:
+                self._tab_rss.clear_results()
+                self._tab_rollup.clear_results()
                 self._status_bar.showMessage(
-                    "No valid uncertainty sources defined.", 5000
+                    "No valid uncertainty sources — results cleared.", 5000
                 )
                 return
+
+            # Unit consistency check
+            mismatched = [
+                s.name for s in valid_sources
+                if s.unit and s.unit != settings.global_unit
+            ]
+            if mismatched:
+                audit_log.log_computation(
+                    "UNIT_MISMATCH",
+                    f"Sources with unit mismatch vs global '{settings.global_unit}': "
+                    f"{', '.join(mismatched)}"
+                )
+                self._status_bar.showMessage(
+                    f"Warning: {len(mismatched)} source(s) have different "
+                    f"units than global setting ({settings.global_unit}).",
+                    10000,
+                )
+                self._tab_rss.show_unit_mismatch(mismatched, settings.global_unit)
+            else:
+                self._tab_rss.hide_unit_mismatch()
 
             # Compute RSS
             self._tab_rss.compute_and_display(sources, comp_data, settings)
@@ -10488,6 +13889,7 @@ class MainWindow(QMainWindow):
             figures=figures,
             audit_entries=audit_log.to_dict(),
             rollup_headers=rollup_headers,
+            project_metadata=self.get_project_metadata(),
         )
         return html
 
@@ -10532,6 +13934,72 @@ class MainWindow(QMainWindow):
             audit_log.log_warning(f"HTML report export failed: {exc}")
             traceback.print_exc()
 
+    def _export_reproducibility_manifest(self):
+        """Export a reproducibility manifest JSON for the current analysis."""
+        import hashlib
+        import platform as _platform
+        import json as _json
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self, "Export Reproducibility Manifest",
+            os.path.join(
+                self._project_folder or os.path.expanduser("~"),
+                "reproducibility_manifest.json"
+            ),
+            "JSON Files (*.json);;All Files (*)"
+        )
+        if not filepath:
+            return
+
+        try:
+            settings = self._tab_settings.get_settings()
+            sources = self._tab_sources.get_sources()
+            rss = self._tab_rss.get_results()
+            mc = self._tab_mc.get_results()
+
+            # Compute settings hash
+            settings_str = _json.dumps(settings.to_dict(), sort_keys=True)
+            settings_hash = hashlib.sha256(settings_str.encode()).hexdigest()
+
+            manifest = {
+                "tool_name": APP_NAME,
+                "tool_version": APP_VERSION,
+                "python_version": sys.version,
+                "platform": _platform.platform(),
+                "os": _platform.system(),
+                "library_versions": {
+                    "numpy": np.__version__,
+                    "scipy": getattr(__import__('scipy'), '__version__', 'unknown'),
+                    "matplotlib": getattr(__import__('matplotlib'), '__version__', 'unknown'),
+                    "PySide6": getattr(__import__('PySide6'), '__version__', 'unknown'),
+                },
+                "analysis_date": datetime.datetime.now().isoformat(),
+                "project_name": self._project_name,
+                "settings_hash": settings_hash,
+                "n_sources": len(sources),
+                "n_enabled_sources": len([s for s in sources if s.enabled]),
+                "n_data_points": rss.n_data if rss and rss.computed else 0,
+                "rss_computed": rss.computed if rss else False,
+                "mc_computed": mc.computed if mc else False,
+                "mc_n_trials": mc.n_trials if mc and mc.computed else 0,
+                "random_seed": getattr(settings, 'mc_seed', None),
+                "method_used": "RSS + MC" if (rss and rss.computed and mc and mc.computed) else (
+                    "RSS" if rss and rss.computed else "None"
+                ),
+            }
+
+            with open(filepath, 'w', encoding='utf-8') as fp:
+                _json.dump(manifest, fp, indent=2, default=str)
+
+            self._status_bar.showMessage(
+                f"Reproducibility manifest exported to {filepath}", 8000
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Export Error",
+                f"Failed to export manifest:\n{exc}"
+            )
+
     # =================================================================
     # TOOLS MENU SLOTS
     # =================================================================
@@ -10574,6 +14042,48 @@ class MainWindow(QMainWindow):
                 f"Failed to load example data:\n{exc}"
             )
             audit_log.log_warning(f"Demo data load failed: {exc}")
+            traceback.print_exc()
+
+    def _load_advanced_example_data(self):
+        """Load advanced demo data (NOT VALIDATED scenario) into all tabs."""
+        try:
+            comp_data, sources, settings = generate_advanced_demo()
+
+            # Clear stale results before loading new data
+            self._tab_rss.clear_results()
+            self._tab_mc.clear_results()
+            self._tab_rollup.clear_results()
+
+            self._tab_comparison.set_comparison_data(comp_data)
+            self._tab_sources.set_sources(sources)
+            self._tab_settings.set_settings(settings)
+
+            self._project_name = "Advanced_Demo_NOT_VALIDATED"
+            self._project_folder = ""
+            self._unsaved_changes = True
+            self._lbl_project_name.setText("Advanced_Demo_NOT_VALIDATED")
+
+            audit_log.log("ADV_DEMO_LOADED",
+                          "Advanced demo data loaded (NOT VALIDATED scenario).",
+                          f"{len(sources)} sources, "
+                          f"{comp_data.flat_data().size} comparison points")
+
+            # Trigger auto-compute
+            QTimer.singleShot(200, self._auto_compute_rss)
+
+            self._status_bar.showMessage(
+                "Advanced example loaded. Demonstrates asymmetric, correlated, "
+                "and non-Normal sources with a NOT VALIDATED result.",
+                10000,
+            )
+            self._tabs.setCurrentIndex(0)
+
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Advanced Demo Error",
+                f"Failed to load advanced example data:\n{exc}"
+            )
+            audit_log.log_warning(f"Advanced demo data load failed: {exc}")
             traceback.print_exc()
 
     def _clear_all(self):
@@ -10622,7 +14132,7 @@ class MainWindow(QMainWindow):
             f"ASME V&amp;V 20 framework with RSS and Monte Carlo methods.</p>"
             f"<p><b>Standards:</b></p>"
             f"<ul>"
-            f"<li>ASME V&amp;V 20-2009 (R2016)</li>"
+            f"<li>ASME V&amp;V 20-2009 (R2021)</li>"
             f"<li>JCGM 100:2008 (GUM)</li>"
             f"<li>JCGM 101:2008 (GUM Supplement 1)</li>"
             f"<li>ASME PTC 19.1-2018</li>"

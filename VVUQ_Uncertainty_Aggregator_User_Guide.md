@@ -1,8 +1,36 @@
-# VVUQ Uncertainty Aggregator v1.0 — User Guide & Technical Reference
+# VVUQ Uncertainty Aggregator v1.2.0 — User Guide & Technical Reference
 
 **CFD Validation Uncertainty Tool per ASME V&V 20 Framework**
 
 *Written for engineers — not statisticians.*
+
+---
+
+## Revision Update (v1.2.0)
+
+- Added **Validation metric mode** in Analysis Settings:
+  - `Standard scalar (V&V 20)` (default)
+  - `Multivariate supplement (covariance-aware)` for mapped/location-rich comparisons
+- Added **Decision Consequence** in the Project Info bar (`Low`, `Medium`, `High`) for risk-based reporting.
+- Expanded HTML report with:
+  - Decision card (plain-language final actions),
+  - Credibility framing checklist,
+  - Fixed VVUQ glossary panel,
+  - Conformity assessment wording template.
+- RSS results text and report now show multivariate supplemental metrics when enabled.
+- Distribution auto-fit now uses **automatic GOF runtime guardrails**:
+  - sparse datasets use KS screening automatically,
+  - larger datasets use adaptive bootstrap sample counts.
+
+### Quick Example (Multivariate Supplement)
+
+1. Load comparison data with multiple locations/conditions in **Tab 1**.
+2. In **Tab 3**, set **Validation metric mode** to `Multivariate supplement (covariance-aware)`.
+3. Compute RSS.
+4. In **Tab 4**, review both:
+   - scalar check `|Ē| <= U_val`, and
+   - multivariate p-value guidance.
+5. Export HTML and use the **Decision Card** section as the one-page transfer summary.
 
 ---
 
@@ -48,6 +76,16 @@ That's what uncertainty quantification (UQ) does. This tool follows the ASME V&V
 > *"Your CFD prediction is accurate to within ±X degrees (or psi, or lb/s) with 95% confidence."*
 
 That's the number you put in your report. That's what the certifying authority wants to see.
+
+> **Common Mistakes to Avoid**
+>
+> Before you dive in, here are the most frequent errors new users make with the Aggregator. Catching these early will save you hours of rework:
+>
+> - **Entering a 2-sigma value as 1-sigma.** This is the single most common mistake. If a spec says "plus or minus 1.8 degrees F at 95% confidence," that is a 2-sigma number. Entering it as 1-sigma doubles your reported uncertainty. Always check the sigma basis before typing a value.
+> - **Forgetting to set the correct sigma basis dropdown.** Every uncertainty source has a sigma basis selector (Confirmed 1-sigma, 2-sigma, 3-sigma, Bounding, etc.). Leaving it on the wrong setting silently corrupts your entire budget. Double-check each source after entry.
+> - **Mixing up systematic and random uncertainties.** Systematic errors (bias) and random errors (scatter) are handled differently. A fixed calibration offset is not the same as measurement noise. Make sure each source is categorized correctly as Numerical, Input/BC, or Experimental.
+> - **Not including all uncertainty sources.** A missing source means your total uncertainty is artificially low, which can flip a "not validated" result to "validated" for the wrong reasons. Walk through every boundary condition, every instrument, and every modeling assumption before running the analysis.
+> - **Using RSS when your inputs are correlated.** RSS assumes all uncertainty sources are independent. If two sources share a common cause (e.g., two thermocouples calibrated with the same reference), RSS underestimates the total. Use the correlation group feature or run Monte Carlo instead.
 
 ---
 
@@ -140,6 +178,29 @@ Compare your mean bias to your expanded uncertainty:
 
 **That's it.** Everything else in this tool is about doing those five steps correctly, rigorously, and in a way that a certification authority will accept.
 
+### What to Do When Validation Fails (|E| > U_val)
+
+Seeing **"NOT VALIDATED"** can be alarming, but it does not mean your CFD is useless. It means the model bias is larger than your known uncertainties can explain. Here are your options, in order of preference:
+
+1. **Check your inputs first.** Go back and verify:
+   - Did you include all uncertainty sources? (Missing even one can cause failure.)
+   - Are your sigma values on the right basis? (A common mistake is entering 2-sigma as 1-sigma.)
+   - Is your grid study converged? (A divergent grid study inflates u_num.)
+
+2. **Look for correctable systematic bias.** If E is consistently positive or negative across all comparison points, you may have a calibration offset. Document it and consider whether a bias correction is justified for your application.
+
+3. **Add missing uncertainty sources.** The most common omissions are:
+   - Turbulence model uncertainty (often the largest contributor for thermal predictions)
+   - Geometry simplification effects
+   - Material property uncertainty
+
+4. **Document and move forward.** Many perfectly useful engineering models are "not validated" by the strict V&V 20 criterion. What matters for certification is that you:
+   - Quantified every source you could
+   - Reported the gap honestly
+   - Explained the engineering significance (e.g., "The 3K bias is within the design margin")
+
+**Do NOT artificially inflate uncertainty sources to force a VALIDATED result.** That defeats the purpose of the standard and will be caught in peer review.
+
 ---
 
 ## 4. Getting Started — Application Layout
@@ -159,13 +220,13 @@ The application has **seven tabs** across the top, plus a collapsible **Project 
 | Reference | 📖 | Built-in standards reference and glossary |
 
 ### Project Info Bar
-Click the **▼ Project Info** toggle at the top to expand fields for:
+Click the **▶ Project Info** toggle at the top to expand fields for:
 - **Program/Project name** — e.g., "Engine Thermal Model V2.3"
 - **Analyst** — your name
 - **Date** — defaults to today
 - **Notes** — free-form text (assumptions, scope, etc.)
 
-These fields are saved with the project and appear in the HTML report.
+The panel starts **collapsed by default** to maximize working space. These fields are saved with the project and appear in the HTML report.
 
 ### Auto-Compute
 The RSS analysis **automatically recomputes** whenever you change comparison data, uncertainty sources, or analysis settings. You don't need to click anything — just make your changes and the results update live. (Monte Carlo must be run manually because it takes a few seconds.)
@@ -178,7 +239,7 @@ The RSS analysis **automatically recomputes** whenever you change comparison dat
 | Ctrl+O | Open Project |
 | Ctrl+S | Save Project |
 | Ctrl+Shift+S | Save As |
-| Ctrl+E | Export HTML Report |
+| Ctrl+H | Export HTML Report |
 | Ctrl+R | Compute RSS |
 | Ctrl+M | Run Monte Carlo |
 | Ctrl+Shift+A | Compute All (RSS + MC) |
@@ -225,7 +286,7 @@ A separate table below shows the mean, std, and count for **each sensor individu
 
 ### Distribution Fitting
 
-The tool automatically fits 8 standard distributions to your data and ranks them by how well they fit (Kolmogorov-Smirnov test). This helps you decide which distribution to assign to your experimental uncertainty source. If the best-fit distribution has p > 0.05, you can't statistically reject it.
+The tool automatically fits 8 standard distributions to your data and ranks them by AICc (small-sample corrected AIC). For goodness-of-fit (GOF), it applies bootstrap AD when practical, and switches to KS screening automatically in sparse/fast-mode cases. This keeps the process responsive for junior users while preserving a clear pass/fail gate.
 
 ### Guidance Panels
 
@@ -286,6 +347,24 @@ When you enter a sigma value, you MUST tell the tool what basis it's on. This is
 
 **Why this matters:** If a thermocouple spec says "±1.8°F (2σ, 95%)" and you enter 1.8 as "Confirmed 1σ", you've just doubled your thermocouple uncertainty. The tool uses the basis to correctly convert to 1σ.
 
+### Sigma Basis — Quick Reference with Real-World Examples
+
+Not sure which sigma basis your data is in? Use this table:
+
+| Where your number came from | What basis it probably is | What to select |
+|---|---|---|
+| Calibration certificate says "±0.5 K" | Usually 2σ (95% confidence) — check the certificate | Confirmed 2σ |
+| Manufacturer datasheet says "accuracy ±1%" | Usually 2σ or 3σ — check the fine print | Confirmed 2σ (conservative) |
+| You ran a grid study and got u_num from the GCI tool | Already 1σ (standard uncertainty) | Confirmed 1σ |
+| You ran the Iterative Uncertainty tool and got sigma | Already 1σ | Confirmed 1σ |
+| You ran the Statistical Analyzer and got σ | Already 1σ (population std deviation) | Confirmed 1σ |
+| A colleague said "the uncertainty is about 2 degrees" | Unknown basis — ask them to clarify | Unverified 1σ (conservative) |
+| You estimated it yourself from experience | Expert judgment — no statistical basis | Unverified 1σ |
+| A textbook says "typical uncertainty is ±X" | Often 2σ, but varies — check the source | Unverified 2σ |
+| Tolerance from a drawing (e.g., ±0.005 inches) | This is a range, not sigma | Uniform (half-range) |
+
+**The #1 mistake:** Entering a 2σ or 95% CI value as if it were 1σ. This doubles your reported uncertainty. Always check the source document.
+
 ### The Mini Distribution Preview
 
 Each source shows a small plot of the assumed PDF shape. This is a sanity check — does the shape look like what you expect? A uniform distribution is flat (equal probability everywhere), a normal distribution is the classic bell curve, etc.
@@ -301,6 +380,49 @@ DOF tells the tool how much data backs up each uncertainty estimate:
 | Expert judgment | Very high (∞) | Treat as fully known (but flag as assumption) |
 
 **Why DOF matters:** Small DOF means you're less sure about your σ estimate, which means the coverage factor k needs to be larger to compensate. If you only have 5 data points, your k could be 3+ instead of 2. (More on this in the k-factor section.)
+
+### Asymmetric Uncertainty (σ⁺/σ⁻)
+
+Sometimes uncertainty is not symmetric — the effect of a +10% perturbation is different from a -10% perturbation. Common examples include:
+
+- **Material property sensitivity:** A ±10% change in conductivity produces +3°F / -5°F in your prediction
+- **Geometry tolerances:** Tighter gap → much hotter; wider gap → slightly cooler
+- **Boundary condition one-sided tests:** You only ran the "hot" perturbation, not the "cold" one
+
+The tool supports asymmetric uncertainty through dedicated σ⁺/σ⁻ fields:
+
+**Enabling asymmetric mode:**
+1. In the Sigma Value input area, check the **"Asymmetric"** checkbox
+2. The single σ field is replaced by two fields: **σ⁺** (positive direction) and **σ⁻** (negative direction)
+3. The tool computes an effective symmetric σ for RSS: `σ_eff = √((σ⁺² + σ⁻²) / 2)` per GUM §4.3.8
+
+**One-sided sensitivity results:**
+
+If you only tested one direction (e.g., you only ran the "hot" perturbation):
+1. Check the **"One-sided"** checkbox
+2. Select the direction you tested: **Upper** or **Lower**
+3. If **"Mirror assumed"** is checked (default), the tool assumes the untested direction has the same magnitude — e.g., if σ⁺ = 3.0°F from your test, σ⁻ is assumed to also be 3.0°F
+4. If unchecked, the untested direction is set to 0 — only use this if you have physical reasons to believe there is no effect in the other direction
+
+**How asymmetric values propagate:**
+
+| Method | How Asymmetry Is Handled |
+|---|---|
+| **RSS** | Uses effective σ = √((σ⁺² + σ⁻²) / 2), which gives a single combined value for the standard RSS formula |
+| **Monte Carlo** | Samples from a **bifurcated Gaussian** (Barlow's split-normal): uses σ⁺ for the positive half and σ⁻ for the negative half. This preserves the full asymmetric shape in the output distribution. |
+
+**Budget table display:** When any source is asymmetric, the budget table shows `σ⁺=X / σ⁻=Y` inline. Hover over the cell for a tooltip with the effective σ value.
+
+**Evidence notes:** When one-sided with mirror assumption, the tool automatically adds a note to the source: "One-sided sensitivity — mirror symmetry assumed for untested direction."
+
+**When to use asymmetric mode:**
+- You have sensitivity results that differ significantly between +/- perturbations (ratio > 1.5)
+- You only tested one direction and want to document the assumption
+- Your certifying authority requires you to preserve directionality information
+
+**When NOT to use asymmetric mode:**
+- σ⁺ and σ⁻ are within ~20% of each other — just use the larger one as a symmetric σ
+- You want the simplest defensible analysis (symmetric is always acceptable per GUM)
 
 ---
 
@@ -379,12 +501,70 @@ This is the heart of the analysis. It's a table listing every enabled uncertaint
 | % of u_val² | How much of the total variance comes from this source |
 | Distribution | Assumed distribution shape |
 | Data Basis | Where the number came from |
+| Class | Uncertainty class: Aleatoric, Epistemic, or Mixed |
+| Reducibility | How much this uncertainty can be reduced by additional work: Low, Medium, or High |
 
 **Color coding in the % column:**
 - **Red highlight (> 80%):** This source dominates the total uncertainty — focus your efforts on reducing this one
 - **Yellow highlight (> 50%):** This source is a major contributor
 
 **Subtotal rows** (gray italic) show the RSS within each category, and the **Grand Total row** (blue/white) shows the combined u_val.
+
+### Source Classification and Correlation
+
+#### Uncertainty Classification
+
+Each uncertainty source can be classified using these fields (set in the source editor on Tab 2):
+
+- **Uncertainty Class** — Aleatoric (inherent variability), Epistemic (knowledge gap), or Mixed. This classification affects the class-split summary (U_A, U_E) shown in results.
+- **Basis Type** — How the uncertainty value was obtained: measured, assumed, spec_limit, expert_judgment, or model_ensemble.
+- **Reducibility** — Whether additional testing or analysis could reduce the uncertainty: low, medium, or high.
+- **Evidence Note** — Free-text field for documenting the basis or justification.
+
+The results text and HTML report include a class-split summary showing U_A (aleatoric), U_E (epistemic), and the epistemic fraction of total variance. When epistemic uncertainty exceeds 50% of total variance, a warning is displayed recommending knowledge-reduction actions.
+
+#### Correlation Groups
+
+Sources that share a common systematic influence (e.g., thermocouple calibration, shared boundary condition) can be placed in a **correlation group** with a pairwise correlation coefficient:
+
+- **Correlation Group** — A text label (e.g., "TC_cal"). Correlation is applied when sources share both the same group name and the same V&V category (`u_num`, `u_input`, or `u_D`). Cross-category terms are intentionally not applied.
+- **Correlation Coefficient (ρ)** — The correlation of this source with the group reference source. Range: -1.0 to +1.0.
+
+**Reference source rule:** Within each group, the first source alphabetically is automatically designated the reference source (ρ = 1.0). Other sources specify their correlation with this reference.
+
+**Transitivity formula:** For sources a and b in the same group, the pairwise correlation is ρ(a,b) = ρ_a × ρ_b. This single-reference factor model produces a valid positive-semi-definite correlation matrix.
+
+**Monte Carlo correlation scope:** Correlated Monte Carlo sampling is applied when all sources in a same-category correlation group use `Normal` distributions. If a group includes non-Normal sources, Monte Carlo falls back to independent sampling for that group and reports a note in the MC results/report.
+
+**Worked example (3 sources in group "TC_cal"):**
+
+| Source | User-entered ρ | Role |
+|--------|---------------|------|
+| TC_inlet | 0.9 | Reference (1st alphabetically — ρ forced to 1.0) |
+| TC_outlet | 0.8 | Correlated with reference |
+| TC_wall | 0.6 | Correlated with reference |
+
+Effective pairwise correlation matrix computed by the tool:
+
+|  | TC_inlet | TC_outlet | TC_wall |
+|--|----------|-----------|---------|
+| TC_inlet | 1.00 | 0.80 | 0.60 |
+| TC_outlet | 0.80 | 1.00 | 0.48 |
+| TC_wall | 0.60 | 0.48 | 1.00 |
+
+Note: ρ(outlet, wall) = 0.8 × 0.6 = 0.48 via transitivity. The user-entered ρ = 0.9 for TC_inlet is overridden to 1.0 because it is the reference source. This matrix appears in the results text and the HTML report.
+
+The results text and HTML report display the effective pairwise correlation matrix for each group, showing the actual coefficients used in the computation.
+
+If ρ = 0.0 for a source in a group, an audit warning is logged since it makes that source effectively independent of group members.
+
+#### Chart Export Controls
+
+Each chart toolbar includes three output actions:
+
+1. **Copy to Clipboard** — Draft quality (150 DPI), for quick sharing.
+2. **Copy Report-Quality** — 300 DPI with a light colour scheme for formal reports.
+3. **Export Figure Package...** — Multi-format archive (PNG 300/600, SVG, PDF) plus JSON metadata sidecar with traceability fields (tool version, analysis ID, settings hash, timestamps, units, method context).
 
 ### The Results Summary
 
@@ -444,13 +624,13 @@ The RSS method assumes all your uncertainties combine into a nice, normal (bell 
 - Uniform or triangular distributions (which have hard cutoffs)
 - One dominant source with a non-normal distribution
 
-...then the RSS assumption may be wrong, and the Monte Carlo method gives you a more honest answer because it **doesn't assume anything** about the combined shape.
+...then the RSS assumption may be wrong, and the Monte Carlo method gives you a more honest answer because it does not force a single Normal combined shape.
 
 ### How It Works (The Dartboard Analogy)
 
 Imagine each uncertainty source is a spinner wheel. The width of the wheel represents how uncertain that source is, and the shape of the markings represents the distribution.
 
-The Monte Carlo method spins ALL the wheels simultaneously — say, 100,000 times. Each spin gives you one possible "total error." After 100,000 spins, you have a complete picture of what the combined error distribution actually looks like. No assumptions about shape required.
+The Monte Carlo method spins ALL the wheels simultaneously — say, 100,000 times. Each spin gives you one possible "total error." After 100,000 spins, you have a complete picture of what the combined error distribution actually looks like. You still rely on the source distributions you selected, but you do not force a Normal combined shape.
 
 You then simply read off the 5th and 95th percentile (or whatever your coverage requires) from the actual distribution of results.
 
@@ -545,7 +725,7 @@ You can load a second project file to add comparison columns to the roll-up tabl
 
 ## 11. Tab 7: Reference Library
 
-Seven built-in reference sub-tabs so you don't have to leave the application:
+Eight built-in reference sub-tabs so you don't have to leave the application:
 
 | Sub-Tab | What's In It |
 |---|---|
@@ -553,9 +733,51 @@ Seven built-in reference sub-tabs so you don't have to leave the application:
 | **k-Factor Tables** | Interactive calculator + precomputed tables for all combinations of sample size, coverage, and confidence |
 | **Welch-Satterthwaite** | Full explanation of the effective DOF formula with a worked example |
 | **Distribution Guide** | All 12 distributions with shape descriptions, k-factors, and when to use each |
+| **Uncertainty Classification Guide** | Aleatory vs. epistemic uncertainty classification with practical CFD examples, combination diagram, one-sided uncertainty guidance, and budget dominance interpretation |
 | **Distribution-Free Bounds** | Non-parametric tolerance intervals — when you can't assume any distribution at all |
 | **Monte Carlo Method** | MC and LHS explanation, convergence criteria, bootstrap interpretation |
 | **Glossary** | Definitions of every technical term used in the tool |
+
+### Uncertainty Classification Guide (New)
+
+This sub-tab helps you understand whether each uncertainty source is **aleatory** (inherent randomness — cannot be reduced) or **epistemic** (knowledge gap — can be reduced with more data or better models). This classification matters because:
+
+- **Epistemic-dominant budgets** suggest the analysis can be improved by collecting more data, using better instrumentation, or employing higher-fidelity models
+- **Aleatory-dominant budgets** are at the irreducible floor — further investment won't shrink the uncertainty
+
+The guide includes:
+- **Definitions** of aleatory and epistemic uncertainty with practical explanations
+- **8 practical CFD examples** with classification, rationale, and reducibility assessment (e.g., iterative convergence scatter, discretization error, thermocouple measurement error, turbulence model form error)
+- **Combination diagram** showing how u_num, u_input, and u_D combine into u_val and how they split into aleatory and epistemic components
+- **One-sided uncertainty guidance** for cases where only one direction was tested
+- **Budget dominance table** to help interpret whether your budget is dominated by reducible or irreducible sources
+
+### Classification Guardrails for Common CFD Cases
+
+- **Inlet mass flow from sensors is often mixed, not purely epistemic.**
+  Random repeatability/noise is aleatory, while calibration/setup bias is epistemic.
+  If you did not separate those components, classify as **Mixed** and explain in `Evidence`.
+- **Thermocouple/temperature measurement uncertainty is usually mixed for the same reason.**
+  Noise and drift/recalibration effects are different mechanisms.
+- **Over-refined/asymptotic mesh behavior does not automatically mean “pure epistemic.”**
+  The source is still numerical/modeling in origin, but if refinement no longer reduces it,
+  treat it as **Mixed with low reducibility** and document the asymptotic evidence.
+- **Classification does not exclude sources from the math.**
+  RSS and Monte Carlo still combine all enabled sources; the class tags are used for split reporting and improvement prioritization.
+- **Type A / Type B is not the same as aleatory / epistemic.**
+  Type A/B describes how the number was estimated (from data vs other information), not its physical class.
+
+### ASME V&V 20 Compliance Note — Epistemic and Aleatory Uncertainty Combination
+
+This tool combines all uncertainty sources via Root-Sum-Square (RSS) regardless of their epistemic or aleatory classification, following ASME V&V 20-2009 (R2021) Section 9 and the GUM (JCGM 100:2008) framework. Under this approach:
+
+- Each uncertainty source is characterized as a standard uncertainty (1-sigma equivalent)
+- Epistemic intervals are converted to standard uncertainties by assuming a distribution (e.g., Uniform interval +/-a becomes sigma = a/sqrt(3))
+- All standard uncertainties are combined via RSS, assuming independence
+
+This is the industry-standard pragmatic approach used in most aerospace CFD validation programs. However, when epistemic sources dominate the uncertainty budget (>50% of u_val), analysts should be aware that RSS assumes random cancellation that may not occur for systematic knowledge-gap uncertainties. For applications requiring stricter separation of epistemic and aleatory uncertainties, more advanced frameworks such as Oberkampf & Roy (2010) recommend double-loop Monte Carlo methods producing probability boxes (p-boxes).
+
+The tool tracks and reports the epistemic/aleatory split to support prioritization of uncertainty reduction efforts. When the Monte Carlo method is used, all sources are sampled from their declared distributions in a single loop (consistent with GUM Supplement 1, JCGM 101:2008).
 
 ---
 
@@ -648,8 +870,8 @@ Now imagine you divide the dartboard into 100,000 equal slices (like pizza slice
 | Property | Monte Carlo (Random) | Latin Hypercube (LHS) |
 |---|---|---|
 | **Coverage of tails** | Sparse — random gaps in extreme values | Guaranteed — every probability band gets a sample |
-| **Convergence speed** | ~1/√N (slow) | ~1/N (much faster) |
-| **Samples needed for same accuracy** | N | ~N/10 |
+| **Convergence speed** | ~1/√N (slow) | Typically faster than random MC for the same N |
+| **Samples needed for similar percentile stability** | N | Often lower than random MC (problem-dependent) |
 | **Results with 10,000 trials** | Good for mean, noisy for percentiles | Excellent for both mean and percentiles |
 | **Reproducibility** | Varies significantly between runs | Much more stable between runs |
 
@@ -661,14 +883,14 @@ Now imagine you divide the dartboard into 100,000 equal slices (like pizza slice
 | Quick sanity check | Either works at 100,000 trials |
 | Need to match legacy results exactly | **MC (Random)** — matches older analyses |
 | Comparing to textbook examples | **MC (Random)** — what most textbooks describe |
-| Certification application | **LHS** — more efficient and recognized by JCGM 101:2008 §6.4 |
+| Certification application | **LHS** — efficient stratified sampling (McKay et al. 1979) within the JCGM 101 Monte Carlo framework |
 
 ### Standards Recognition
 
-Both methods are recognized by the relevant standards:
-- **JCGM 101:2008 §6.4** explicitly discusses Latin Hypercube as an alternative to basic random sampling
+Both methods are defensible in this workflow:
+- **JCGM 101:2008** provides the Monte Carlo propagation framework used by the tool
 - **ASME V&V 20, Section 4.4** recognizes Monte Carlo propagation methods in general
-- **McKay, Beckman & Conover (1979)** — the original LHS paper, widely cited in aerospace UQ literature
+- **McKay, Beckman & Conover (1979)** provides the original Latin Hypercube sampling method
 
 ---
 
@@ -771,9 +993,9 @@ The **JSON file** contains everything: comparison data, all uncertainty sources,
 
 ### Loading a Project (Ctrl+O)
 
-Opens a previously saved JSON project file. All data, sources, settings, and results are restored. If the project was saved with an older version of the tool that didn't have some newer settings (like the LHS sampling method), the defaults are applied automatically — backward compatibility is built in.
+Opens a previously saved JSON project file. All comparison data, uncertainty sources, settings, audit entries, and project metadata are restored. RSS results are automatically recomputed from the restored inputs. Monte Carlo simulation results must be rerun manually if needed (click "Run Monte Carlo" on the Results — Monte Carlo tab). If the project was saved with an older version of the tool that didn't have some newer settings (like the LHS sampling method), the defaults are applied automatically — backward compatibility is built in.
 
-### The HTML Report (Ctrl+E)
+### The HTML Report (Ctrl+H)
 
 A comprehensive, self-contained HTML document suitable for printing or attaching to a certification package. It includes:
 
@@ -826,7 +1048,7 @@ The typical requirement is **95/95 one-sided** — 95% coverage at 95% confidenc
 
 The tool's auto-generated certification statement (Tab 6) provides ready-to-use language. A typical statement looks like:
 
-> *"Validation uncertainty was computed per ASME V&V 20-2009 using 12 identified uncertainty sources aggregated by RSS (u_val = 2.83°F, k = 2.00, U_val = 5.66°F). Monte Carlo propagation (Latin Hypercube sampling, 100,000 trials) per JCGM 101:2008 §6.4 yields a 95% one-sided prediction interval of [+0.25°F, +9.79°F] with bootstrap 95% CI envelope [+0.09°F, +9.93°F]. The mean comparison error Ē = +5.00°F gives a validation ratio |Ē|/U_val = 0.88 (< 1.0). Model is VALIDATED at the 95/95 one-sided level."*
+> *"Validation uncertainty was computed per ASME V&V 20-2009 using 12 identified uncertainty sources aggregated by RSS (u_val = 2.83°F, k = 2.00, U_val = 5.66°F). Monte Carlo propagation (Latin Hypercube stratified sampling, 100,000 trials; JCGM 101 framework; McKay et al. 1979) yields a 95% one-sided prediction interval of [+0.25°F, +9.79°F] with bootstrap 95% CI envelope [+0.09°F, +9.93°F]. The mean comparison error Ē = +5.00°F gives a validation ratio |Ē|/U_val = 0.88 (< 1.0). Model is VALIDATED at the 95/95 one-sided level."*
 
 ### Documentation Package
 
@@ -843,14 +1065,13 @@ For a certification submission, include:
 
 | Standard | Full Title | What This Tool Uses It For |
 |---|---|---|
-| **ASME V&V 20-2009 (R2016)** | Standard for Verification and Validation in Computational Fluid Dynamics and Heat Transfer | Overall framework: E = S - D, three uncertainty categories, RSS combination, |Ē| ≤ U_val validation criterion, k = 2 default |
+| **ASME V&V 20-2009 (R2021)** | Standard for Verification and Validation in Computational Fluid Dynamics and Heat Transfer | Overall framework: E = S - D, three uncertainty categories, RSS combination, |Ē| ≤ U_val validation criterion, k = 2 default |
 | **JCGM 100:2008 (GUM)** | Guide to the Expression of Uncertainty in Measurement | RSS combination rules, Welch-Satterthwaite effective DOF, coverage factors from Student-t, Type A/B evaluation methods |
-| **JCGM 101:2008 (GUM Supplement 1)** | Propagation of Distributions Using a Monte Carlo Method | Monte Carlo propagation, Latin Hypercube sampling (§6.4), convergence criteria (§7.9), bootstrap confidence intervals |
+| **JCGM 101:2008 (GUM Supplement 1)** | Propagation of Distributions Using a Monte Carlo Method | Monte Carlo propagation framework, convergence criteria (§7.9), bootstrap confidence intervals |
 | **ASME PTC 19.1-2018** | Test Uncertainty | Sample size requirements, distribution-free tolerance intervals, sigma-basis conversions |
 | **AIAA G-077-1998** | Guide for the Verification and Validation of Computational Fluid Dynamics Simulations | V&V reporting best practices, model form uncertainty characterization |
 | **Krishnamoorthy & Mathew (2009)** | Statistical Tolerance Regions | One-sided and two-sided tolerance factor formulas using non-central t-distribution |
 | **McKay, Beckman & Conover (1979)** | A Comparison of Three Methods for Selecting Values of Input Variables... | Original Latin Hypercube Sampling paper |
-
 ---
 
 ## 19. Glossary
@@ -883,7 +1104,8 @@ For a certification submission, include:
 | **CDF** | Cumulative Distribution Function — the running total of probability from left to right |
 | **Percentile (Pxx)** | The value below which xx% of the data falls (e.g., P95 = value below which 95% falls) |
 | **Shapiro-Wilk test** | A statistical test for whether data follows a normal distribution (p > 0.05 = probably normal) |
-| **KS test** | Kolmogorov-Smirnov test — a goodness-of-fit test comparing data to a theoretical distribution |
+| **Bootstrap GOF** | Parametric bootstrap goodness-of-fit p-value (primary when bootstrap mode is active) |
+| **KS test** | Kolmogorov-Smirnov goodness-of-fit diagnostic (secondary context) |
 | **Type A evaluation** | Uncertainty estimated from actual measured data (statistical analysis) |
 | **Type B evaluation** | Uncertainty estimated from other information (specs, handbooks, engineering judgment) |
 | **ppf** | Percent Point Function — the inverse of the CDF (given a probability, returns the value) |
@@ -940,6 +1162,6 @@ Many perfectly useful engineering models are "not validated" by the strict V&V 2
 
 ---
 
-*VVUQ Uncertainty Aggregator v1.0 — Built for engineers who need defensible uncertainty numbers, not statistics PhDs.*
+*VVUQ Uncertainty Aggregator v1.2.0 — Built for engineers who need defensible uncertainty numbers, not statistics PhDs.*
 
-*Standards: ASME V&V 20-2009 (R2016), JCGM 100:2008, JCGM 101:2008, ASME PTC 19.1-2018, AIAA G-077-1998*
+*Standards: ASME V&V 20-2009 (R2021), JCGM 100:2008, JCGM 101:2008, ASME PTC 19.1-2018, AIAA G-077-1998*
