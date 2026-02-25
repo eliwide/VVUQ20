@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-GCI Calculator v1.4
+GCI Calculator v1.5.0
 Grid Convergence Index Tool per Celik et al. (JFE 2008) & Roache (1998)
 
 Standalone PySide6 application for computing Grid Convergence Index (GCI)
@@ -33,7 +33,7 @@ import textwrap
 import datetime
 import tempfile
 import warnings
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Iterable, Optional, List, Tuple
 from html import escape as _html_esc
 
@@ -57,7 +57,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QSplitter, QScrollArea, QFrame, QMessageBox,
     QAbstractItemView, QFileDialog, QStatusBar, QStackedWidget,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont, QColor
 
 import matplotlib
@@ -66,6 +66,7 @@ import matplotlib.pyplot as plt
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
 from matplotlib.figure import Figure
+from matplotlib.gridspec import GridSpec
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION: SHARED VVUQ REPORT COMPONENTS
 # Keep shared data (constants, terms, renderer) consistent across all four
@@ -271,9 +272,10 @@ def render_conformity_template_html(metric_name, metric_value, consequence,
 # CONSTANTS & THEME — matches VVUQ Uncertainty Aggregator
 # =============================================================================
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 APP_NAME = "GCI Calculator"
-APP_DATE = "2026-02-23"
+APP_DATE = "2026-02-24"
+__version__ = APP_VERSION
 
 DARK_COLORS = {
     'bg': '#1e1e2e',
@@ -380,6 +382,15 @@ UNIT_PRESETS = {
     "Length":      ["m", "mm", "in", "ft"],
     "Other":       [],
 }
+
+# Scheme order presets for the theoretical-p combo box
+THEORETICAL_ORDER_PRESETS = [
+    ("Second-order (most CFD codes)", 2.0),
+    ("First-order upwind", 1.0),
+    ("Third-order (MUSCL, WENO-3)", 3.0),
+    ("Fourth-order (spectral, high-order DG)", 4.0),
+    ("Custom", None),
+]
 
 
 def get_dark_stylesheet():
@@ -1070,8 +1081,20 @@ class GCIResult:
     warnings: List[str] = field(default_factory=list)
     notes: str = ""
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+    # Auto-selection (when primary triplet is divergent and N > 3)
+    auto_selected_triplet: Optional[List[int]] = None  # 0-based grid indices used
+    auto_selection_reason: str = ""
+    auto_selection_candidates: List[dict] = field(default_factory=list)  # all evaluated triplets
+
+    # Effective grid-independence (relative threshold)
+    effectively_grid_independent: bool = False
+
+    # Directional u_num (one-sided validation support)
+    direction_of_concern: str = "both"      # "both", "underprediction", "overprediction"
+    discretization_bias_sign: str = ""      # "high", "low", "neutral", "" (production vs grid-converged)
+    u_num_directional: float = float('nan') # u_num adjusted for direction of concern
+    directional_note: str = ""              # explanation when directional differs from standard
+
 
 
 def _safe_rp(r: float, p: float) -> float:
@@ -1079,8 +1102,11 @@ def _safe_rp(r: float, p: float) -> float:
 
     Returns float('inf') if the result overflows or is not finite.
     """
+    import warnings
     try:
-        val = r ** p
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            val = r ** p
     except (OverflowError, ValueError):
         return float('inf')
     if not np.isfinite(val):
@@ -1088,11 +1114,143 @@ def _safe_rp(r: float, p: float) -> float:
     return val
 
 
+def _find_best_triplet(solutions: List[float], cell_counts: List[float],
+                       dim: int = 3, target_idx: Optional[int] = None,
+                       ) -> Optional[dict]:
+    """Find the best grid triplet for GCI from N grids.
+
+    When the primary (finest 3) triplet shows divergent behaviour due to
+    low refinement ratios, this helper evaluates ALL C(N,3) combinations
+    and returns the one with monotonic convergence and the best refinement
+    ratios.
+
+    Parameters
+    ----------
+    solutions : list of float
+        Solution values on each grid (finest first).
+    cell_counts : list of float
+        Cell counts per grid (finest first).
+    dim : int
+        Spatial dimension for refinement ratio computation.
+    target_idx : int or None
+        0-based index of the production grid.  Triplets containing this
+        grid receive a small scoring bonus.
+
+    Returns
+    -------
+    dict or None
+        Best triplet info, or None if no valid triplet exists.
+        Keys: indices, solutions, cell_counts, ratios, R, score, reason,
+              all_candidates (list of ALL evaluated triplets incl. rejected)
+    """
+    from itertools import combinations
+    n = len(solutions)
+    if n < 3:
+        return None
+
+    candidates = []       # (score, info_dict) — valid triplets only
+    all_evaluated = []    # ALL triplets (valid + rejected) for traceability
+
+    for combo in combinations(range(n), 3):
+        # combo is already sorted ascending — indices are 0-based (finest first)
+        i, j, k = combo
+        cc = [cell_counts[i], cell_counts[j], cell_counts[k]]
+        ss = [solutions[i], solutions[j], solutions[k]]
+
+        # Refinement ratios
+        r12 = compute_refinement_ratio(cc[0], cc[1], dim)
+        r23 = compute_refinement_ratio(cc[1], cc[2], dim)
+
+        # Convergence ratio
+        e21 = ss[1] - ss[0]
+        e32 = ss[2] - ss[1]
+
+        if abs(e32) < 1e-30:
+            all_evaluated.append({
+                'indices': list(combo),
+                'R': float('nan'),
+                'convergence_type': 'indeterminate',
+                'min_r': min(r12, r23),
+                'score': None,
+                'selected': False,
+            })
+            continue  # can't compute R
+
+        R = e21 / e32
+
+        if 0 <= R < 1:
+            conv_type = "monotonic"
+        elif -1 < R < 0:
+            conv_type = "oscillatory"
+        else:
+            # Divergent — record and skip
+            all_evaluated.append({
+                'indices': list(combo),
+                'R': R,
+                'convergence_type': 'divergent',
+                'min_r': min(r12, r23),
+                'score': None,
+                'selected': False,
+            })
+            continue
+
+        # Score: prefer monotonic, then best min refinement ratio
+        type_bonus = 1000.0 if conv_type == "monotonic" else 0.0
+        r_min = min(r12, r23)
+        target_bonus = 0.5 if (target_idx is not None and target_idx in combo) else 0.0
+        finest_bonus = 0.1 if 0 in combo else 0.0
+        score = type_bonus + r_min + target_bonus + finest_bonus
+
+        info = {
+            'indices': list(combo),
+            'solutions': ss,
+            'cell_counts': cc,
+            'ratios': [r12, r23],
+            'R': R,
+            'convergence_type': conv_type,
+            'score': score,
+            'reason': (
+                f"Auto-selected Grids {i+1}, {j+1}, {k+1} "
+                f"({conv_type} convergence, R = {R:.4f}, "
+                f"r = {r12:.3f}, {r23:.3f})"
+            ),
+        }
+        candidates.append((score, info))
+
+        all_evaluated.append({
+            'indices': list(combo),
+            'R': R,
+            'convergence_type': conv_type,
+            'min_r': r_min,
+            'score': score,
+            'selected': False,
+        })
+
+    if not candidates:
+        return None
+
+    # Return highest-scoring candidate
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    best = candidates[0][1]
+
+    # Mark the selected triplet in all_evaluated
+    for entry in all_evaluated:
+        if entry['indices'] == best['indices']:
+            entry['selected'] = True
+            break
+
+    best['all_candidates'] = all_evaluated
+    return best
+
+
 def compute_gci(solutions: List[float], cell_counts: List[float],
                 dim: int = 3, safety_factor: Optional[float] = None,
                 theoretical_order: float = 2.0,
                 assumed_order: Optional[float] = None,
-                reference_scale: Optional[float] = None) -> GCIResult:
+                reference_scale: Optional[float] = None,
+                direction_of_concern: str = "both",
+                grid_independent_tol: float = 0.001,
+                target_grid_idx: int = 0) -> GCIResult:
     """
     Compute Grid Convergence Index for 2, 3, or N grids.
 
@@ -1120,6 +1278,17 @@ def compute_gci(solutions: List[float], cell_counts: List[float],
         Use this when solution values are near zero (e.g., pressure
         differences, residuals) to avoid division by near-zero.
         If None (default), uses the fine-grid solution abs(f1).
+    direction_of_concern : str
+        Validation concern direction: "both" (default, two-sided),
+        "underprediction", or "overprediction".  When the discretization
+        bias is conservative for the direction of concern (e.g.,
+        production grid overpredicts and concern is underprediction),
+        u_num_directional is set to 0.
+    grid_independent_tol : float
+        Relative tolerance for effective grid-independence detection.
+        If the spread across the 3 finest grids is less than this
+        fraction of the mean solution, the grids are considered
+        effectively independent.  Default 0.001 (0.1%).
 
     Returns
     -------
@@ -1135,9 +1304,12 @@ def compute_gci(solutions: List[float], cell_counts: List[float],
 
     Notes
     -----
-    - For 3+ grids: uses the finest three to compute observed order via
-      Richardson extrapolation.  Additional grids provide extra pairs for
-      cross-checking but do not change the primary GCI_fine result.
+    - For 3 grids: uses the finest three to compute observed order via
+      Richardson extrapolation (the standard Celik et al. procedure).
+    - For 4+ grids: primary GCI uses the finest three grids.  If that
+      triplet is divergent, auto-triplet reselection evaluates all C(N,3)
+      combinations and picks the best monotonically-converging triplet.
+      Additional grids also provide extra pairs for cross-checking.
     - For 2 grids: Richardson extrapolation is NOT possible (underdetermined).
       Uses an assumed order (typically the theoretical order) with the
       conservative Fs = 3.0 safety factor.
@@ -1152,16 +1324,60 @@ def compute_gci(solutions: List[float], cell_counts: List[float],
             f"solutions ({len(solutions)}) and cell_counts "
             f"({len(cell_counts)}) must have the same length.")
 
+    # Validate dimension
+    if dim not in (1, 2, 3):
+        res = GCIResult()
+        res.n_grids = len(solutions)
+        res.dim = dim
+        res.grid_solutions = list(solutions)
+        res.grid_cells = list(cell_counts)
+        res.warnings.append(f"dim must be 1, 2, or 3, got {dim}.")
+        res.notes = "Invalid dimension parameter."
+        return res
+
     n_grids = len(solutions)
+
+    # Auto-sort: enforce finest-first (descending cell count) ordering.
+    # The GUI already does this, but direct API callers may not.
+    # We must also remap target_grid_idx so it tracks the same grid.
+    indexed = list(enumerate(zip(cell_counts, solutions)))  # [(orig_idx, (cells, sol)), ...]
+    indexed.sort(key=lambda x: -x[1][0])
+    sort_map = {orig: new for new, (orig, _) in enumerate(indexed)}
+    cell_counts = [item[1][0] for item in indexed]
+    solutions = [item[1][1] for item in indexed]
+    if target_grid_idx is not None:
+        target_grid_idx = sort_map.get(target_grid_idx, target_grid_idx)
+    else:
+        target_grid_idx = 0  # Default to finest grid (index 0 after sort)
+
+    # Clamp target_grid_idx to valid range
+    if target_grid_idx < 0 or target_grid_idx >= n_grids:
+        target_grid_idx = 0
+
     res = GCIResult()
     res.n_grids = n_grids
     res.dim = dim
     res.theoretical_order = theoretical_order
     res.grid_solutions = list(solutions)
     res.grid_cells = list(cell_counts)
+    res.target_grid_idx = target_grid_idx
 
     if n_grids < 2:
         res.warnings.append("Need at least 2 grids for GCI calculation.")
+        return res
+
+    # Guard: non-finite inputs
+    if any(not np.isfinite(s) for s in solutions):
+        res.warnings.append(
+            "Non-finite solution value (NaN or Inf) detected. "
+            "Cannot compute GCI.")
+        res.notes = "Input contains NaN or Inf — check data extraction."
+        return res
+    if any(c <= 0 or not np.isfinite(c) for c in cell_counts):
+        res.warnings.append(
+            "Non-positive or non-finite cell count detected. "
+            "Cannot compute GCI.")
+        res.notes = "Cell counts must be positive finite numbers."
         return res
 
     # ------------------------------------------------------------------
@@ -1278,8 +1494,39 @@ def compute_gci(solutions: List[float], cell_counts: List[float],
                     f"Consider providing a reference scale value."
                 )
 
-        # ----- Convergence type -----
-        if abs(e32) < 1e-30 and abs(e21) < 1e-30:
+        # ----- Effective grid-independence check (relative threshold) -----
+        _spread = max(f1, f2, f3) - min(f1, f2, f3)
+        _ref_gi = reference_scale if reference_scale else abs(
+            (f1 + f2 + f3) / 3.0)
+        _rel_spread = (_spread / _ref_gi) if _ref_gi > 1e-30 else float('inf')
+
+        if _rel_spread < grid_independent_tol and _spread > 0:
+            res.convergence_type = "grid-independent"
+            res.effectively_grid_independent = True
+            res.convergence_ratio = 0.0
+            res.observed_order = float('inf')
+            res.richardson_extrapolation = f1  # finest grid is best estimate
+            res.gci_fine = 0.0
+            res.gci_coarse = 0.0
+            res.asymptotic_ratio = 1.0
+            res.is_valid = True
+            res.u_num = _spread / 2.0  # conservative: half the spread
+            if abs(f1) > 1e-30:
+                res.u_num_pct = (res.u_num / abs(f1)) * 100.0
+            else:
+                res.u_num_pct = 0.0
+            fs = safety_factor if safety_factor is not None else 1.25
+            res.safety_factor = fs
+            res.notes = (
+                f"Effectively grid-independent: solutions differ by "
+                f"{_spread:.4g} ({_rel_spread*100:.3f}% of mean), which is "
+                f"below the {grid_independent_tol*100:.1f}% threshold. "
+                f"u_num estimated conservatively as half the solution "
+                f"spread ({res.u_num:.4g})."
+            )
+
+        # ----- Convergence type (standard checks) -----
+        elif abs(e32) < 1e-30 and abs(e21) < 1e-30:
             # True grid-independent — ALL three solutions match
             res.convergence_type = "grid-independent"
             res.convergence_ratio = 0.0
@@ -1328,7 +1575,145 @@ def compute_gci(solutions: List[float], cell_counts: List[float],
                 res.convergence_type = "divergent"
 
             if res.convergence_type == "divergent":
-                # ----- DIVERGENT — GCI not applicable -----
+                # ----- DIVERGENT — try auto-selecting a better triplet -----
+                res.observed_order = _solve_observed_order(e21, e32, r21, r32)
+
+                if n_grids > 3:
+                    best = _find_best_triplet(
+                        solutions, cell_counts, dim,
+                        target_idx=res.target_grid_idx)
+                    if best is not None:
+                        # Re-run GCI on the auto-selected triplet
+                        bi = best['indices']
+                        auto_res = compute_gci(
+                            solutions=best['solutions'],
+                            cell_counts=best['cell_counts'],
+                            dim=dim,
+                            safety_factor=safety_factor,
+                            theoretical_order=theoretical_order,
+                            reference_scale=reference_scale,
+                            direction_of_concern=direction_of_concern,
+                            grid_independent_tol=grid_independent_tol,
+                        )
+                        if auto_res.is_valid:
+                            # Carry over results from auto-selected triplet
+                            auto_res.grid_solutions = list(solutions)
+                            auto_res.grid_cells = list(cell_counts)
+                            auto_res.grid_spacings = res.grid_spacings
+                            auto_res.refinement_ratios = res.refinement_ratios
+                            auto_res.n_grids = n_grids
+                            auto_res.target_grid_idx = target_grid_idx
+                            auto_res.auto_selected_triplet = bi
+                            auto_res.auto_selection_reason = best['reason']
+                            auto_res.auto_selection_candidates = best.get(
+                                'all_candidates', [])
+                            auto_res.method = (
+                                f"{n_grids}-grid (auto-selected "
+                                f"Grids {bi[0]+1},{bi[1]+1},{bi[2]+1})"
+                            )
+                            primary_note = (
+                                f"Primary triplet (Grids 1-2-3) showed "
+                                f"divergent behaviour (R = {R:.4f}). "
+                            )
+                            auto_res.notes = primary_note + best['reason'] + \
+                                "\n\n" + auto_res.notes
+                            auto_res.warnings = res.warnings + auto_res.warnings
+                            auto_res.warnings.append(
+                                f"Primary triplet divergent (R = {R:.4f}); "
+                                f"auto-selected Grids {bi[0]+1}, {bi[1]+1}, "
+                                f"{bi[2]+1} for GCI computation."
+                            )
+                            # Recompute per-grid u_num for ALL original grids
+                            f_ext_auto = auto_res.richardson_extrapolation
+                            if not np.isnan(f_ext_auto):
+                                auto_res.per_grid_error = []
+                                auto_res.per_grid_u_num = []
+                                auto_res.per_grid_u_pct = []
+                                for gi in range(n_grids):
+                                    err = abs(solutions[gi] - f_ext_auto)
+                                    auto_res.per_grid_error.append(err)
+                                    auto_res.per_grid_u_num.append(err)
+                                    if abs(solutions[gi]) > 1e-30:
+                                        auto_res.per_grid_u_pct.append(
+                                            (err / abs(solutions[gi])) * 100.0)
+                                    else:
+                                        auto_res.per_grid_u_pct.append(0.0)
+                            else:
+                                # Oscillatory auto-selected: RE not available.
+                                # Use oscillation-based u_num for all grids.
+                                auto_res.per_grid_error = [auto_res.u_num] * n_grids
+                                auto_res.per_grid_u_num = [auto_res.u_num] * n_grids
+                                auto_res.per_grid_u_pct = [
+                                    (auto_res.u_num / abs(solutions[gi]) * 100.0
+                                     if abs(solutions[gi]) > 1e-30 else 0.0)
+                                    for gi in range(n_grids)
+                                ]
+                            # Recompute directional u_num with correct target
+                            tgt_a = target_grid_idx
+                            if (0 <= tgt_a < len(solutions)
+                                    and not np.isnan(f_ext_auto)):
+                                bias_a = solutions[tgt_a] - f_ext_auto
+                                if abs(bias_a) < 1e-30:
+                                    auto_res.discretization_bias_sign = "neutral"
+                                elif bias_a > 0:
+                                    auto_res.discretization_bias_sign = "high"
+                                else:
+                                    auto_res.discretization_bias_sign = "low"
+                                std_u_a = auto_res.per_grid_u_num[tgt_a]
+                                auto_res.direction_of_concern = direction_of_concern
+                                if (direction_of_concern == "both"
+                                        or auto_res.discretization_bias_sign == "neutral"):
+                                    auto_res.u_num_directional = std_u_a
+                                    auto_res.directional_note = ""
+                                elif (direction_of_concern == "underprediction"
+                                      and auto_res.discretization_bias_sign == "high"):
+                                    auto_res.u_num_directional = 0.0
+                                    auto_res.directional_note = (
+                                        "Production grid overpredicts relative to "
+                                        "grid-converged solution. Discretization bias "
+                                        "is conservative for underprediction — "
+                                        "u_num contribution is zero."
+                                    )
+                                elif (direction_of_concern == "overprediction"
+                                      and auto_res.discretization_bias_sign == "low"):
+                                    auto_res.u_num_directional = 0.0
+                                    auto_res.directional_note = (
+                                        "Production grid underpredicts relative to "
+                                        "grid-converged solution. Discretization bias "
+                                        "is conservative for overprediction — "
+                                        "u_num contribution is zero."
+                                    )
+                                else:
+                                    # Adverse bias — full u_num applies
+                                    auto_res.u_num_directional = std_u_a
+                                    auto_res.directional_note = (
+                                        f"Production grid {auto_res.discretization_bias_sign}-predicts "
+                                        f"relative to grid-converged solution. Discretization bias "
+                                        f"is NOT conservative for {direction_of_concern} — "
+                                        f"full u_num applies."
+                                    )
+                            else:
+                                # Oscillatory auto-selected triplet: Richardson
+                                # extrapolation is NaN, so directional bias
+                                # cannot be determined.  Use full u_num.
+                                auto_res.direction_of_concern = direction_of_concern
+                                if 0 <= tgt_a < n_grids:
+                                    auto_res.u_num_directional = (
+                                        auto_res.per_grid_u_num[tgt_a]
+                                        if tgt_a < len(auto_res.per_grid_u_num)
+                                        else auto_res.u_num
+                                    )
+                                else:
+                                    auto_res.u_num_directional = auto_res.u_num
+                                auto_res.directional_note = (
+                                    "Oscillatory convergence in auto-selected "
+                                    "triplet — Richardson extrapolation is "
+                                    "unavailable, so directional bias cannot "
+                                    "be assessed. Full u_num applies."
+                                )
+                            return auto_res
+
+                # No auto-selection possible — original divergent result
                 res.is_valid = False
                 if R <= -1:
                     res.warnings.append(
@@ -1343,8 +1728,6 @@ def compute_gci(solutions: List[float], cell_counts: List[float],
                         f"settings, and whether the grids are in the "
                         f"asymptotic range."
                     )
-                # Still compute observed order for diagnostics
-                res.observed_order = _solve_observed_order(e21, e32, r21, r32)
                 res.notes = (
                     "DIVERGENT: The solution does not converge with grid "
                     "refinement. GCI cannot be computed reliably. "
@@ -1368,6 +1751,14 @@ def compute_gci(solutions: List[float], cell_counts: List[float],
                 osc_norm = ref if ref is not None else abs(f1)
                 if osc_norm > 1e-30:
                     res.gci_fine = fs * (osc_range / osc_norm) / 2.0
+                else:
+                    # Near-zero normaliser — GCI% is meaningless but u_num
+                    # (absolute) is still valid from osc_range / 2.
+                    res.warnings.append(
+                        "Fine-grid solution is near zero — GCI_fine cannot "
+                        "be expressed as a relative value. The absolute "
+                        "u_num is still computed from the oscillation range."
+                    )
 
                 # Richardson extrapolation not reliable for oscillatory
                 res.richardson_extrapolation = float('nan')
@@ -1486,14 +1877,16 @@ def compute_gci(solutions: List[float], cell_counts: List[float],
     #   When norm = |f1| (default): u_num = GCI_fine * |f1| / Fs = |f2-f1|/(r^p-1) = |f1 - f_RE|
     # Using |f1 - f_RE| directly is always correct, even when a custom
     # reference_scale is set (the norm cancels differently in the GCI path).
-    f_ext_for_unum = res.richardson_extrapolation
-    if not np.isnan(f_ext_for_unum):
-        res.u_num = abs(solutions[0] - f_ext_for_unum)
-        if abs(solutions[0]) > 1e-30:
-            res.u_num_pct = (res.u_num / abs(solutions[0])) * 100.0
-        else:
-            res.u_num_pct = 0.0
-    elif res.convergence_type == "oscillatory":
+    # Skip if already set by effectively grid-independent check
+    if not res.effectively_grid_independent:
+        f_ext_for_unum = res.richardson_extrapolation
+        if not np.isnan(f_ext_for_unum):
+            res.u_num = abs(solutions[0] - f_ext_for_unum)
+            if abs(solutions[0]) > 1e-30:
+                res.u_num_pct = (res.u_num / abs(solutions[0])) * 100.0
+            else:
+                res.u_num_pct = 0.0
+    if not res.effectively_grid_independent and res.convergence_type == "oscillatory":
         # Oscillatory: u_num = half the oscillation range (independent of ref_scale).
         # GCI_fine was normalized by ref, but u_num must be absolute.
         osc_range = abs(max(solutions[:min(n_grids, 3)])
@@ -1511,17 +1904,21 @@ def compute_gci(solutions: List[float], cell_counts: List[float],
     # discretization error on ANY grid i is simply |f_i - f_exact|.
     # This is the key feature for "my production grid is not the finest."
     f_ext = res.richardson_extrapolation
-    if not np.isnan(f_ext) and res.is_valid:
+    if res.effectively_grid_independent:
+        # Effectively grid-independent: use spread/2 for all grids
+        for i in range(n_grids):
+            res.per_grid_error.append(res.u_num)
+            res.per_grid_u_num.append(res.u_num)
+            if abs(solutions[i]) > 1e-30:
+                res.per_grid_u_pct.append(
+                    (res.u_num / abs(solutions[i])) * 100.0)
+            else:
+                res.per_grid_u_pct.append(0.0)
+    elif not np.isnan(f_ext) and res.is_valid:
+        # Standard: per-grid u_num from Richardson extrapolation
         for i in range(n_grids):
             err_abs = abs(solutions[i] - f_ext)
             res.per_grid_error.append(err_abs)
-            # u_num for grid i = |f_i - f_exact|
-            # Richardson extrapolation error IS the standard uncertainty.
-            # Derivation: GCI_fine = Fs * |f1-f2| / (|f1| * (r^p - 1))
-            #             u_num    = GCI_fine * |f1| / Fs
-            #                      = |f1-f2| / (r^p - 1)
-            #                      = |f1 - f_RE|   (by definition of RE)
-            # So |f_i - f_RE| is already the u_num (1-sigma) estimate.
             u_i = err_abs
             res.per_grid_u_num.append(u_i)
             if abs(solutions[i]) > 1e-30:
@@ -1539,6 +1936,70 @@ def compute_gci(solutions: List[float], cell_counts: List[float],
                 res.per_grid_error.append(float('nan'))
                 res.per_grid_u_num.append(float('nan'))
                 res.per_grid_u_pct.append(float('nan'))
+
+    # ------------------------------------------------------------------
+    # 5. Directional u_num (one-sided validation support)
+    # ------------------------------------------------------------------
+    # When Richardson extrapolation is available, determine whether the
+    # production grid over- or under-predicts relative to the grid-
+    # converged solution.  If the bias is conservative for the stated
+    # direction of concern, u_num_directional = 0.
+    res.direction_of_concern = direction_of_concern
+    tgt = res.target_grid_idx
+    f_ext_dir = res.richardson_extrapolation
+
+    if (res.is_valid and not np.isnan(f_ext_dir)
+            and 0 <= tgt < len(solutions)):
+        bias = solutions[tgt] - f_ext_dir
+        if abs(bias) < 1e-30:
+            res.discretization_bias_sign = "neutral"
+        elif bias > 0:
+            res.discretization_bias_sign = "high"   # production overpredicts
+        else:
+            res.discretization_bias_sign = "low"    # production underpredicts
+
+        # Standard u_num for the production grid
+        std_u = (res.per_grid_u_num[tgt]
+                 if tgt < len(res.per_grid_u_num) else res.u_num)
+        if np.isnan(std_u):
+            std_u = res.u_num
+
+        if direction_of_concern == "both" or res.discretization_bias_sign == "neutral":
+            res.u_num_directional = std_u
+            res.directional_note = ""
+        elif (direction_of_concern == "underprediction"
+              and res.discretization_bias_sign == "high"):
+            # Production overpredicts → conservative for underprediction
+            res.u_num_directional = 0.0
+            res.directional_note = (
+                "Production grid overpredicts relative to the grid-converged "
+                "solution. Discretization bias is conservative for "
+                "underprediction — u_num contribution is zero in the "
+                "direction of concern."
+            )
+        elif (direction_of_concern == "overprediction"
+              and res.discretization_bias_sign == "low"):
+            # Production underpredicts → conservative for overprediction
+            res.u_num_directional = 0.0
+            res.directional_note = (
+                "Production grid underpredicts relative to the grid-converged "
+                "solution. Discretization bias is conservative for "
+                "overprediction — u_num contribution is zero in the "
+                "direction of concern."
+            )
+        else:
+            # Bias is adverse for the direction of concern
+            res.u_num_directional = std_u
+            res.directional_note = (
+                f"Production grid {res.discretization_bias_sign}-predicts "
+                f"relative to grid-converged solution. Discretization bias "
+                f"is NOT conservative for {direction_of_concern} — "
+                f"full u_num applies."
+            )
+    else:
+        # Can't determine direction — use standard u_num
+        res.u_num_directional = res.u_num
+        res.directional_note = ""
 
     return res
 
@@ -1614,14 +2075,26 @@ def compute_fs_uncertainty(
         P_ratio, observed_order, convergence_type, is_valid, note
     """
     n = len(solutions)
+    _invalid_fs = {
+        "method": "FS variant (after Xing & Stern 2010)",
+        "is_valid": False,
+        "u_num": float('nan'),
+        "u_num_pct": float('nan'),
+    }
+    if len(solutions) != len(cell_counts):
+        return {**_invalid_fs,
+                "note": (f"solutions ({len(solutions)}) and cell_counts "
+                         f"({len(cell_counts)}) must have the same length.")}
     if n < 3:
-        return {
-            "method": "FS variant (after Xing & Stern 2010)",
-            "is_valid": False,
-            "note": "FS method requires at least 3 grids.",
-            "u_num": float('nan'),
-            "u_num_pct": float('nan'),
-        }
+        return {**_invalid_fs, "note": "FS method requires at least 3 grids."}
+    if dim not in (1, 2, 3):
+        return {**_invalid_fs, "note": f"dim must be 1, 2, or 3, got {dim}."}
+    if any(c <= 0 or not np.isfinite(c) for c in cell_counts):
+        return {**_invalid_fs,
+                "note": "Cell counts must be positive finite numbers."}
+    if any(not np.isfinite(s) for s in solutions):
+        return {**_invalid_fs,
+                "note": "Solution values must be finite numbers."}
 
     # Sort finest to coarsest (most cells first)
     paired = sorted(zip(cell_counts, solutions), key=lambda x: -x[0])
@@ -1786,14 +2259,27 @@ def compute_lsr_uncertainty(
     from scipy.optimize import curve_fit
 
     n = len(solutions)
+    _invalid_lsr = {
+        "method": "LSR variant with AICc (after Eca & Hoekstra 2014)",
+        "is_valid": False,
+        "u_num": float('nan'),
+        "u_num_pct": float('nan'),
+    }
+    if len(solutions) != len(cell_counts):
+        return {**_invalid_lsr,
+                "note": (f"solutions ({len(solutions)}) and cell_counts "
+                         f"({len(cell_counts)}) must have the same length.")}
     if n < 4:
-        return {
-            "method": "LSR variant with AICc (after Eca & Hoekstra 2014)",
-            "is_valid": False,
-            "note": f"LSR method requires 4+ grids (got {n}).",
-            "u_num": float('nan'),
-            "u_num_pct": float('nan'),
-        }
+        return {**_invalid_lsr,
+                "note": f"LSR method requires 4+ grids (got {n})."}
+    if dim not in (1, 2, 3):
+        return {**_invalid_lsr, "note": f"dim must be 1, 2, or 3, got {dim}."}
+    if any(c <= 0 or not np.isfinite(c) for c in cell_counts):
+        return {**_invalid_lsr,
+                "note": "Cell counts must be positive finite numbers."}
+    if any(not np.isfinite(s) for s in solutions):
+        return {**_invalid_lsr,
+                "note": "Solution values must be finite numbers."}
 
     # Sort finest to coarsest
     paired = sorted(zip(cell_counts, solutions), key=lambda x: -x[0])
@@ -2205,12 +2691,14 @@ def parse_csv_field(filepath: str) -> Tuple[np.ndarray, np.ndarray]:
         )
 
     lines = []
+    line_numbers = []  # actual 1-based file line number for each entry
     with open(filepath, 'r', encoding='utf-8-sig') as f:
-        for line in f:
+        for file_lineno, line in enumerate(f, start=1):
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
             lines.append(line)
+            line_numbers.append(file_lineno)
 
     if not lines:
         raise ValueError(f"No data found in {filepath}")
@@ -2229,8 +2717,10 @@ def parse_csv_field(filepath: str) -> Tuple[np.ndarray, np.ndarray]:
 
     data_start = 1 if has_header else 0
     rows = []
-    dropped_tokens = 0
-    for line in lines[data_start:]:
+    row_file_lines = []  # actual file line number for each data row
+    bad_token_rows = []  # (file_line, token_value) for error reporting
+    for i, line in enumerate(lines[data_start:]):
+        file_ln = line_numbers[data_start + i]
         tokens = line.replace(',', '\t').split('\t')
         vals = []
         for t in tokens:
@@ -2239,26 +2729,52 @@ def parse_csv_field(filepath: str) -> Tuple[np.ndarray, np.ndarray]:
                 try:
                     vals.append(float(t))
                 except ValueError:
-                    dropped_tokens += 1
+                    vals.append(float('nan'))  # preserve column alignment
+                    bad_token_rows.append((file_ln, t))
         if vals:
             rows.append(vals)
+            row_file_lines.append(file_ln)
 
     if not rows:
         raise ValueError(f"No numeric data rows in {filepath}")
 
-    if dropped_tokens > 0:
-        warnings.warn(
-            f"{dropped_tokens} non-numeric token(s) dropped while parsing "
-            f"'{os.path.basename(filepath)}'. Column alignment may be affected.",
-            stacklevel=2,
+    if bad_token_rows:
+        examples = bad_token_rows[:5]
+        detail = "; ".join(f"line {r}: '{v}'" for r, v in examples)
+        if len(bad_token_rows) > 5:
+            detail += f" ... and {len(bad_token_rows) - 5} more"
+        raise ValueError(
+            f"Non-numeric values found in '{os.path.basename(filepath)}' — "
+            f"{len(bad_token_rows)} bad token(s): {detail}. "
+            f"Please clean the CSV so every data cell is a number."
         )
 
-    n_cols = min(len(r) for r in rows)
+    # Verify consistent column count across all rows (use file line numbers)
+    expected_cols = len(rows[0])
+    ragged = [(row_file_lines[i], len(r))
+              for i, r in enumerate(rows) if len(r) != expected_cols]
+    if ragged:
+        bad_lines = [ln for ln, _ in ragged[:5]]
+        raise ValueError(
+            f"Inconsistent column count in '{os.path.basename(filepath)}': "
+            f"line {row_file_lines[0]} has {expected_cols} columns but line(s) "
+            f"{bad_lines} differ. Check for missing/extra values."
+        )
+
+    n_cols = expected_cols
     if n_cols < 3:
         raise ValueError(
-            f"Need at least 3 columns (x, y, value), got {n_cols} in {filepath}")
+            f"Need at least 3 columns (x, y, value), got {n_cols} in "
+            f"'{os.path.basename(filepath)}'.")
+    if n_cols > 4:
+        raise ValueError(
+            f"Single-field CSV expects 3 columns (x, y, value) for 2D or "
+            f"4 columns (x, y, z, value) for 3D, but got {n_cols} columns "
+            f"in '{os.path.basename(filepath)}'. If the file contains "
+            f"multiple grid solutions, use the pre-interpolated CSV loader "
+            f"instead.")
 
-    data = np.array([r[:n_cols] for r in rows])
+    data = np.array(rows)
     if n_cols == 3:
         # 2D: x, y, value
         coords = data[:, :2]
@@ -2475,12 +2991,14 @@ def parse_pre_interpolated_csv(filepath: str
     Returns (coords, solutions_per_grid, grid_col_names).
     """
     lines_raw = []
+    line_numbers_raw = []  # actual 1-based file line number for each entry
     with open(filepath, 'r', encoding='utf-8-sig') as f:
-        for line in f:
+        for file_lineno, line in enumerate(f, start=1):
             line = line.strip()
             if not line or line.startswith('#'):
                 continue
             lines_raw.append(line)
+            line_numbers_raw.append(file_lineno)
 
     if not lines_raw:
         raise ValueError(f"No data found in {filepath}")
@@ -2505,8 +3023,10 @@ def parse_pre_interpolated_csv(filepath: str
         data_start = 0
 
     rows = []
-    dropped_tokens = 0
-    for line in lines_raw[data_start:]:
+    row_file_lines = []  # actual file line number for each data row
+    bad_token_rows = []  # (file_line, token_value) for error reporting
+    for i, line in enumerate(lines_raw[data_start:]):
+        file_ln = line_numbers_raw[data_start + i]
         tokens = line.replace(',', '\t').split('\t')
         vals = []
         for t in tokens:
@@ -2515,22 +3035,40 @@ def parse_pre_interpolated_csv(filepath: str
                 try:
                     vals.append(float(t))
                 except ValueError:
-                    dropped_tokens += 1
+                    vals.append(float('nan'))  # preserve column alignment
+                    bad_token_rows.append((file_ln, t))
         if vals:
             rows.append(vals)
+            row_file_lines.append(file_ln)
 
     if not rows:
         raise ValueError(f"No numeric data rows in {filepath}")
 
-    if dropped_tokens > 0:
-        warnings.warn(
-            f"{dropped_tokens} non-numeric token(s) dropped while parsing "
-            f"'{os.path.basename(filepath)}'. Column alignment may be affected.",
-            stacklevel=2,
+    if bad_token_rows:
+        examples = bad_token_rows[:5]
+        detail = "; ".join(f"line {r}: '{v}'" for r, v in examples)
+        if len(bad_token_rows) > 5:
+            detail += f" ... and {len(bad_token_rows) - 5} more"
+        raise ValueError(
+            f"Non-numeric values found in '{os.path.basename(filepath)}' — "
+            f"{len(bad_token_rows)} bad token(s): {detail}. "
+            f"Please clean the CSV so every data cell is a number."
         )
 
-    n_cols = min(len(r) for r in rows)
-    data = np.array([r[:n_cols] for r in rows])
+    # Verify consistent column count across all rows (use file line numbers)
+    expected_cols = len(rows[0])
+    ragged = [(row_file_lines[i], len(r))
+              for i, r in enumerate(rows) if len(r) != expected_cols]
+    if ragged:
+        bad_lines = [ln for ln, _ in ragged[:5]]
+        raise ValueError(
+            f"Inconsistent column count in '{os.path.basename(filepath)}': "
+            f"line {row_file_lines[0]} has {expected_cols} columns but line(s) "
+            f"{bad_lines} differ. Check for missing/extra values."
+        )
+
+    n_cols = expected_cols
+    data = np.array(rows)
 
     # Determine coord vs field columns using headers if available
     # Default: 2D coords (x, y) + grid fields
@@ -2547,11 +3085,56 @@ def parse_pre_interpolated_csv(filepath: str
                 break  # stop at first non-coordinate column
         if n_coord_cols < 2:
             n_coord_cols = 2  # minimum 2 coordinate columns
-    elif n_cols >= 6:
-        # No headers: if 6+ cols, could be 2D with 4+ grids or 3D with 3+ grids.
-        # Heuristic: check if column 3 values look like coordinates (small range)
-        # vs field values (larger range). Default to 2D (safer assumption).
+    elif n_cols == 5:
+        # No headers, 5 columns: could be 2D (x,y + 3 grids) or
+        # 3D (x,y,z + 2 grids).  Default to 2D (more common case).
         n_coord_cols = 2
+        warnings.warn(
+            f"Headerless CSV with 5 columns: assumed 2D "
+            f"(2 coordinate columns + 3 grid solutions). If this "
+            f"is actually 3D data (x, y, z + 2 grids), add a header "
+            f"row with coordinate names (x, y, z) to disambiguate.",
+            stacklevel=2,
+        )
+    elif n_cols >= 6:
+        # No headers and 6+ columns: could be 2D with (n_cols-2) grids
+        # or 3D with (n_cols-3) grids.
+        # Heuristic: if the 3rd column (index 2) has a range/spread
+        # similar to the first two columns (coordinates), treat it as a
+        # z-coordinate (3D). If it looks more like a field value (range
+        # similar to columns 3+), keep 2D. This resolves the ambiguity
+        # for headerless x,y,z,g1,g2,g3 files.
+        col2_range = data[:, 2].max() - data[:, 2].min() if len(data) > 1 else 0
+        # Compare col 2 range to the avg range of the known-coordinate cols
+        coord_ranges = []
+        for ci in range(2):
+            cr = data[:, ci].max() - data[:, ci].min() if len(data) > 1 else 0
+            coord_ranges.append(cr)
+        avg_coord_range = np.mean(coord_ranges) if coord_ranges else 0
+        # Compare col 2 range to the avg range of candidate field cols (col 3+)
+        field_ranges = []
+        for ci in range(3, min(n_cols, 6)):
+            fr = data[:, ci].max() - data[:, ci].min() if len(data) > 1 else 0
+            field_ranges.append(fr)
+        avg_field_range = np.mean(field_ranges) if field_ranges else 0
+        # If col 2 range is closer to coordinate range than field range → 3D
+        if (avg_coord_range > 0 and avg_field_range > 0
+                and abs(col2_range - avg_coord_range)
+                < abs(col2_range - avg_field_range)):
+            n_coord_cols = 3
+        else:
+            n_coord_cols = 2  # default: safer 2D assumption
+        # Heuristic is inherently fragile — warn the user so they can verify
+        dim_label = "3D" if n_coord_cols == 3 else "2D"
+        n_grids_guess = n_cols - n_coord_cols
+        warnings.warn(
+            f"Headerless CSV with {n_cols} columns: auto-detected as "
+            f"{dim_label} ({n_coord_cols} coordinate columns + "
+            f"{n_grids_guess} grid solutions) using a range-based "
+            f"heuristic. If this is wrong, add a header row with "
+            f"coordinate names (x, y, z) to disambiguate.",
+            stacklevel=2,
+        )
 
     coords = data[:, :n_coord_cols]
     n_grids = n_cols - n_coord_cols
@@ -2639,6 +3222,18 @@ class GCICalculatorTab(QWidget):
         )
         setup_form.addRow("Dimensions:", self._cmb_dim)
 
+        self._cmb_order_preset = QComboBox()
+        for label, val in THEORETICAL_ORDER_PRESETS:
+            self._cmb_order_preset.addItem(label, val)
+        self._cmb_order_preset.setCurrentIndex(0)  # "Second-order" default
+        self._cmb_order_preset.setToolTip(
+            "Select the formal order of accuracy of your numerical scheme.\n"
+            "This sets the theoretical order p used as fallback and for\n"
+            "sanity-checking the observed order.\n\n"
+            "Select 'Custom' to enter any value in the spinbox below."
+        )
+        setup_form.addRow("Scheme order:", self._cmb_order_preset)
+
         self._spn_theoretical_p = QDoubleSpinBox()
         self._spn_theoretical_p.setRange(1.0, 4.0)
         self._spn_theoretical_p.setValue(2.0)
@@ -2650,8 +3245,8 @@ class GCICalculatorTab(QWidget):
             "  2.0 — Second-order (most CFD codes) [Default]\n"
             "  3.0 — Third-order (MUSCL, WENO-3)\n"
             "  4.0 — Fourth-order (spectral, high-order DG)\n\n"
-            "Used as fallback if observed order can't be computed,\n"
-            "and for sanity-checking the observed order."
+            "Driven by the scheme order preset above.\n"
+            "Edit directly only when 'Custom' is selected."
         )
         setup_form.addRow("Theoretical order p:", self._spn_theoretical_p)
 
@@ -2685,7 +3280,12 @@ class GCICalculatorTab(QWidget):
             "by near-zero. Use a characteristic value of the\n"
             "quantity (e.g., freestream pressure, max temperature)."
         )
-        setup_form.addRow("Reference scale:", self._spn_ref_scale)
+        self._grp_ref_scale = QGroupBox("Advanced: Reference Scale Configuration")
+        self._grp_ref_scale.setCheckable(True)
+        self._grp_ref_scale.setChecked(False)
+        _ref_scale_layout = QFormLayout(self._grp_ref_scale)
+        _ref_scale_layout.addRow("Reference scale:", self._spn_ref_scale)
+        setup_form.addRow(self._grp_ref_scale)
 
         self._cmb_production = QComboBox()
         self._cmb_production.setToolTip(
@@ -2700,6 +3300,22 @@ class GCICalculatorTab(QWidget):
             "the tool will tell you u_num for that grid."
         )
         setup_form.addRow("Production grid:", self._cmb_production)
+
+        self._cmb_direction = QComboBox()
+        self._cmb_direction.addItem("Both (two-sided)", "both")
+        self._cmb_direction.addItem("Underprediction only", "underprediction")
+        self._cmb_direction.addItem("Overprediction only", "overprediction")
+        self._cmb_direction.setToolTip(
+            "Direction of validation concern.\n\n"
+            "If the discretization bias is conservative for your\n"
+            "concern direction, u_num (directional) will be zero\n"
+            "because mesh refinement cannot make the prediction\n"
+            "worse in the direction you care about.\n\n"
+            "Example: If finer grids predict cooler temperatures\n"
+            "and you only care about underprediction, the production\n"
+            "grid is biased warm (conservative) — u_num = 0."
+        )
+        setup_form.addRow("Direction of concern:", self._cmb_direction)
 
         left_layout.addWidget(grp_setup)
 
@@ -2772,21 +3388,12 @@ class GCICalculatorTab(QWidget):
         left_layout.addWidget(self._guidance_bounding)
 
         # -- Bounding threshold configuration --
-        self._bounding_config_frame = QFrame()
-        self._bounding_config_frame.setFrameShape(QFrame.StyledPanel)
-        self._bounding_config_frame.setStyleSheet(
-            f"QFrame {{ background-color: {DARK_COLORS['surface0']}; "
-            f"border: 1px solid {DARK_COLORS['overlay0']}; border-radius: 4px; }}"
-        )
+        self._bounding_config_frame = QGroupBox("Advanced: Bounding Threshold Settings")
+        self._bounding_config_frame.setCheckable(True)
+        self._bounding_config_frame.setChecked(False)
         bnd_layout = QVBoxLayout(self._bounding_config_frame)
         bnd_layout.setContentsMargins(8, 6, 8, 6)
         bnd_layout.setSpacing(4)
-        bnd_title = QLabel("Bounding Threshold Settings")
-        bnd_title_font = bnd_title.font()
-        bnd_title_font.setBold(True)
-        bnd_title.setFont(bnd_title_font)
-        bnd_title.setStyleSheet(f"color: {DARK_COLORS['fg']};")
-        bnd_layout.addWidget(bnd_title)
 
         bnd_mode_row = QHBoxLayout()
         bnd_mode_row.setSpacing(6)
@@ -2852,6 +3459,17 @@ class GCICalculatorTab(QWidget):
         results_widget = QWidget()
         results_lay = QVBoxLayout(results_widget)
         results_lay.setContentsMargins(6, 6, 6, 6)
+        # Carry-value copy button row
+        carry_row = QHBoxLayout()
+        self._btn_copy_carry = QPushButton("\U0001f4cb Copy Carry Value")
+        self._btn_copy_carry.setToolTip(
+            "Copy u_num carry-over value to clipboard, "
+            "ready to paste into the Uncertainty Aggregator.")
+        self._btn_copy_carry.setEnabled(False)
+        self._btn_copy_carry.clicked.connect(self._copy_carry_to_clipboard)
+        carry_row.addWidget(self._btn_copy_carry)
+        carry_row.addStretch()
+        results_lay.addLayout(carry_row)
         self._results_text = QPlainTextEdit()
         self._results_text.setReadOnly(True)
         ff = QFont("Consolas", 9)
@@ -2884,11 +3502,18 @@ class GCICalculatorTab(QWidget):
         btn_export = QPushButton("Export Figure Package...")
         btn_export.setToolTip("Export PNG (300+600 DPI), SVG, PDF, and JSON.")
         btn_export.clicked.connect(lambda: _export_figure_package_dialog(self._fig, self))
+        self._btn_summary_card = QPushButton("Export Summary Card...")
+        self._btn_summary_card.setToolTip(
+            "Export a compact PNG summary card with convergence plot\n"
+            "and key GCI metrics — ready for PowerPoint or reports.")
+        self._btn_summary_card.setEnabled(False)
+        self._btn_summary_card.clicked.connect(self._export_summary_card)
         tb_row = QHBoxLayout()
         tb_row.addWidget(toolbar)
         tb_row.addWidget(btn_copy)
         tb_row.addWidget(btn_rq)
         tb_row.addWidget(btn_export)
+        tb_row.addWidget(self._btn_summary_card)
         plot_layout.addLayout(tb_row)
         plot_layout.addWidget(self._canvas)
         self._right_tabs.addTab(plot_widget, "Convergence Plot")
@@ -2929,6 +3554,52 @@ class GCICalculatorTab(QWidget):
         report_lay.addWidget(self._report_text)
         self._right_tabs.addTab(report_widget, "Report Statements")
 
+        # Sub-tab 5: Carry-Over Summary
+        carry_widget = QWidget()
+        carry_lay = QVBoxLayout(carry_widget)
+        carry_lay.setContentsMargins(6, 6, 6, 6)
+
+        carry_header = QLabel(
+            "<b>Carry-Over Summary</b> — Values to transfer to "
+            "the Uncertainty Aggregator")
+        carry_header.setWordWrap(True)
+        carry_header.setStyleSheet(
+            f"color: {DARK_COLORS['accent']}; font-size: 13px; "
+            f"padding: 4px 0;")
+        carry_lay.addWidget(carry_header)
+
+        self._carry_table = QTableWidget()
+        self._carry_table.setColumnCount(8)
+        self._carry_table.setHorizontalHeaderLabels([
+            "Quantity", "u_num", "Unit", "Distribution",
+            "DOF", "Sigma Basis", "Convergence", "Status"
+        ])
+        self._carry_table.setAlternatingRowColors(True)
+        style_table(self._carry_table)
+        carry_lay.addWidget(self._carry_table)
+
+        self._carry_warnings = QPlainTextEdit()
+        self._carry_warnings.setReadOnly(True)
+        self._carry_warnings.setMaximumHeight(100)
+        self._carry_warnings.setPlaceholderText(
+            "Warnings and convergence notes will appear here after computation.")
+        ff = QFont("Consolas", 9)
+        ff.setStyleHint(QFont.StyleHint.Monospace)
+        self._carry_warnings.setFont(ff)
+        carry_lay.addWidget(self._carry_warnings)
+
+        carry_btn_row = QHBoxLayout()
+        self._btn_copy_all_carry = QPushButton(
+            "\U0001f4cb Copy All Carry Values")
+        self._btn_copy_all_carry.setEnabled(False)
+        self._btn_copy_all_carry.clicked.connect(
+            self._copy_all_carry_values)
+        carry_btn_row.addWidget(self._btn_copy_all_carry)
+        carry_btn_row.addStretch()
+        carry_lay.addLayout(carry_btn_row)
+
+        self._right_tabs.addTab(carry_widget, "Carry-Over Summary")
+
         # Set splitter proportions
         splitter.setSizes([450, 600])
 
@@ -2938,6 +3609,10 @@ class GCICalculatorTab(QWidget):
         self._btn_remove_qty.clicked.connect(self._remove_quantity)
         self._btn_paste.clicked.connect(self._paste_data)
         self._btn_compute.clicked.connect(self._compute)
+        self._cmb_order_preset.currentIndexChanged.connect(
+            self._on_order_preset_changed)
+        self._spn_theoretical_p.valueChanged.connect(
+            self._on_theoretical_p_manual_change)
 
         # Mark results stale when inputs change
         self._cmb_n_grids.currentIndexChanged.connect(self._mark_results_stale)
@@ -2947,6 +3622,7 @@ class GCICalculatorTab(QWidget):
         self._spn_ref_scale.valueChanged.connect(self._mark_results_stale)
         self._grid_table.cellChanged.connect(self._mark_results_stale)
         self._cmb_production.currentIndexChanged.connect(self._mark_results_stale)
+        self._cmb_direction.currentIndexChanged.connect(self._mark_results_stale)
 
         # Internal state
         self._results_stale = False
@@ -2955,6 +3631,33 @@ class GCICalculatorTab(QWidget):
         self._quantity_units = ["K"]
         self._rebuild_table()
         self._rebuild_qty_config()
+
+    # ------------------------------------------------------------------
+    # QUANTITY UNIT CONFIGURATION
+    # ------------------------------------------------------------------
+    # SCHEME ORDER PRESET
+    # ------------------------------------------------------------------
+
+    def _on_order_preset_changed(self, index):
+        """Set theoretical order spinbox from preset combo selection."""
+        val = self._cmb_order_preset.currentData()
+        if val is not None:
+            self._spn_theoretical_p.blockSignals(True)
+            self._spn_theoretical_p.setValue(val)
+            self._spn_theoretical_p.blockSignals(False)
+            self._mark_results_stale()
+
+    def _on_theoretical_p_manual_change(self, value):
+        """Switch preset combo to 'Custom' if spinbox edited to non-preset."""
+        preset_val = self._cmb_order_preset.currentData()
+        if preset_val is not None and abs(preset_val - value) > 0.01:
+            # Find the Custom entry (data == None)
+            for i in range(self._cmb_order_preset.count()):
+                if self._cmb_order_preset.itemData(i) is None:
+                    self._cmb_order_preset.blockSignals(True)
+                    self._cmb_order_preset.setCurrentIndex(i)
+                    self._cmb_order_preset.blockSignals(False)
+                    break
 
     # ------------------------------------------------------------------
     # QUANTITY UNIT CONFIGURATION
@@ -3256,8 +3959,18 @@ class GCICalculatorTab(QWidget):
             if item is None or not item.text().strip():
                 return None, None
             try:
-                cell_counts.append(float(item.text()))
+                val = float(item.text())
+                if not np.isfinite(val):
+                    QMessageBox.warning(
+                        self, "Invalid Input",
+                        f"Grid {i+1} cell count is not a finite number "
+                        f"(got {item.text()}).\nPlease enter a positive integer.")
+                    return None, None
+                cell_counts.append(val)
             except ValueError:
+                QMessageBox.warning(
+                    self, "Invalid Input",
+                    f"Grid {i+1} cell count '{item.text()}' is not a valid number.")
                 return None, None
 
             # Solutions
@@ -3266,8 +3979,26 @@ class GCICalculatorTab(QWidget):
                 if item is None or not item.text().strip():
                     return None, None
                 try:
-                    solutions[q].append(float(item.text()))
+                    sol_val = float(item.text())
+                    if not np.isfinite(sol_val):
+                        q_label = (self._quantity_names[q]
+                                   if q < len(self._quantity_names)
+                                   else f"Quantity {q+1}")
+                        QMessageBox.warning(
+                            self, "Invalid Input",
+                            f"Grid {i+1}, {q_label}: solution value is not "
+                            f"finite (got {item.text()}).\n"
+                            f"Please enter a valid number.")
+                        return None, None
+                    solutions[q].append(sol_val)
                 except ValueError:
+                    q_label = (self._quantity_names[q]
+                               if q < len(self._quantity_names)
+                               else f"Quantity {q+1}")
+                    QMessageBox.warning(
+                        self, "Invalid Input",
+                        f"Grid {i+1}, {q_label}: '{item.text()}' is not "
+                        f"a valid number.")
                     return None, None
 
         return cell_counts, solutions
@@ -3332,6 +4063,23 @@ class GCICalculatorTab(QWidget):
                 )
                 return
 
+        # Validate: check for identical solutions across all grids
+        for q in range(len(solutions_list)):
+            unique_vals = set(solutions_list[q])
+            if len(unique_vals) == 1:
+                q_label = self._qty_label(q)
+                QMessageBox.warning(
+                    self, "Identical Solutions",
+                    f"All {len(solutions_list[q])} grid solutions for "
+                    f"{q_label} are identical ({solutions_list[q][0]:.6g}).\n\n"
+                    f"Grid convergence analysis requires different solution "
+                    f"values on different grids. Check that:\n"
+                    f"  - You extracted the correct quantity from each grid\n"
+                    f"  - The solver converged to different answers on each grid\n"
+                    f"  - You are not reading the same file multiple times"
+                )
+                return
+
         n_grids = len(cell_counts)
         dim = self._cmb_dim.currentData()
         theoretical_p = self._spn_theoretical_p.value()
@@ -3343,6 +4091,10 @@ class GCICalculatorTab(QWidget):
         target_idx = self._cmb_production.currentData()
         if target_idx is None:
             target_idx = 0
+
+        direction = self._cmb_direction.currentData()
+        if direction is None:
+            direction = "both"
 
         self._btn_compute.setEnabled(False)
         try:
@@ -3357,8 +4109,9 @@ class GCICalculatorTab(QWidget):
                     safety_factor=fs,
                     theoretical_order=theoretical_p,
                     reference_scale=ref_scale,
+                    direction_of_concern=direction,
+                    target_grid_idx=target_idx,
                 )
-                res.target_grid_idx = target_idx
                 self._results.append(res)
 
                 # Auto-compute FS method (3+ grids)
@@ -3391,6 +4144,9 @@ class GCICalculatorTab(QWidget):
             self._update_guidance()
             self._update_plot()
             self._generate_report_statements()
+            self._update_carry_over_summary()
+            self._btn_copy_carry.setEnabled(bool(self._results))
+            self._btn_summary_card.setEnabled(bool(self._results))
             self._results_stale = False
             self._btn_compute.setText("Compute GCI")
             self._btn_compute.setToolTip("")
@@ -3482,6 +4238,25 @@ class GCICalculatorTab(QWidget):
                 lines.append(
                     f"  {order_label:21s}{res.observed_order:.4f}"
                 )
+                # Order diagnostic
+                if (not res.order_is_assumed
+                        and res.theoretical_order > 0
+                        and res.observed_order > 0):
+                    p_obs = res.observed_order
+                    p_th = res.theoretical_order
+                    lo = 0.5 * p_th
+                    hi = 2.0 * p_th
+                    if lo <= p_obs <= hi:
+                        lines.append(
+                            f"  Order diagnostic:    \u2713 Within "
+                            f"acceptable range [{lo:.1f}, {hi:.1f}]"
+                        )
+                    else:
+                        lines.append(
+                            f"  Order diagnostic:    \u2717 Outside "
+                            f"range [{lo:.1f}, {hi:.1f}] — "
+                            f"use with caution"
+                        )
             lines.append("")
 
             # Richardson extrapolation
@@ -3606,6 +4381,36 @@ class GCICalculatorTab(QWidget):
                     lines.append(f"    {note_line}")
                 lines.append("")
 
+            # Triplet comparison table (auto-selection traceability)
+            if res.auto_selection_candidates:
+                lines.append("  Triplet Evaluation Table (auto-selection):")
+                lines.append(
+                    f"    {'Grids':<12s} {'R':>8s} {'Type':<14s} "
+                    f"{'min(r)':>8s} {'Score':>10s} {'Status':<10s}"
+                )
+                lines.append("    " + "\u2500" * 66)
+                for cand in res.auto_selection_candidates:
+                    idx = cand['indices']
+                    grids_str = f"{idx[0]+1}-{idx[1]+1}-{idx[2]+1}"
+                    R_val = cand['R']
+                    R_str = f"{R_val:.4f}" if np.isfinite(R_val) else "N/A"
+                    ctype = cand['convergence_type']
+                    min_r = cand.get('min_r', 0.0)
+                    score = cand.get('score')
+                    score_str = f"{score:.2f}" if score is not None else "rejected"
+                    if cand.get('selected'):
+                        status = "\u2190 SELECTED"
+                    elif score is not None:
+                        status = "valid"
+                    else:
+                        status = "rejected"
+                    lines.append(
+                        f"    {grids_str:<12s} {R_str:>8s} "
+                        f"{ctype:<14s} {min_r:>8.3f} "
+                        f"{score_str:>10s} {status:<10s}"
+                    )
+                lines.append("")
+
             # ============================================================
             # CARRY-OVER BOX — the value to feed into the Uncertainty
             # Aggregator.  Made impossible to miss.
@@ -3630,6 +4435,19 @@ class GCICalculatorTab(QWidget):
                 carry_grid_label = "Grid 1 (finest)"
 
             if carry_u is not None:
+                # Auto-selection note
+                if res.auto_selected_triplet is not None:
+                    lines.append(
+                        f"  \u26A0  {res.auto_selection_reason}")
+                    lines.append("")
+
+                # Effective grid-independence note
+                if res.effectively_grid_independent:
+                    lines.append(
+                        "  \u2713  Grid-independent: solutions differ by "
+                        f"< {res.u_num*2:.4g} — u_num = {res.u_num:.4g}")
+                    lines.append("")
+
                 lines.append("  " + "\u2550" * 61)
                 lines.append(
                     "  \u2551  \u279C  CARRY THIS VALUE TO THE UNCERTAINTY "
@@ -3640,12 +4458,49 @@ class GCICalculatorTab(QWidget):
                     f"  \u2551                                                "
                     f"             \u2551"
                 )
-                val_line = f"u_num = {carry_u:.6g}{unit_sfx}"
-                pct_line = f"({carry_pct:.4f}% of solution)"
+                val_line = f"u_num (standard)     = {carry_u:.6g}{unit_sfx}"
+                pct_line = f"({carry_pct:.4f}%)"
                 combined = f"{val_line}   {pct_line}"
                 lines.append(
                     f"  \u2551    {combined:<57s}\u2551"
                 )
+
+                # Directional u_num line
+                dir_u = res.u_num_directional
+                if not np.isnan(dir_u):
+                    dir_label = res.direction_of_concern
+                    if dir_label != "both":
+                        if dir_u == 0.0:
+                            dir_line = (
+                                f"u_num (directional)  = 0.0000"
+                                f"{unit_sfx}   \u2190 CONSERVATIVE BIAS"
+                            )
+                        else:
+                            dir_pct = ((dir_u / abs(res.grid_solutions[tgt]))
+                                       * 100.0
+                                       if abs(res.grid_solutions[tgt]) > 1e-30
+                                       else 0.0) if q_idx == 0 else carry_pct
+                            dir_line = (
+                                f"u_num (directional)  = {dir_u:.6g}"
+                                f"{unit_sfx}   ({dir_pct:.4f}%, adverse)"
+                            )
+                        lines.append(
+                            f"  \u2551    {dir_line:<57s}\u2551"
+                        )
+                        dir_info = f"Direction: {dir_label}"
+                        lines.append(
+                            f"  \u2551    {dir_info:<57s}\u2551"
+                        )
+                        if res.directional_note:
+                            # Wrap note to fit box (multi-line)
+                            import textwrap
+                            wrapped = textwrap.wrap(
+                                res.directional_note, width=55)
+                            for wline in wrapped:
+                                lines.append(
+                                    f"  \u2551    {wline:<57s}\u2551"
+                                )
+
                 lines.append(
                     f"  \u2551                                                "
                     f"             \u2551"
@@ -4104,21 +4959,75 @@ class GCICalculatorTab(QWidget):
                 'yellow'
             )
         elif res.convergence_type == "divergent":
+            # Compute spread metrics for diagnostic severity
+            solutions = res.grid_solutions
+            spread = max(solutions) - min(solutions)
+            mean_val = np.mean(solutions)
+            spread_pct = ((spread / abs(mean_val) * 100.0)
+                          if abs(mean_val) > 1e-30 else float('inf'))
+
+            if spread_pct < 2.0:
+                severity = "SMALL"
+                spread_advice = (
+                    f"The grid solutions differ by {spread_pct:.1f}% "
+                    f"(spread = {spread:.4g}). This is marginal "
+                    f"divergence.\n"
+                    f"  -> A conservative bounding estimate "
+                    f"(u_num = spread/2 = {spread/2:.4g}) MAY be "
+                    f"acceptable with engineering justification.\n"
+                    f"  -> Adding a finer grid may resolve the "
+                    f"convergence direction."
+                )
+            elif spread_pct < 10.0:
+                severity = "MODERATE"
+                spread_advice = (
+                    f"The grid solutions differ by {spread_pct:.1f}% "
+                    f"(spread = {spread:.4g}). This suggests a "
+                    f"genuine convergence problem.\n"
+                    f"  -> Do NOT use bounding without investigating "
+                    f"root causes below."
+                )
+            else:
+                severity = "LARGE"
+                spread_advice = (
+                    f"The grid solutions differ by {spread_pct:.1f}% "
+                    f"(spread = {spread:.4g}). This indicates a "
+                    f"fundamental problem.\n"
+                    f"  -> DO NOT proceed until resolved."
+                )
+
             self._guidance_convergence.set_guidance(
-                f"DIVERGENT — the solution gets worse with grid refinement "
-                f"(R = {res.convergence_ratio:.4f}). GCI is NOT valid.\n\n"
-                f"DO THIS NOW (do not carry u_num yet):\n"
-                f"1. Verify iterative convergence on EVERY grid — residuals "
-                f"should drop at least 3 orders of magnitude.\n"
-                f"2. Check mesh quality metrics across all grids (skewness "
-                f"< 0.9, aspect ratio < 100, orthogonality > 0.1).\n"
-                f"3. Try adding a finer grid — e.g., double the cell count "
-                f"of your current finest grid.\n"
-                f"4. Move measurement location away from singularities, "
-                f"sharp gradients, or geometric discontinuities.\n"
-                f"5. If the spread between grid solutions is small (see "
-                f"below), consider assigning a conservative bounding "
-                f"uncertainty.",
+                f"DIVERGENT — the solution gets worse with grid "
+                f"refinement (R = {res.convergence_ratio:.4f}). "
+                f"GCI is NOT valid.\n\n"
+                f"DIAGNOSTIC: Solution spread is {severity} "
+                f"({spread_pct:.1f}%)\n"
+                f"{spread_advice}\n\n"
+                f"COMMON ROOT CAUSES (check in order):\n"
+                f"1. Insufficient iterative convergence — residuals "
+                f"must drop 3+ orders on EVERY grid. Check that "
+                f"monitor points have flatlined, not just residuals.\n"
+                f"2. y+ mismatch — if using wall functions, verify "
+                f"y+ is in the valid range (30-300 for standard, "
+                f"<1 for enhanced wall treatment) on ALL grids.\n"
+                f"3. First-order boundary gradients — some solvers "
+                f"default to first-order at boundaries. Check Fluent: "
+                f"'Alternative Formulation'; CFX: 'High Resolution' "
+                f"at walls.\n"
+                f"4. Mesh quality degradation — check that coarser "
+                f"meshes don't have degraded quality (skewness < 0.9, "
+                f"aspect ratio < 100).\n"
+                f"5. Extraction point location — move away from "
+                f"singularities, trailing edges, or re-entrant "
+                f"corners.\n\n"
+                f"IF YOU MUST PROCEED (document ALL of the following):\n"
+                f"  - State that formal grid convergence was not "
+                f"achieved.\n"
+                f"  - Report the grid solutions and spread.\n"
+                f"  - If spread is small, assign u_num = spread/2 as "
+                f"a bounding estimate with Uniform distribution.\n"
+                f"  - Flag as epistemic uncertainty requiring "
+                f"additional investigation.",
                 'red'
             )
             # --- Conservative bounding estimate for small-spread divergence ---
@@ -4365,14 +5274,29 @@ class GCICalculatorTab(QWidget):
                     markeredgewidth=1.5, zorder=7,
                     label=f'Production grid (Grid {tgt+1})')
 
-        # Richardson extrapolation (at h=0)
+        # Richardson extrapolation (at h=0) and RE convergence curve
         if has_re:
-            ax.axhline(y=res.richardson_extrapolation,
+            f_ext = res.richardson_extrapolation
+            ax.axhline(y=f_ext,
                        color=DARK_COLORS['green'], linestyle='--',
                        linewidth=1.5, alpha=0.8,
-                       label=f'Richardson extrap. = {res.richardson_extrapolation:.6g}')
-            ax.plot(0, res.richardson_extrapolation, '*',
+                       label=f'Richardson extrap. = {f_ext:.6g}')
+            ax.plot(0, f_ext, '*',
                     color=DARK_COLORS['green'], markersize=14, zorder=6)
+
+            # RE convergence curve: f(h) = f_ext + C·h^p
+            p_obs = res.observed_order
+            if (not np.isnan(p_obs) and 0 < p_obs < 100
+                    and spacings[0] > 1e-30
+                    and abs(solutions[0] - f_ext) > 1e-30):
+                C_coeff = (solutions[0] - f_ext) / _safe_rp(spacings[0], p_obs)
+                if np.isfinite(C_coeff):
+                    h_curve = np.linspace(0, spacings[-1] * 1.05, 200)
+                    f_curve = f_ext + C_coeff * h_curve ** p_obs
+                    ax.plot(h_curve, f_curve, '-',
+                            color=DARK_COLORS['green'], linewidth=1.2,
+                            alpha=0.4, zorder=2,
+                            label=f'RE trend (p = {p_obs:.2f})')
 
         # u_num error band on fine grid (light blue) — k=2 expanded
         if not np.isnan(res.u_num) and len(solutions) > 0:
@@ -4478,6 +5402,43 @@ class GCICalculatorTab(QWidget):
                 ax2.legend(loc='best', fontsize=7)
                 ax2.grid(True, alpha=0.3, which='both')
 
+        # ---- ORDER DIAGNOSTIC GAUGE (inset on top subplot) ----
+        p_obs = res.observed_order
+        p_th = res.theoretical_order
+        if (has_re and not res.order_is_assumed
+                and not np.isnan(p_obs) and 0 < p_obs < 100
+                and p_th > 0):
+            ax_ins = ax.inset_axes([0.62, 0.02, 0.36, 0.08])
+            ax_ins.set_xlim(0, max(2.5 * p_th, p_obs * 1.3))
+            ax_ins.set_ylim(0, 1)
+
+            # Green zone: 0.5p_th to 2p_th
+            ax_ins.axvspan(0.5 * p_th, 2.0 * p_th,
+                           color=DARK_COLORS['green'], alpha=0.3)
+            # Yellow zones
+            ax_ins.axvspan(0, 0.5 * p_th,
+                           color=DARK_COLORS['yellow'], alpha=0.15)
+            ax_ins.axvspan(2.0 * p_th, ax_ins.get_xlim()[1],
+                           color=DARK_COLORS['yellow'], alpha=0.15)
+
+            # Marker for observed order
+            in_range = 0.5 * p_th <= p_obs <= 2.0 * p_th
+            marker_color = DARK_COLORS['green'] if in_range else DARK_COLORS['red']
+            ax_ins.axvline(p_obs, color=marker_color, linewidth=2.5)
+            ax_ins.axvline(p_th, color=DARK_COLORS['fg_dim'],
+                           linewidth=1, linestyle=':')
+
+            status = "\u2713" if in_range else "\u2717"
+            ax_ins.set_title(
+                f"p_obs = {p_obs:.2f}  (p_th = {p_th:.1f})  {status}",
+                fontsize=6.5, color=marker_color, pad=2)
+            ax_ins.set_yticks([])
+            ax_ins.tick_params(axis='x', labelsize=5.5)
+            ax_ins.set_facecolor(DARK_COLORS['bg_alt'])
+            for spine in ax_ins.spines.values():
+                spine.set_color(DARK_COLORS['border'])
+                spine.set_linewidth(0.5)
+
         self._fig.tight_layout()
         self._canvas.draw()
 
@@ -4494,6 +5455,445 @@ class GCICalculatorTab(QWidget):
         except Exception as exc:
             QMessageBox.warning(self, "Clipboard Error",
                                 f"Could not copy to clipboard:\n\n{exc}")
+
+    # ------------------------------------------------------------------
+    # CARRY-OVER SUMMARY SUBTAB
+    # ------------------------------------------------------------------
+
+    def _update_carry_over_summary(self):
+        """Populate the Carry-Over Summary subtab table after computation."""
+        if not self._results:
+            self._carry_table.setRowCount(0)
+            self._carry_warnings.clear()
+            self._btn_copy_all_carry.setEnabled(False)
+            return
+
+        n_qty = len(self._results)
+        self._carry_table.setRowCount(n_qty)
+        warnings_lines = []
+
+        for q_idx, res in enumerate(self._results):
+            q_label = self._qty_label(q_idx)
+            q_unit = self._qty_unit(q_idx)
+            unit_sfx = f" {q_unit}" if q_unit else ""
+            tgt = res.target_grid_idx
+
+            # Determine carry value (same logic as carry-over box)
+            carry_u = None
+            if (res.is_valid and res.per_grid_u_num
+                    and 0 <= tgt < len(res.per_grid_u_num)
+                    and not np.isnan(res.per_grid_u_num[tgt])):
+                carry_u = res.per_grid_u_num[tgt]
+            elif res.is_valid and not np.isnan(res.u_num):
+                carry_u = res.u_num
+
+            conv_type = res.convergence_type or "unknown"
+
+            if carry_u is not None and conv_type != "divergent":
+                u_str = f"{carry_u:.6g}{unit_sfx}"
+                dist = "Normal"
+                dof = "\u221e"
+                basis = "Confirmed 1\u03c3"
+                status = "READY"
+                status_color = DARK_COLORS['green']
+            elif conv_type == "divergent":
+                # Check for bounding estimate
+                sols = res.grid_solutions
+                spread = max(sols) - min(sols)
+                mean_v = np.mean(sols)
+                spread_pct = ((spread / abs(mean_v) * 100.0)
+                              if abs(mean_v) > 1e-30 else float('inf'))
+                if spread_pct < 2.0:
+                    u_str = f"{spread/2:.6g}{unit_sfx} (bounding)"
+                    dist = "Uniform"
+                    status = "BOUNDING"
+                    status_color = DARK_COLORS['yellow']
+                else:
+                    u_str = "N/A"
+                    dist = "N/A"
+                    status = "BLOCKED"
+                    status_color = DARK_COLORS['red']
+                dof = "\u221e"
+                basis = "Bounding estimate"
+                warnings_lines.append(
+                    f"{q_label}: DIVERGENT convergence "
+                    f"(R = {res.convergence_ratio:.4f}). "
+                    f"Spread = {spread:.4g}{unit_sfx} "
+                    f"({spread_pct:.1f}%).")
+            else:
+                u_str = "N/A"
+                dist = "N/A"
+                dof = "N/A"
+                basis = "N/A"
+                status = "INVALID"
+                status_color = DARK_COLORS['red']
+                warnings_lines.append(
+                    f"{q_label}: No valid u_num available.")
+
+            if conv_type == "oscillatory":
+                status = "CAUTION"
+                status_color = DARK_COLORS['yellow']
+                warnings_lines.append(
+                    f"{q_label}: Oscillatory convergence. "
+                    f"u_num is a conservative estimate.")
+
+            items_data = [
+                (q_label, None),
+                (u_str, None),
+                (q_unit, None),
+                (dist, None),
+                (dof, None),
+                (basis, None),
+                (conv_type.capitalize(), None),
+                (status, status_color),
+            ]
+            for col, (text, color) in enumerate(items_data):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if color:
+                    item.setForeground(QColor(color))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                self._carry_table.setItem(q_idx, col, item)
+
+        self._carry_warnings.setPlainText("\n".join(warnings_lines))
+        self._btn_copy_all_carry.setEnabled(True)
+
+    def _copy_all_carry_values(self):
+        """Copy all carry-over values to clipboard as tab-separated text."""
+        if not self._results:
+            return
+        try:
+            lines = ["Quantity\tu_num\tUnit\tDistribution\tDOF\tSigma Basis\t"
+                     "Convergence\tStatus"]
+            for row in range(self._carry_table.rowCount()):
+                row_data = []
+                for col in range(self._carry_table.columnCount()):
+                    item = self._carry_table.item(row, col)
+                    row_data.append(item.text() if item else "")
+                lines.append("\t".join(row_data))
+            QApplication.clipboard().setText("\n".join(lines))
+        except Exception as exc:
+            QMessageBox.warning(self, "Clipboard Error",
+                                f"Could not copy:\n\n{exc}")
+
+    def _copy_carry_to_clipboard(self):
+        """Copy u_num carry-over value to clipboard."""
+        if not self._results:
+            return
+        try:
+            res = self._results[0]
+            tgt = res.target_grid_idx
+            q_unit = self._qty_unit(0)
+            unit_sfx = f" {q_unit}" if q_unit else ""
+
+            # Determine carry value
+            carry_u = res.u_num
+            if (res.per_grid_u_num and 0 <= tgt < len(res.per_grid_u_num)
+                    and not np.isnan(res.per_grid_u_num[tgt])):
+                carry_u = res.per_grid_u_num[tgt]
+            if np.isnan(carry_u):
+                return
+
+            cells = res.grid_cells[tgt] if tgt < len(res.grid_cells) else 0
+            grid_label = f"Grid {tgt+1} ({cells:,.0f} cells)"
+
+            parts = [
+                f"u_num = {carry_u:.6g}{unit_sfx}",
+                "Basis: Confirmed 1\u03c3",
+                "DOF: \u221e",
+                f"Source: {grid_label}  |  Fs = {res.safety_factor:.2f}",
+            ]
+
+            # Directional info
+            dir_u = res.u_num_directional
+            if not np.isnan(dir_u) and res.direction_of_concern != "both":
+                if dir_u == 0.0:
+                    parts.append(
+                        f"Direction: {res.direction_of_concern} "
+                        f"\u2192 CONSERVATIVE (u_num = 0.0)")
+                else:
+                    parts.append(
+                        f"Direction: {res.direction_of_concern} "
+                        f"\u2192 adverse bias (u_num = {dir_u:.6g}{unit_sfx})")
+
+            parts.append(
+                "Method: GCI per Celik et al. (2008), ASME V&V 20 \u00a75.1")
+
+            clipboard_text = "\n".join(parts)
+            QApplication.clipboard().setText(clipboard_text)
+
+            # Brief visual feedback
+            orig_text = self._btn_copy_carry.text()
+            self._btn_copy_carry.setText("\u2713 Copied!")
+            QTimer.singleShot(
+                1500, lambda: self._btn_copy_carry.setText(orig_text))
+
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Clipboard Error",
+                f"Could not copy carry value:\n\n{exc}")
+
+    def _export_summary_card(self):
+        """Export a compact PNG summary card with convergence plot + metrics.
+
+        Creates a single-image card suitable for PowerPoint or report appendices.
+        Left panel (60%): Convergence plot with RE curve and error bands.
+        Right panel (40%): Key GCI metrics as formatted text.
+        """
+        if not self._results:
+            return
+
+        res = self._results[0]
+        q_unit = self._qty_unit(0)
+        unit_sfx = f" {q_unit}" if q_unit else ""
+
+        # ---- Ask for save path ----
+        default_name = "GCI_Summary_Card.png"
+        path, filt = QFileDialog.getSaveFileName(
+            self, "Export GCI Summary Card", default_name,
+            "PNG Image (*.png);;PDF Document (*.pdf);;All Files (*)")
+        if not path:
+            return
+
+        # ---- Use a light report theme for print quality ----
+        CARD_BG = '#ffffff'
+        CARD_FG = '#1a1a2e'
+        CARD_DIM = '#555566'
+        CARD_ACCENT = '#2563eb'
+        CARD_GREEN = '#16a34a'
+        CARD_ORANGE = '#ea580c'
+        CARD_YELLOW = '#ca8a04'
+        CARD_RED = '#dc2626'
+        CARD_BORDER = '#d1d5db'
+
+        try:
+            fig = Figure(figsize=(10, 5), facecolor=CARD_BG)
+            gs = GridSpec(1, 2, width_ratios=[6, 4], figure=fig,
+                         left=0.07, right=0.97, top=0.90, bottom=0.12,
+                         wspace=0.05)
+
+            # ---- LEFT PANEL: Convergence plot ----
+            ax = fig.add_subplot(gs[0, 0])
+            ax.set_facecolor('#f8fafc')
+
+            spacings = np.array(res.grid_spacings)
+            solutions = np.array(res.grid_solutions)
+            tgt = res.target_grid_idx
+            has_re = not np.isnan(res.richardson_extrapolation)
+
+            # Grid solutions
+            ax.plot(spacings, solutions, 'o-', color=CARD_ACCENT,
+                    markersize=7, linewidth=1.8, label='Grid solutions',
+                    zorder=5)
+
+            # Production grid marker
+            if 0 <= tgt < len(spacings):
+                ax.plot(spacings[tgt], solutions[tgt], 'D',
+                        color=CARD_ORANGE, markersize=11,
+                        markeredgecolor=CARD_FG, markeredgewidth=1.2,
+                        zorder=7, label=f'Production (Grid {tgt+1})')
+
+            # Richardson extrapolation
+            if has_re:
+                f_ext = res.richardson_extrapolation
+                ax.axhline(y=f_ext, color=CARD_GREEN, linestyle='--',
+                           linewidth=1.3, alpha=0.7,
+                           label=f'RE = {f_ext:.6g}')
+                ax.plot(0, f_ext, '*', color=CARD_GREEN,
+                        markersize=12, zorder=6)
+
+                # RE convergence curve
+                p_obs = res.observed_order
+                if (not np.isnan(p_obs) and 0 < p_obs < 100
+                        and spacings[0] > 1e-30
+                        and abs(solutions[0] - f_ext) > 1e-30):
+                    C_coeff = ((solutions[0] - f_ext)
+                               / _safe_rp(spacings[0], p_obs))
+                    if np.isfinite(C_coeff):
+                        h_curve = np.linspace(0, spacings[-1] * 1.05, 200)
+                        f_curve = f_ext + C_coeff * h_curve ** p_obs
+                        ax.plot(h_curve, f_curve, '-',
+                                color=CARD_GREEN, linewidth=1.0,
+                                alpha=0.35, zorder=2,
+                                label=f'RE trend (p={p_obs:.2f})')
+
+            # Fine-grid u_num band
+            if not np.isnan(res.u_num) and len(solutions) > 0:
+                f1 = solutions[0]
+                band = 2 * res.u_num
+                ax.fill_between(
+                    [0, spacings[0]],
+                    [f1 - band, f1 - band],
+                    [f1 + band, f1 + band],
+                    alpha=0.12, color=CARD_ACCENT,
+                    label=f'Fine u_num \u00b12\u03c3')
+
+            # Production-grid u_num band
+            if (tgt > 0 and 0 <= tgt < len(spacings) and
+                    res.per_grid_u_num and
+                    tgt < len(res.per_grid_u_num) and
+                    not np.isnan(res.per_grid_u_num[tgt])):
+                f_prod = solutions[tgt]
+                u_prod = res.per_grid_u_num[tgt]
+                bh = 2 * u_prod
+                ax.fill_between(
+                    [spacings[tgt] * 0.85, spacings[tgt] * 1.15],
+                    [f_prod - bh, f_prod - bh],
+                    [f_prod + bh, f_prod + bh],
+                    alpha=0.2, color=CARD_ORANGE, zorder=3)
+
+            # Grid labels
+            for i, (h, f) in enumerate(zip(spacings, solutions)):
+                c = CARD_ORANGE if i == tgt else CARD_DIM
+                tag = f"G{i+1}\u2605" if i == tgt else f"G{i+1}"
+                ax.annotate(tag, (h, f), textcoords="offset points",
+                            xytext=(7, 7), fontsize=6.5, color=c,
+                            fontweight='bold' if i == tgt else 'normal')
+
+            ax.set_xlabel("Representative spacing h", fontsize=8,
+                          color=CARD_FG)
+            ax.set_ylabel(f"Solution{' (' + q_unit + ')' if q_unit else ''}",
+                          fontsize=8, color=CARD_FG)
+            ax.set_title("Grid Convergence Study", fontsize=10,
+                         fontweight='bold', color=CARD_FG)
+            ax.legend(loc='best', fontsize=6, framealpha=0.8)
+            ax.grid(True, alpha=0.2)
+            ax.set_xlim(left=-0.001)
+            ax.tick_params(labelsize=7, colors=CARD_FG)
+            for spine in ax.spines.values():
+                spine.set_color(CARD_BORDER)
+
+            # ---- RIGHT PANEL: Metrics text ----
+            ax_txt = fig.add_subplot(gs[0, 1])
+            ax_txt.axis('off')
+
+            # Build metrics lines
+            lines = []
+            lines.append("GCI Summary")
+            lines.append("\u2500" * 32)
+            lines.append("")
+            lines.append(f"Grids analyzed:      {res.n_grids}")
+
+            # Production grid info
+            cells = res.grid_cells[tgt] if tgt < len(res.grid_cells) else 0
+            if cells > 0:
+                lines.append(
+                    f"Production grid:     Grid {tgt+1} ({cells:,.0f} cells)")
+            else:
+                lines.append(f"Production grid:     Grid {tgt+1}")
+
+            # Convergence type
+            conv = res.convergence_type
+            if res.effectively_grid_independent:
+                conv = "grid-independent"
+            lines.append(f"Convergence:         {conv}")
+
+            # Auto-selected triplet
+            if res.auto_selected_triplet is not None:
+                trip_str = "-".join(str(g+1) for g in res.auto_selected_triplet)
+                lines.append(f"Selected triplet:    Grids {trip_str}")
+
+            lines.append("")
+
+            # Order
+            if not np.isnan(res.observed_order) and res.observed_order < 1e6:
+                lines.append(f"Observed order:      {res.observed_order:.2f}")
+            elif res.order_is_assumed:
+                lines.append(
+                    f"Assumed order:       {res.theoretical_order:.1f}")
+            lines.append(f"Theoretical order:   {res.theoretical_order:.1f}")
+
+            # Order diagnostic
+            if (not res.order_is_assumed and res.theoretical_order > 0
+                    and not np.isnan(res.observed_order)
+                    and 0 < res.observed_order < 100):
+                p_o = res.observed_order
+                p_t = res.theoretical_order
+                lo, hi = 0.5 * p_t, 2.0 * p_t
+                if lo <= p_o <= hi:
+                    lines.append(
+                        f"Order diagnostic:    \u2713 [{lo:.1f}, {hi:.1f}]")
+                else:
+                    lines.append(
+                        f"Order diagnostic:    \u2717 [{lo:.1f}, {hi:.1f}]")
+
+            lines.append("")
+
+            # u_num values
+            carry_u = res.u_num
+            if (res.per_grid_u_num and 0 <= tgt < len(res.per_grid_u_num)
+                    and not np.isnan(res.per_grid_u_num[tgt])):
+                carry_u = res.per_grid_u_num[tgt]
+
+            lines.append(f"u_num (std):         {carry_u:.4g}{unit_sfx}")
+
+            dir_u = res.u_num_directional
+            if not np.isnan(dir_u) and res.direction_of_concern != "both":
+                lines.append(
+                    f"u_num (directional): {dir_u:.4g}{unit_sfx}")
+                lines.append(
+                    f"Direction:           {res.direction_of_concern}")
+                if dir_u == 0.0:
+                    lines.append(
+                        f"Bias:                Conservative \u2713")
+                else:
+                    lines.append(
+                        f"Bias:                Adverse")
+
+            lines.append("")
+            lines.append(f"Safety factor:       {res.safety_factor:.2f}")
+            lines.append(f"Method:              GCI (Celik 2008)")
+            lines.append(f"Standard:            ASME V&V 20 \u00a75.1")
+
+            # Richardson extrapolation
+            if has_re:
+                lines.append("")
+                lines.append(
+                    f"f_exact (RE):        {res.richardson_extrapolation:.6g}"
+                    f"{unit_sfx}")
+
+            metrics_text = "\n".join(lines)
+
+            ax_txt.text(0.05, 0.95, metrics_text,
+                        transform=ax_txt.transAxes,
+                        verticalalignment='top',
+                        fontfamily='monospace', fontsize=7.5,
+                        color=CARD_FG, linespacing=1.4)
+
+            # ---- Title banner ----
+            fig.text(0.5, 0.96, "GCI Analysis Summary Card",
+                     ha='center', va='top', fontsize=12,
+                     fontweight='bold', color=CARD_FG)
+
+            # ---- Footer with timestamp ----
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+            fig.text(0.97, 0.02,
+                     f"Generated {now}  |  Celik et al. (2008), "
+                     f"ASME V&V 20-2009",
+                     ha='right', va='bottom', fontsize=5.5,
+                     color=CARD_DIM, style='italic')
+
+            # ---- Save ----
+            dpi = 300
+            if path.lower().endswith('.pdf'):
+                fig.savefig(path, dpi=dpi, facecolor=CARD_BG,
+                            bbox_inches='tight')
+            else:
+                fig.savefig(path, dpi=dpi, facecolor=CARD_BG,
+                            bbox_inches='tight', pad_inches=0.15)
+            plt.close(fig)
+
+            QMessageBox.information(
+                self, "Summary Card Exported",
+                f"Summary card saved to:\n\n{path}")
+
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Export Error",
+                f"Could not export summary card:\n\n{exc}")
 
     def _generate_report_statements(self):
         """Generate copy-pasteable regulatory paragraphs for V&V reports.
@@ -4563,7 +5963,7 @@ class GCICalculatorTab(QWidget):
                     f"the numerical uncertainty for {q_label} is "
                     f"u_num = {u_val:.4g}{unit_sfx} "
                     f"({u_pct:.2f}% of the solution). "
-                    f"The expanded uncertainty (k=2) is"
+                    f"The expanded uncertainty (k=2) is "
                     f"+/-{2*u_val:.4g}{unit_sfx} "
                     f"({2*u_pct:.2f}%)."
                 )
@@ -4601,25 +6001,51 @@ class GCICalculatorTab(QWidget):
                     f"The numerical uncertainty for {q_label} is "
                     f"u_num = {u_val:.4g}{unit_sfx} "
                     f"({u_pct:.2f}%). "
-                    f"The expanded uncertainty (k=2) is"
+                    f"The expanded uncertainty (k=2) is "
                     f"+/-{2*u_val:.4g}{unit_sfx} "
                     f"({2*u_pct:.2f}%)."
                 )
 
             elif res.convergence_type == "divergent":
+                sols = res.grid_solutions
+                spread = max(sols) - min(sols)
+                mean_v = np.mean(sols)
+                spread_pct_r = ((spread / abs(mean_v) * 100.0)
+                                if abs(mean_v) > 1e-30 else float('inf'))
                 lines.append(
                     f"  A grid convergence study was performed using "
                     f"{res.n_grids} grids. DIVERGENT behavior was "
-                    f"observed — the solution does not converge with "
+                    f"observed (R = {res.convergence_ratio:.4f}) — the "
+                    f"solution does not converge monotonically with "
                     f"grid refinement. The Grid Convergence Index "
                     f"(GCI) method does not yield a valid numerical "
                     f"uncertainty estimate for {q_label} under these "
-                    f"conditions. Additional grid refinement, "
-                    f"investigation of solver settings, or an "
-                    f"alternative uncertainty estimation approach "
-                    f"is required before a numerical uncertainty "
-                    f"can be assigned."
+                    f"conditions."
                 )
+                lines.append("")
+                lines.append(
+                    f"  The solution spread across grids is "
+                    f"{spread:.4g}{unit_sfx} ({spread_pct_r:.1f}% "
+                    f"of the mean)."
+                )
+                if spread_pct_r < 2.0:
+                    lines.append(
+                        f"  Given the small spread, a conservative "
+                        f"bounding uncertainty of u_num = "
+                        f"{spread/2:.4g}{unit_sfx} (half the spread, "
+                        f"treated as a bounding estimate) MAY be "
+                        f"justified with appropriate engineering "
+                        f"documentation. This is NOT a GCI-derived "
+                        f"value. Use Uniform distribution."
+                    )
+                else:
+                    lines.append(
+                        f"  Additional grid refinement, investigation "
+                        f"of solver settings, or an alternative "
+                        f"uncertainty estimation approach is required "
+                        f"before a numerical uncertainty can be "
+                        f"assigned."
+                    )
 
             elif res.convergence_type == "grid-independent":
                 lines.append(
@@ -4909,6 +6335,87 @@ class GCICalculatorTab(QWidget):
                 "262, 104-130"
             )
         lines.append("")
+
+        # ---- Formal References ----
+        sect += 1
+        lines.append(f"{sect}. REFERENCES")
+        lines.append("-" * 50)
+        lines.append("")
+        ref_num = 1
+        lines.append(
+            f"  [{ref_num}] Celik, I.B., Ghia, U., Roache, P.J., "
+            "Freitas, C.J., Coleman, H.,"
+        )
+        lines.append(
+            "      and Raad, P.E. (2008). \"Procedure for Estimation "
+            "and Reporting"
+        )
+        lines.append(
+            "      of Uncertainty Due to Discretization in CFD "
+            "Applications.\""
+        )
+        lines.append(
+            "      J. Fluids Eng., 130(7), 078001."
+        )
+        lines.append("")
+        ref_num += 1
+        lines.append(
+            f"  [{ref_num}] Roache, P.J. (1998). Verification and "
+            "Validation in Computational"
+        )
+        lines.append(
+            "      Science and Engineering. Hermosa Publishers, "
+            "Albuquerque, NM."
+        )
+        lines.append("")
+        ref_num += 1
+        lines.append(
+            f"  [{ref_num}] ASME V&V 20-2009 (R2021). Standard for "
+            "Verification and Validation"
+        )
+        lines.append(
+            "      in Computational Fluid Dynamics and Heat Transfer."
+        )
+        lines.append("")
+        ref_num += 1
+        lines.append(
+            f"  [{ref_num}] Richardson, L.F. (1911). \"The Approximate "
+            "Arithmetical Solution"
+        )
+        lines.append(
+            "      by Finite Differences of Physical Problems "
+            "Involving Differential"
+        )
+        lines.append(
+            "      Equations.\" Phil. Trans. R. Soc. A, 210, 307-357."
+        )
+        if has_alt:
+            lines.append("")
+            ref_num += 1
+            lines.append(
+                f"  [{ref_num}] Xing, T. and Stern, F. (2010). "
+                "\"Factors of Safety for Richardson"
+            )
+            lines.append(
+                "      Extrapolation.\" ASME J. Fluids Eng., "
+                "132(6), 061403."
+            )
+        if has_lsr:
+            lines.append("")
+            ref_num += 1
+            lines.append(
+                f"  [{ref_num}] Eca, L. and Hoekstra, M. (2014). "
+                "\"A Procedure for the Estimation"
+            )
+            lines.append(
+                "      of the Numerical Uncertainty of CFD Calculations "
+                "Based on Grid"
+            )
+            lines.append(
+                "      Refinement Studies.\" J. Comp. Physics, "
+                "262, 104-130."
+            )
+        lines.append("")
         lines.append("=" * 70)
 
         self._report_text.setPlainText("\n".join(lines))
@@ -4934,10 +6441,12 @@ class GCICalculatorTab(QWidget):
             "version": APP_VERSION,
             "n_grids": n_grids,
             "dim_index": self._cmb_dim.currentIndex(),
+            "order_preset_index": self._cmb_order_preset.currentIndex(),
             "theoretical_order": self._spn_theoretical_p.value(),
             "safety_factor": self._spn_safety.value(),
             "reference_scale": self._spn_ref_scale.value(),
             "production_grid": self._cmb_production.currentIndex(),
+            "direction_of_concern": self._cmb_direction.currentIndex(),
             "n_quantities": self._n_quantities,
             "quantity_names": list(self._quantity_names),
             "quantity_units": list(self._quantity_units),
@@ -4979,7 +6488,10 @@ class GCICalculatorTab(QWidget):
         # Set dimension
         self._cmb_dim.setCurrentIndex(state.get("dim_index", 0))
 
-        # Set theoretical order and safety factor
+        # Set theoretical order preset and safety factor
+        preset_idx = state.get("order_preset_index", 0)
+        if 0 <= preset_idx < self._cmb_order_preset.count():
+            self._cmb_order_preset.setCurrentIndex(preset_idx)
         self._spn_theoretical_p.setValue(state.get("theoretical_order", 2.0))
         self._spn_safety.setValue(state.get("safety_factor", 0.0))
         self._spn_ref_scale.setValue(state.get("reference_scale", 0.0))
@@ -5000,6 +6512,11 @@ class GCICalculatorTab(QWidget):
         if 0 <= prod_idx < self._cmb_production.count():
             self._cmb_production.setCurrentIndex(prod_idx)
 
+        # Set direction of concern
+        dir_idx = state.get("direction_of_concern", 0)
+        if 0 <= dir_idx < self._cmb_direction.count():
+            self._cmb_direction.setCurrentIndex(dir_idx)
+
         # Fill table data
         grid_data = state.get("grid_data", [])
         for i, row in enumerate(grid_data):
@@ -5016,12 +6533,14 @@ class GCICalculatorTab(QWidget):
 
     def clear_all(self):
         """Reset the calculator tab to default state."""
+        self._cmb_order_preset.setCurrentIndex(0)  # Second-order
         self._spn_theoretical_p.setValue(2.0)
         self._spn_safety.setValue(0.0)
         self._spn_ref_scale.setValue(0.0)
         self._cmb_dim.setCurrentIndex(0)
         self._cmb_n_grids.setCurrentIndex(1)  # 3 grids
         self._cmb_production.setCurrentIndex(0)
+        self._cmb_direction.setCurrentIndex(0)  # "Both (two-sided)"
         self._n_quantities = 1
         self._quantity_names = ["Temperature"]
         self._quantity_units = ["K"]
@@ -5038,6 +6557,11 @@ class GCICalculatorTab(QWidget):
         self._guidance_order.set_guidance("", 'green')
         self._guidance_asymptotic.set_guidance("", 'green')
         self._report_text.clear()
+        self._btn_copy_carry.setEnabled(False)
+        self._btn_summary_card.setEnabled(False)
+        self._carry_table.setRowCount(0)
+        self._carry_warnings.clear()
+        self._btn_copy_all_carry.setEnabled(False)
 
 
 # =============================================================================
@@ -5089,6 +6613,16 @@ class SpatialGCITab(QWidget):
         self._cmb_dim_spatial.addItem("3D", 3)
         self._cmb_dim_spatial.addItem("2D", 2)
         setup_form.addRow("Dimensions:", self._cmb_dim_spatial)
+
+        self._cmb_order_preset_spatial = QComboBox()
+        for label, val in THEORETICAL_ORDER_PRESETS:
+            self._cmb_order_preset_spatial.addItem(label, val)
+        self._cmb_order_preset_spatial.setCurrentIndex(0)
+        self._cmb_order_preset_spatial.setToolTip(
+            "Select the formal order of accuracy of your numerical scheme.\n"
+            "Select 'Custom' to enter any value in the spinbox below."
+        )
+        setup_form.addRow("Scheme order:", self._cmb_order_preset_spatial)
 
         self._spn_p_theo = QDoubleSpinBox()
         self._spn_p_theo.setRange(1.0, 4.0)
@@ -5437,6 +6971,52 @@ class SpatialGCITab(QWidget):
         # Sub-tab 5: 3D Point Cloud Viewer
         self._setup_3d_viewer()
 
+        # Sub-tab 6: Carry-Over Summary
+        spatial_carry_widget = QWidget()
+        spatial_carry_lay = QVBoxLayout(spatial_carry_widget)
+        spatial_carry_lay.setContentsMargins(6, 6, 6, 6)
+
+        sc_header = QLabel(
+            "<b>Carry-Over Summary</b> — Recommended u_num for "
+            "the Uncertainty Aggregator")
+        sc_header.setWordWrap(True)
+        sc_header.setStyleSheet(
+            f"color: {DARK_COLORS['accent']}; font-size: 13px; "
+            f"padding: 4px 0;")
+        spatial_carry_lay.addWidget(sc_header)
+
+        self._spatial_carry_table = QTableWidget()
+        self._spatial_carry_table.setColumnCount(8)
+        self._spatial_carry_table.setHorizontalHeaderLabels([
+            "Statistic", "u_num", "Unit", "Distribution",
+            "DOF", "Sigma Basis", "Points", "Status"
+        ])
+        self._spatial_carry_table.setAlternatingRowColors(True)
+        style_table(self._spatial_carry_table)
+        spatial_carry_lay.addWidget(self._spatial_carry_table)
+
+        self._spatial_carry_info = QPlainTextEdit()
+        self._spatial_carry_info.setReadOnly(True)
+        self._spatial_carry_info.setMaximumHeight(120)
+        self._spatial_carry_info.setPlaceholderText(
+            "Convergence breakdown and recommendations appear here.")
+        ff = QFont("Consolas", 9)
+        ff.setStyleHint(QFont.StyleHint.Monospace)
+        self._spatial_carry_info.setFont(ff)
+        spatial_carry_lay.addWidget(self._spatial_carry_info)
+
+        sc_btn_row = QHBoxLayout()
+        self._btn_copy_spatial_carry = QPushButton(
+            "\U0001f4cb Copy Carry Value")
+        self._btn_copy_spatial_carry.setEnabled(False)
+        self._btn_copy_spatial_carry.clicked.connect(
+            self._copy_spatial_carry_value)
+        sc_btn_row.addWidget(self._btn_copy_spatial_carry)
+        sc_btn_row.addStretch()
+        spatial_carry_lay.addLayout(sc_btn_row)
+
+        self._right_tabs.addTab(spatial_carry_widget, "Carry-Over Summary")
+
         # Splitter proportions
         splitter.setSizes([450, 600])
 
@@ -5448,6 +7028,10 @@ class SpatialGCITab(QWidget):
         # Mark results stale when settings change
         self._cmb_dim_spatial.currentIndexChanged.connect(
             self._mark_spatial_stale)
+        self._cmb_order_preset_spatial.currentIndexChanged.connect(
+            self._on_order_preset_spatial_changed)
+        self._spn_p_theo.valueChanged.connect(
+            self._on_p_theo_manual_change)
         self._spn_p_theo.valueChanged.connect(self._mark_spatial_stale)
         self._spn_fs_spatial.valueChanged.connect(self._mark_spatial_stale)
         self._chk_incl_osc.stateChanged.connect(self._mark_spatial_stale)
@@ -5460,6 +7044,28 @@ class SpatialGCITab(QWidget):
         self._pre_grid_names = None
         self._sep_data = {}    # grid_idx -> (coords, values, filepath)
         self._prof_data = {}   # grid_idx -> (coords, values, filepath)
+
+    # ------------------------------------------------------------------
+    # SCHEME ORDER PRESET (Spatial)
+    # ------------------------------------------------------------------
+
+    def _on_order_preset_spatial_changed(self, index):
+        val = self._cmb_order_preset_spatial.currentData()
+        if val is not None:
+            self._spn_p_theo.blockSignals(True)
+            self._spn_p_theo.setValue(val)
+            self._spn_p_theo.blockSignals(False)
+            self._mark_spatial_stale()
+
+    def _on_p_theo_manual_change(self, value):
+        preset_val = self._cmb_order_preset_spatial.currentData()
+        if preset_val is not None and abs(preset_val - value) > 0.01:
+            for i in range(self._cmb_order_preset_spatial.count()):
+                if self._cmb_order_preset_spatial.itemData(i) is None:
+                    self._cmb_order_preset_spatial.blockSignals(True)
+                    self._cmb_order_preset_spatial.setCurrentIndex(i)
+                    self._cmb_order_preset_spatial.blockSignals(False)
+                    break
 
     # ------------------------------------------------------------------
     # UNIT COMBO HELPER
@@ -5728,6 +7334,7 @@ class SpatialGCITab(QWidget):
             self._update_spatial_plots()
             self._update_3d_viewer()
             self._generate_spatial_report_statements()
+            self._update_spatial_carry_over()
             self._spatial_stale = False
             self._btn_compute_spatial.setText("Compute Spatial GCI")
             self._btn_compute_spatial.setToolTip("")
@@ -5958,6 +7565,23 @@ class SpatialGCITab(QWidget):
                         f"{np.mean(div_R_vals):.3f}")
                 lines.append(
                     "    Check mesh quality in the divergent region.")
+                if div_frac > 0.25:
+                    lines.append("")
+                    lines.append(
+                        "    CRITICAL: More than 25% of points are "
+                        "divergent. This indicates a systemic issue "
+                        "with the grid refinement strategy. Common "
+                        "causes: non-conformal mesh interfaces, "
+                        "different mesh topology between grids, or "
+                        "interpolation artifacts in data transfer.")
+                elif div_frac > 0.10:
+                    lines.append("")
+                    lines.append(
+                        "    NOTE: Divergent points may be concentrated "
+                        "near geometry features (leading/trailing "
+                        "edges, junctions) where mesh refinement is "
+                        "non-uniform. Use the 3D Point Cloud viewer "
+                        "to visualize the spatial distribution.")
                 lines.append("")
 
         if s.n_points_valid > 0:
@@ -6459,6 +8083,105 @@ class SpatialGCITab(QWidget):
         self._pv_plotter.show_axes()
         self._pv_plotter.reset_camera()
 
+    # ------------------------------------------------------------------
+    # CARRY-OVER SUMMARY (Spatial)
+    # ------------------------------------------------------------------
+
+    def _update_spatial_carry_over(self):
+        """Populate the Spatial Carry-Over Summary subtab."""
+        s = self._summary
+        if s is None or s.n_points_valid == 0:
+            self._spatial_carry_table.setRowCount(0)
+            self._spatial_carry_info.clear()
+            self._btn_copy_spatial_carry.setEnabled(False)
+            return
+
+        unit_sfx = f" {s.quantity_unit}" if s.quantity_unit else ""
+        total = max(s.n_points_total, 1)
+        mono_pct = 100 * s.n_monotonic / total
+        div_pct = 100 * s.n_divergent / total
+
+        # Populate table with recommended value and alternatives
+        rows = [
+            ("95th Percentile (recommended)",
+             f"{s.u_num_p95:.6g}{unit_sfx}",
+             "RECOMMENDED", DARK_COLORS['green']),
+            ("Mean",
+             f"{s.u_num_mean:.6g}{unit_sfx}",
+             "Alternative", None),
+            ("Maximum (conservative)",
+             f"{s.u_num_max:.6g}{unit_sfx}",
+             "Conservative", None),
+        ]
+        self._spatial_carry_table.setRowCount(len(rows))
+        for i, (stat, val, status, color) in enumerate(rows):
+            items = [
+                (stat, None),
+                (val, None),
+                (s.quantity_unit or "", None),
+                ("Normal", None),
+                ("\u221e", None),
+                ("Confirmed 1\u03c3", None),
+                (f"{s.n_points_valid:,}", None),
+                (status, color),
+            ]
+            for col, (text, clr) in enumerate(items):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if clr:
+                    item.setForeground(QColor(clr))
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                if i == 0:
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                self._spatial_carry_table.setItem(i, col, item)
+
+        # Info text
+        info_lines = [
+            f"Quantity: {s.quantity_name}",
+            f"Total points: {s.n_points_total:,}  |  "
+            f"Valid: {s.n_points_valid:,}",
+            f"Monotonic: {mono_pct:.1f}%  |  "
+            f"Divergent: {div_pct:.1f}%",
+            "",
+            f"Enter in Aggregator as:",
+            f"  Source type: Numerical (u_num)",
+            f"  Sigma Value: {s.u_num_p95:.6g}{unit_sfx}",
+            f"  Sigma Basis: Confirmed 1\u03c3",
+            f"  DOF: \u221e",
+            f"  Distribution: Normal",
+        ]
+        if div_pct > 10:
+            info_lines.append("")
+            info_lines.append(
+                f"\u26A0 {div_pct:.0f}% of points are divergent. "
+                f"Review spatial distribution before carry-over.")
+        self._spatial_carry_info.setPlainText("\n".join(info_lines))
+        self._btn_copy_spatial_carry.setEnabled(True)
+
+    def _copy_spatial_carry_value(self):
+        """Copy recommended spatial carry value to clipboard."""
+        s = self._summary
+        if s is None or s.n_points_valid == 0:
+            return
+        try:
+            unit_sfx = f" {s.quantity_unit}" if s.quantity_unit else ""
+            text = (
+                f"u_num = {s.u_num_p95:.6g}{unit_sfx}\n"
+                f"Basis: Confirmed 1\u03c3\n"
+                f"DOF: \u221e\n"
+                f"Distribution: Normal\n"
+                f"Source: Spatial GCI 95th percentile "
+                f"({s.n_points_valid:,} points)")
+            QApplication.clipboard().setText(text)
+        except Exception as exc:
+            QMessageBox.warning(self, "Clipboard Error",
+                                f"Could not copy:\n\n{exc}")
+
     def _copy_spatial_report(self):
         """Copy spatial report statements to clipboard."""
         try:
@@ -6678,6 +8401,7 @@ class SpatialGCITab(QWidget):
         return {
             "mode": self._cmb_mode.currentData(),
             "dim": self._cmb_dim_spatial.currentData(),
+            "order_preset_index": self._cmb_order_preset_spatial.currentIndex(),
             "theoretical_order": self._spn_p_theo.value(),
             "safety_factor": self._spn_fs_spatial.value(),
             "quantity_name": self._edt_qty_name.text(),
@@ -6700,6 +8424,9 @@ class SpatialGCITab(QWidget):
         idx_dim = 0 if dim == 3 else 1
         self._cmb_dim_spatial.setCurrentIndex(idx_dim)
 
+        preset_idx = state.get("order_preset_index", 0)
+        if 0 <= preset_idx < self._cmb_order_preset_spatial.count():
+            self._cmb_order_preset_spatial.setCurrentIndex(preset_idx)
         self._spn_p_theo.setValue(state.get("theoretical_order", 2.0))
         self._spn_fs_spatial.setValue(state.get("safety_factor", 0.0))
         self._edt_qty_name.setText(state.get("quantity_name", "Temperature"))
@@ -6719,6 +8446,7 @@ class SpatialGCITab(QWidget):
         """Reset the spatial tab to defaults."""
         self._cmb_mode.setCurrentIndex(0)
         self._cmb_dim_spatial.setCurrentIndex(0)
+        self._cmb_order_preset_spatial.setCurrentIndex(0)
         self._spn_p_theo.setValue(2.0)
         self._spn_fs_spatial.setValue(0.0)
         self._edt_qty_name.setText("Temperature")
@@ -6750,6 +8478,9 @@ class SpatialGCITab(QWidget):
         self._guidance_import.set_guidance("", 'green')
         self._guidance_spatial.set_guidance("", 'green')
         self._report_text.clear()
+        self._spatial_carry_table.setRowCount(0)
+        self._spatial_carry_info.clear()
+        self._btn_copy_spatial_carry.setEnabled(False)
 
 
 # =============================================================================
@@ -6963,6 +8694,821 @@ class GCIReferenceTab(QWidget):
 # =============================================================================
 
 _esc = _html_esc  # Alias: use stdlib html.escape for all HTML escaping.
+
+
+# =============================================================================
+# MESH STUDY PLANNER TAB
+# =============================================================================
+
+# Study checklist items — grouped by category
+STUDY_CHECKLIST_ITEMS = {
+    "Mesh Generation": [
+        "Same meshing strategy (topology) on all grids",
+        "Consistent boundary layer resolution approach",
+        "Mesh quality checked on all grids (skewness, aspect ratio, orthogonality)",
+        "y+ values in valid range for wall treatment on all grids",
+        "No unintended mesh features (e.g., refinement zones in wrong place)",
+    ],
+    "Solver Settings": [
+        "Identical solver settings on all grids (scheme, turbulence model, BCs)",
+        "Same convergence criteria on all grids",
+        "Iterative convergence achieved on all grids (residuals 3+ orders)",
+        "Monitor points have flatlined on all grids",
+        "Same time-step (transient) or pseudo-time settings on all grids",
+    ],
+    "Data Extraction": [
+        "Same quantity extraction location(s) on all grids",
+        "Extraction point away from singularities and sharp gradients",
+        "Solution values recorded at the same physical conditions",
+        "Cell counts recorded accurately for each grid",
+        "Units consistent across all grids",
+    ],
+    "Study Design": [
+        "At least 3 grids planned (2-grid is minimum viable only)",
+        "Refinement ratios r > 1.3 between consecutive grids",
+        "Systematic (not random) refinement strategy",
+        "Production grid identified",
+        "Budget allows for all planned grids (time, storage, licenses)",
+    ],
+}
+
+
+def _plan_mesh_sizes(production_cells, dim, r, n_grids, strategy):
+    """Compute target mesh sizes for a grid convergence study.
+
+    Returns list of (grid_label, cell_count, is_production) tuples,
+    ordered finest-first.
+    """
+    cells = []
+    if strategy == "refine":
+        # Production is coarsest; refine upward
+        for i in range(n_grids):
+            level = n_grids - 1 - i  # finest first
+            n = production_cells * (r ** (dim * level))
+            cells.append(n)
+        prod_idx = n_grids - 1  # last (coarsest)
+    elif strategy == "coarsen":
+        # Production is finest; coarsen downward
+        for i in range(n_grids):
+            n = production_cells / (r ** (dim * i))
+            cells.append(n)
+        prod_idx = 0  # first (finest)
+    else:
+        # Production is middle grid
+        mid = n_grids // 2
+        for i in range(n_grids):
+            offset = mid - i  # positive = finer, negative = coarser
+            n = production_cells * (r ** (dim * offset))
+            cells.append(n)
+        prod_idx = mid
+
+    result = []
+    for i, n in enumerate(cells):
+        if i == 0:
+            label = f"Grid {i+1} (finest)"
+        elif i == n_grids - 1:
+            label = f"Grid {i+1} (coarsest)"
+        else:
+            label = f"Grid {i+1}"
+        result.append((label, round(n), i == prod_idx))
+    return result
+
+
+class MeshStudyPlannerTab(QWidget):
+    """Pre-analysis planning tab for GCI studies."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        splitter = QSplitter(Qt.Horizontal, self)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(6, 6, 6, 6)
+        outer.addWidget(splitter)
+
+        # ---- LEFT PANEL: Inputs ----
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(6, 6, 6, 6)
+        left_layout.setSpacing(8)
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left)
+        left_scroll.setWidgetResizable(True)
+        splitter.addWidget(left_scroll)
+
+        # -- Section A: Target Mesh Calculator --
+        grp_target = QGroupBox("Target Mesh Calculator")
+        target_form = QFormLayout(grp_target)
+        target_form.setSpacing(6)
+
+        self._spn_prod_cells = QDoubleSpinBox()
+        self._spn_prod_cells.setRange(1, 1e12)
+        self._spn_prod_cells.setDecimals(0)
+        self._spn_prod_cells.setValue(1000000)
+        self._spn_prod_cells.setGroupSeparatorShown(True)
+        self._spn_prod_cells.setToolTip(
+            "Total cell count of your production (baseline) mesh.")
+        target_form.addRow("Production mesh cells:", self._spn_prod_cells)
+
+        self._cmb_plan_dim = QComboBox()
+        self._cmb_plan_dim.addItem("3D", 3)
+        self._cmb_plan_dim.addItem("2D", 2)
+        target_form.addRow("Dimensions:", self._cmb_plan_dim)
+
+        self._spn_target_r = QDoubleSpinBox()
+        self._spn_target_r.setRange(1.1, 3.0)
+        self._spn_target_r.setValue(1.5)
+        self._spn_target_r.setSingleStep(0.1)
+        self._spn_target_r.setDecimals(2)
+        self._spn_target_r.setToolTip(
+            "Desired refinement ratio between consecutive grids.\n"
+            "Celik et al. recommend r > 1.3.\n"
+            "r = 1.5 is a good default; r = 2.0 is ideal but expensive.")
+        target_form.addRow("Target refinement ratio:", self._spn_target_r)
+
+        self._cmb_study_size = QComboBox()
+        self._cmb_study_size.addItems([
+            "3-grid study (standard)",
+            "4-grid study (cross-check)",
+            "5-grid study (best practice)",
+        ])
+        target_form.addRow("Study type:", self._cmb_study_size)
+
+        self._cmb_strategy = QComboBox()
+        self._cmb_strategy.addItem(
+            "Refine from production (production = coarsest)", "refine")
+        self._cmb_strategy.addItem(
+            "Coarsen from production (production = finest)", "coarsen")
+        self._cmb_strategy.addItem(
+            "Production is middle grid", "middle")
+        self._cmb_strategy.setToolTip(
+            "How to build the study grids relative to production:\n\n"
+            "Refine: Build finer grids above your production mesh.\n"
+            "  Your production mesh is the coarsest in the study.\n\n"
+            "Coarsen: Build coarser grids below your production mesh.\n"
+            "  Your production mesh is the finest in the study.\n\n"
+            "Middle: Build grids above and below your production mesh.\n"
+            "  Your production mesh is in the middle of the study.")
+        target_form.addRow("Strategy:", self._cmb_strategy)
+
+        self._btn_compute_targets = QPushButton("Compute Mesh Targets")
+        self._btn_compute_targets.setStyleSheet(
+            f"QPushButton {{ background-color: {DARK_COLORS['accent']}; "
+            f"color: {DARK_COLORS['bg']}; font-weight: bold; "
+            f"font-size: 14px; padding: 10px; }}"
+            f"QPushButton:hover {{ background-color: "
+            f"{DARK_COLORS['accent_hover']}; }}")
+        self._btn_compute_targets.clicked.connect(self._compute_targets)
+        target_form.addRow(self._btn_compute_targets)
+
+        left_layout.addWidget(grp_target)
+
+        # -- Section B: Refinement Ratio Checker --
+        grp_ratio = QGroupBox("Refinement Ratio Checker")
+        ratio_lay = QVBoxLayout(grp_ratio)
+        ratio_lay.setSpacing(4)
+
+        ratio_lay.addWidget(QLabel(
+            "Enter your actual cell counts to check ratios:"))
+        self._tbl_ratio_check = QTableWidget(3, 2)
+        self._tbl_ratio_check.setHorizontalHeaderLabels(
+            ["Grid", "Cell Count"])
+        self._tbl_ratio_check.setMaximumHeight(150)
+        for i in range(3):
+            lbl = QTableWidgetItem(f"Grid {i+1}")
+            lbl.setFlags(lbl.flags() & ~Qt.ItemIsEditable)
+            self._tbl_ratio_check.setItem(i, 0, lbl)
+        style_table(self._tbl_ratio_check)
+        ratio_lay.addWidget(self._tbl_ratio_check)
+
+        ratio_btn_row = QHBoxLayout()
+        self._btn_add_ratio_grid = QPushButton("+ Grid")
+        self._btn_add_ratio_grid.clicked.connect(self._add_ratio_grid)
+        self._btn_rem_ratio_grid = QPushButton("- Grid")
+        self._btn_rem_ratio_grid.clicked.connect(self._rem_ratio_grid)
+        self._btn_check_ratios = QPushButton("Check Ratios")
+        self._btn_check_ratios.clicked.connect(self._check_ratios)
+        ratio_btn_row.addWidget(self._btn_add_ratio_grid)
+        ratio_btn_row.addWidget(self._btn_rem_ratio_grid)
+        ratio_btn_row.addWidget(self._btn_check_ratios)
+        ratio_btn_row.addStretch()
+        ratio_lay.addLayout(ratio_btn_row)
+
+        left_layout.addWidget(grp_ratio)
+
+        # -- Section C: Resource Estimator --
+        grp_resource = QGroupBox("Resource Estimator")
+        res_form = QFormLayout(grp_resource)
+        res_form.setSpacing(6)
+
+        self._spn_baseline_time = QDoubleSpinBox()
+        self._spn_baseline_time.setRange(0.001, 10000)
+        self._spn_baseline_time.setValue(1.0)
+        self._spn_baseline_time.setDecimals(2)
+        self._spn_baseline_time.setSuffix(" hours")
+        self._spn_baseline_time.setToolTip(
+            "Wall-clock time for a single production run.")
+        res_form.addRow("Baseline solve time:", self._spn_baseline_time)
+
+        self._cmb_scaling = QComboBox()
+        self._cmb_scaling.addItem("Linear (N)", "linear")
+        self._cmb_scaling.addItem("N^1.5 (typical implicit CFD)", "n15")
+        self._cmb_scaling.addItem("N^2 (dense linear algebra)", "n2")
+        self._cmb_scaling.setCurrentIndex(1)  # N^1.5 default
+        self._cmb_scaling.setToolTip(
+            "How solve time scales with cell count:\n"
+            "  Linear: direct proportionality\n"
+            "  N^1.5: typical for implicit pressure-based CFD solvers\n"
+            "  N^2: dense direct solvers")
+        res_form.addRow("Scaling model:", self._cmb_scaling)
+
+        self._btn_estimate = QPushButton("Estimate Resources")
+        self._btn_estimate.clicked.connect(self._estimate_resources)
+        res_form.addRow(self._btn_estimate)
+
+        left_layout.addWidget(grp_resource)
+
+        left_layout.addStretch()
+
+        # ---- RIGHT PANEL: Results subtabs ----
+        self._right_tabs = QTabWidget()
+        splitter.addWidget(self._right_tabs)
+
+        # Subtab 1: Mesh Targets
+        targets_widget = QWidget()
+        targets_lay = QVBoxLayout(targets_widget)
+        targets_lay.setContentsMargins(6, 6, 6, 6)
+
+        self._targets_table = QTableWidget()
+        self._targets_table.setColumnCount(5)
+        self._targets_table.setHorizontalHeaderLabels([
+            "Grid", "Cell Count", "Ref. Ratio", "r > 1.3?", "Role"
+        ])
+        self._targets_table.setAlternatingRowColors(True)
+        style_table(self._targets_table)
+        targets_lay.addWidget(self._targets_table)
+
+        self._guidance_targets = GuidancePanel("Target Assessment")
+        targets_lay.addWidget(self._guidance_targets)
+        self._right_tabs.addTab(targets_widget, "Mesh Targets")
+
+        # Subtab 2: Ratio Check
+        ratio_widget = QWidget()
+        ratio_r_lay = QVBoxLayout(ratio_widget)
+        ratio_r_lay.setContentsMargins(6, 6, 6, 6)
+
+        self._ratio_results_table = QTableWidget()
+        self._ratio_results_table.setColumnCount(4)
+        self._ratio_results_table.setHorizontalHeaderLabels([
+            "Grid Pair", "Refinement Ratio", "Assessment", "Suggested Count"
+        ])
+        self._ratio_results_table.setAlternatingRowColors(True)
+        style_table(self._ratio_results_table)
+        ratio_r_lay.addWidget(self._ratio_results_table)
+
+        self._guidance_ratios = GuidancePanel("Ratio Assessment")
+        ratio_r_lay.addWidget(self._guidance_ratios)
+        self._right_tabs.addTab(ratio_widget, "Ratio Check")
+
+        # Subtab 3: Resource Estimator
+        resource_widget = QWidget()
+        resource_lay = QVBoxLayout(resource_widget)
+        resource_lay.setContentsMargins(6, 6, 6, 6)
+
+        self._resource_table = QTableWidget()
+        self._resource_table.setColumnCount(5)
+        self._resource_table.setHorizontalHeaderLabels([
+            "Grid", "Cells", "Est. Time", "Multiplier", "Est. Memory"
+        ])
+        self._resource_table.setAlternatingRowColors(True)
+        style_table(self._resource_table)
+        resource_lay.addWidget(self._resource_table)
+
+        self._resource_summary = QLabel("")
+        self._resource_summary.setWordWrap(True)
+        self._resource_summary.setStyleSheet(
+            f"color: {DARK_COLORS['accent']}; font-size: 13px; "
+            f"padding: 8px; border: 1px solid {DARK_COLORS['border']}; "
+            f"border-radius: 4px;")
+        resource_lay.addWidget(self._resource_summary)
+        self._right_tabs.addTab(resource_widget, "Resources")
+
+        # Subtab 4: Study Checklist
+        checklist_widget = QWidget()
+        checklist_lay = QVBoxLayout(checklist_widget)
+        checklist_lay.setContentsMargins(6, 6, 6, 6)
+
+        cl_header = QLabel(
+            "<b>Pre-Flight Checklist</b> — Verify before running "
+            "your grid convergence study")
+        cl_header.setWordWrap(True)
+        cl_header.setStyleSheet(
+            f"color: {DARK_COLORS['accent']}; padding: 4px 0;")
+        checklist_lay.addWidget(cl_header)
+
+        cl_scroll = QScrollArea()
+        cl_scroll.setWidgetResizable(True)
+        cl_inner = QWidget()
+        cl_inner_lay = QVBoxLayout(cl_inner)
+        cl_inner_lay.setSpacing(4)
+
+        self._checklist_boxes = {}
+        for category, items in STUDY_CHECKLIST_ITEMS.items():
+            grp = QGroupBox(category)
+            grp_lay = QVBoxLayout(grp)
+            grp_lay.setSpacing(2)
+            for item_text in items:
+                cb = QCheckBox(item_text)
+                cb.setStyleSheet(f"color: {DARK_COLORS['fg']};")
+                grp_lay.addWidget(cb)
+                self._checklist_boxes[item_text] = cb
+            cl_inner_lay.addWidget(grp)
+
+        cl_inner_lay.addStretch()
+        cl_scroll.setWidget(cl_inner)
+        checklist_lay.addWidget(cl_scroll)
+
+        cl_btn_row = QHBoxLayout()
+        btn_check_all = QPushButton("Check All")
+        btn_check_all.clicked.connect(self._check_all_items)
+        btn_uncheck_all = QPushButton("Uncheck All")
+        btn_uncheck_all.clicked.connect(self._uncheck_all_items)
+        self._lbl_checklist_status = QLabel("")
+        cl_btn_row.addWidget(btn_check_all)
+        cl_btn_row.addWidget(btn_uncheck_all)
+        cl_btn_row.addWidget(self._lbl_checklist_status)
+        cl_btn_row.addStretch()
+        checklist_lay.addLayout(cl_btn_row)
+
+        self._right_tabs.addTab(checklist_widget, "Study Checklist")
+
+        # Subtab 5: Quick Reference
+        ref_widget = QWidget()
+        ref_lay = QVBoxLayout(ref_widget)
+        ref_lay.setContentsMargins(6, 6, 6, 6)
+
+        self._ref_text = QTextEdit()
+        self._ref_text.setReadOnly(True)
+        self._ref_text.setHtml(self._build_quick_ref_html())
+        ref_lay.addWidget(self._ref_text)
+
+        self._right_tabs.addTab(ref_widget, "Quick Reference")
+
+        # Splitter proportions
+        splitter.setSizes([400, 650])
+
+    # ------------------------------------------------------------------
+    # MESH TARGET CALCULATOR
+    # ------------------------------------------------------------------
+
+    def _compute_targets(self):
+        """Compute target mesh sizes and display results."""
+        prod_cells = int(self._spn_prod_cells.value())
+        dim = self._cmb_plan_dim.currentData()
+        r = self._spn_target_r.value()
+        n_grids = self._cmb_study_size.currentIndex() + 3  # 3, 4, or 5
+        strategy = self._cmb_strategy.currentData()
+
+        mesh_plan = _plan_mesh_sizes(prod_cells, dim, r, n_grids, strategy)
+
+        self._targets_table.setRowCount(len(mesh_plan))
+        all_ok = True
+        for i, (label, cells, is_prod) in enumerate(mesh_plan):
+            # Compute ratio to next coarser grid
+            if i < len(mesh_plan) - 1:
+                next_cells = mesh_plan[i + 1][1]
+                if next_cells > 0:
+                    ratio = compute_refinement_ratio(cells, next_cells, dim)
+                    ratio_str = f"{ratio:.3f}"
+                    ok = ratio >= 1.3
+                    check_str = "\u2713 Yes" if ok else "\u2717 No"
+                    if not ok:
+                        all_ok = False
+                else:
+                    ratio_str = "N/A"
+                    check_str = "\u2717"
+                    all_ok = False
+            else:
+                ratio_str = "\u2014"
+                check_str = "\u2014"
+
+            role = "PRODUCTION" if is_prod else "Study grid"
+
+            items = [
+                (label, None),
+                (f"{cells:,}", None),
+                (ratio_str, None),
+                (check_str,
+                 DARK_COLORS['green'] if "\u2713" in check_str
+                 else (DARK_COLORS['red'] if "\u2717" in check_str
+                       else None)),
+                (role,
+                 DARK_COLORS['accent'] if is_prod else None),
+            ]
+            for col, (text, color) in enumerate(items):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if color:
+                    item.setForeground(QColor(color))
+                if is_prod:
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                self._targets_table.setItem(i, col, item)
+
+        # Summary guidance
+        total_cells = sum(m[1] for m in mesh_plan)
+        finest_cells = mesh_plan[0][1]
+        if all_ok:
+            self._guidance_targets.set_guidance(
+                f"All refinement ratios meet the r > 1.3 criterion. "
+                f"Total cells across all grids: {total_cells:,}. "
+                f"Finest grid: {finest_cells:,} cells.\n\n"
+                f"This study is ready to proceed.",
+                'green')
+        else:
+            self._guidance_targets.set_guidance(
+                f"Some refinement ratios are below 1.3. Consider "
+                f"increasing the target ratio or adjusting the "
+                f"production mesh cell count.\n\n"
+                f"Total cells: {total_cells:,}. "
+                f"Finest: {finest_cells:,} cells.",
+                'yellow')
+
+        # Store for resource estimator
+        self._last_mesh_plan = mesh_plan
+
+    # ------------------------------------------------------------------
+    # RATIO CHECKER
+    # ------------------------------------------------------------------
+
+    def _add_ratio_grid(self):
+        n = self._tbl_ratio_check.rowCount()
+        if n >= 6:
+            return
+        self._tbl_ratio_check.setRowCount(n + 1)
+        lbl = QTableWidgetItem(f"Grid {n+1}")
+        lbl.setFlags(lbl.flags() & ~Qt.ItemIsEditable)
+        self._tbl_ratio_check.setItem(n, 0, lbl)
+
+    def _rem_ratio_grid(self):
+        n = self._tbl_ratio_check.rowCount()
+        if n <= 2:
+            return
+        self._tbl_ratio_check.setRowCount(n - 1)
+
+    def _check_ratios(self):
+        """Read user-entered cell counts and compute refinement ratios."""
+        dim = self._cmb_plan_dim.currentData()
+        counts = []
+        for i in range(self._tbl_ratio_check.rowCount()):
+            item = self._tbl_ratio_check.item(i, 1)
+            if item and item.text().strip():
+                try:
+                    val = float(item.text().replace(",", ""))
+                    if val > 0 and np.isfinite(val):
+                        counts.append((i, val))
+                except ValueError:
+                    pass
+
+        if len(counts) < 2:
+            self._guidance_ratios.set_guidance(
+                "Enter at least 2 cell counts to check ratios.", 'yellow')
+            return
+
+        # Sort by cell count descending (finest first)
+        counts.sort(key=lambda x: x[1], reverse=True)
+
+        n_pairs = len(counts) - 1
+        self._ratio_results_table.setRowCount(n_pairs)
+        all_ok = True
+        target_r = self._spn_target_r.value()
+
+        for j in range(n_pairs):
+            i_fine, n_fine = counts[j]
+            i_coarse, n_coarse = counts[j + 1]
+            r = compute_refinement_ratio(n_fine, n_coarse, dim)
+
+            pair_label = f"Grid {i_fine+1} \u2192 Grid {i_coarse+1}"
+            r_str = f"{r:.4f}"
+
+            if 1.3 <= r <= 2.0:
+                assess = "\u2713 Ideal"
+                color = DARK_COLORS['green']
+            elif 1.1 <= r < 1.3:
+                assess = "\u26A0 Too close"
+                color = DARK_COLORS['yellow']
+                all_ok = False
+            elif 2.0 < r <= 3.0:
+                assess = "\u26A0 Large gap"
+                color = DARK_COLORS['yellow']
+            elif r > 3.0:
+                assess = "\u2717 Too large"
+                color = DARK_COLORS['red']
+                all_ok = False
+            else:
+                assess = "\u2717 Too small"
+                color = DARK_COLORS['red']
+                all_ok = False
+
+            # Suggested optimal count for the coarser grid
+            suggested = n_fine / (target_r ** dim)
+            sugg_str = f"{suggested:,.0f}"
+
+            for col, (text, clr) in enumerate([
+                (pair_label, None),
+                (r_str, None),
+                (assess, color),
+                (sugg_str, DARK_COLORS['fg_dim']),
+            ]):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if clr:
+                    item.setForeground(QColor(clr))
+                self._ratio_results_table.setItem(j, col, item)
+
+        if all_ok:
+            self._guidance_ratios.set_guidance(
+                "All refinement ratios are in the ideal range "
+                "(1.3 \u2264 r \u2264 2.0).", 'green')
+        else:
+            self._guidance_ratios.set_guidance(
+                "Some ratios are outside the ideal range. See the "
+                "'Suggested Count' column for recommended cell counts.",
+                'yellow')
+
+    # ------------------------------------------------------------------
+    # RESOURCE ESTIMATOR
+    # ------------------------------------------------------------------
+
+    def _estimate_resources(self):
+        """Estimate computational resources for the mesh study."""
+        if not hasattr(self, '_last_mesh_plan') or not self._last_mesh_plan:
+            # Auto-compute targets first
+            self._compute_targets()
+        if not hasattr(self, '_last_mesh_plan') or not self._last_mesh_plan:
+            return
+
+        baseline_time = self._spn_baseline_time.value()
+        scaling = self._cmb_scaling.currentData()
+        plan = self._last_mesh_plan
+        prod_cells = int(self._spn_prod_cells.value())
+
+        self._resource_table.setRowCount(len(plan))
+        total_time = 0.0
+
+        for i, (label, cells, is_prod) in enumerate(plan):
+            ratio = cells / max(prod_cells, 1)
+            if scaling == "linear":
+                time_mult = ratio
+            elif scaling == "n15":
+                time_mult = ratio ** 1.5
+            else:  # n2
+                time_mult = ratio ** 2.0
+
+            est_time = baseline_time * time_mult
+            total_time += est_time
+
+            # Memory estimate: ~1 KB per cell (rough CFD estimate)
+            mem_gb = cells * 1e-6  # ~1 KB/cell = 1e-6 GB/cell
+            if mem_gb < 1.0:
+                mem_str = f"{mem_gb*1000:.0f} MB"
+            else:
+                mem_str = f"{mem_gb:.1f} GB"
+
+            if est_time < 1.0:
+                time_str = f"{est_time*60:.0f} min"
+            else:
+                time_str = f"{est_time:.1f} hours"
+
+            for col, (text, color) in enumerate([
+                (label, DARK_COLORS['accent'] if is_prod else None),
+                (f"{cells:,}", None),
+                (time_str, None),
+                (f"{time_mult:.2f}x", None),
+                (mem_str, None),
+            ]):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                if color:
+                    item.setForeground(QColor(color))
+                if is_prod:
+                    f = item.font()
+                    f.setBold(True)
+                    item.setFont(f)
+                self._resource_table.setItem(i, col, item)
+
+        if total_time < 1.0:
+            total_str = f"{total_time*60:.0f} minutes"
+        else:
+            total_str = f"{total_time:.1f} hours"
+        cost_mult = total_time / max(baseline_time, 0.001)
+
+        self._resource_summary.setText(
+            f"<b>Total estimated study time:</b> {total_str} "
+            f"({cost_mult:.1f}x your single production run)<br>"
+            f"<b>Scaling model:</b> "
+            f"{self._cmb_scaling.currentText()}<br><br>"
+            f"<i>Note: Estimates assume similar convergence rates "
+            f"across all grids. Actual times may vary due to solver "
+            f"behavior, parallel efficiency, and I/O.</i>")
+
+    # ------------------------------------------------------------------
+    # CHECKLIST
+    # ------------------------------------------------------------------
+
+    def _check_all_items(self):
+        for cb in self._checklist_boxes.values():
+            cb.setChecked(True)
+        self._update_checklist_status()
+
+    def _uncheck_all_items(self):
+        for cb in self._checklist_boxes.values():
+            cb.setChecked(False)
+        self._update_checklist_status()
+
+    def _update_checklist_status(self):
+        total = len(self._checklist_boxes)
+        checked = sum(1 for cb in self._checklist_boxes.values()
+                      if cb.isChecked())
+        if checked == total:
+            self._lbl_checklist_status.setText(
+                f"\u2713 All {total} items checked")
+            self._lbl_checklist_status.setStyleSheet(
+                f"color: {DARK_COLORS['green']}; font-weight: bold;")
+        else:
+            self._lbl_checklist_status.setText(
+                f"{checked}/{total} items checked")
+            self._lbl_checklist_status.setStyleSheet(
+                f"color: {DARK_COLORS['fg_dim']};")
+
+    # ------------------------------------------------------------------
+    # QUICK REFERENCE CARD
+    # ------------------------------------------------------------------
+
+    def _build_quick_ref_html(self):
+        c = DARK_COLORS
+        return f"""
+        <html>
+        <head><style>
+            body {{ background-color: {c['bg']}; color: {c['fg']};
+                   font-family: {','.join(FONT_FAMILIES)}; font-size: 12px;
+                   padding: 12px; }}
+            h2 {{ color: {c['accent']}; margin: 16px 0 8px 0; }}
+            h3 {{ color: {c['fg']}; margin: 12px 0 6px 0; }}
+            table {{ border-collapse: collapse; width: 100%;
+                     margin: 8px 0; }}
+            th, td {{ border: 1px solid {c['border']}; padding: 6px 10px;
+                      text-align: left; }}
+            th {{ background-color: {c['bg_alt']}; color: {c['accent']};
+                  font-weight: bold; }}
+            td {{ background-color: {c['bg_widget']}; }}
+            .green {{ color: {c['green']}; }}
+            .yellow {{ color: {c['yellow']}; }}
+            .red {{ color: {c['red']}; }}
+            ul {{ margin: 4px 0 8px 20px; }}
+            li {{ margin: 2px 0; }}
+            .formula {{ background-color: {c['bg_input']};
+                        padding: 8px; border-radius: 4px;
+                        font-family: Consolas, monospace;
+                        margin: 4px 0; }}
+        </style></head>
+        <body>
+
+        <h2>GCI Study Quick Reference</h2>
+
+        <h3>When to Use 2, 3, or 4+ Grids</h3>
+        <table>
+        <tr><th>Grids</th><th>What You Get</th><th>Fs</th>
+            <th>Recommendation</th></tr>
+        <tr><td>2</td>
+            <td>GCI with <i>assumed</i> order</td>
+            <td>3.0</td>
+            <td class="yellow">Minimum viable — not for publication</td></tr>
+        <tr><td>3</td>
+            <td>GCI with <i>computed</i> order + FS method</td>
+            <td>1.25</td>
+            <td class="green">Standard procedure (recommended)</td></tr>
+        <tr><td>4+</td>
+            <td>Cross-checking + LSR method</td>
+            <td>1.25</td>
+            <td class="green">Best practice for critical work</td></tr>
+        </table>
+
+        <h3>Refinement Ratio Guidelines</h3>
+        <table>
+        <tr><th>Ratio</th><th>Assessment</th></tr>
+        <tr><td>r &lt; 1.1</td>
+            <td class="red">Too small — grids too similar, noisy GCI</td></tr>
+        <tr><td>1.1 &le; r &lt; 1.3</td>
+            <td class="yellow">Marginal — may work but not reliable</td></tr>
+        <tr><td>1.3 &le; r &le; 2.0</td>
+            <td class="green">Ideal range (Celik et al. recommend r &gt; 1.3)
+            </td></tr>
+        <tr><td>r &gt; 2.0</td>
+            <td class="yellow">Large gap — acceptable if consistent</td></tr>
+        </table>
+
+        <h3>Common Pitfalls</h3>
+        <ul>
+        <li>Only running 2 grids instead of 3</li>
+        <li>Confusing cell count with mesh spacing (h)</li>
+        <li>Not checking iterative convergence on every grid</li>
+        <li>Using non-systematic refinement (random cell counts)</li>
+        <li>Extracting data at singularities or sharp gradients</li>
+        <li>Different solver settings between grids</li>
+        <li>y+ out of valid range on some grids</li>
+        </ul>
+
+        <h3>Key Formulas</h3>
+        <div class="formula">
+        <b>Representative spacing:</b> h = (1/N)<sup>1/dim</sup><br><br>
+        <b>Refinement ratio:</b> r = h_coarse / h_fine
+            = (N_fine / N_coarse)<sup>1/dim</sup><br><br>
+        <b>Observed order:</b> p = ln((f3-f2)/(f2-f1)) / ln(r)<br><br>
+        <b>Richardson extrapolation:</b>
+            f_exact = f1 + (f1-f2) / (r<sup>p</sup> - 1)<br><br>
+        <b>GCI:</b> GCI = Fs &middot; |e| / (r<sup>p</sup> - 1)<br><br>
+        <b>u_num = GCI &middot; |f1| / Fs = |f1 - f_exact|</b>
+        </div>
+
+        <h3>Standards References</h3>
+        <ul>
+        <li>Celik et al. (2008) J. Fluids Eng. 130(7), 078001</li>
+        <li>Roache (1998) Verification and Validation in CFD</li>
+        <li>ASME V&amp;V 20-2009 (R2021) Section 5.1</li>
+        <li>ITTC 7.5-03-01-01 (2024) CFD Uncertainty Analysis</li>
+        </ul>
+
+        </body></html>
+        """
+
+    # ------------------------------------------------------------------
+    # STATE SERIALIZATION
+    # ------------------------------------------------------------------
+
+    def get_state(self) -> dict:
+        """Serialize planner state for project save."""
+        checklist = {}
+        for text, cb in self._checklist_boxes.items():
+            checklist[text] = cb.isChecked()
+        return {
+            "production_cells": self._spn_prod_cells.value(),
+            "dim": self._cmb_plan_dim.currentData(),
+            "target_r": self._spn_target_r.value(),
+            "study_size_index": self._cmb_study_size.currentIndex(),
+            "strategy_index": self._cmb_strategy.currentIndex(),
+            "baseline_time": self._spn_baseline_time.value(),
+            "scaling_index": self._cmb_scaling.currentIndex(),
+            "checklist": checklist,
+        }
+
+    def set_state(self, state: dict):
+        """Restore planner state from project load."""
+        self._spn_prod_cells.setValue(
+            state.get("production_cells", 1000000))
+        dim = state.get("dim", 3)
+        self._cmb_plan_dim.setCurrentIndex(0 if dim == 3 else 1)
+        self._spn_target_r.setValue(state.get("target_r", 1.5))
+        idx = state.get("study_size_index", 0)
+        if 0 <= idx < self._cmb_study_size.count():
+            self._cmb_study_size.setCurrentIndex(idx)
+        idx = state.get("strategy_index", 0)
+        if 0 <= idx < self._cmb_strategy.count():
+            self._cmb_strategy.setCurrentIndex(idx)
+        self._spn_baseline_time.setValue(
+            state.get("baseline_time", 1.0))
+        idx = state.get("scaling_index", 1)
+        if 0 <= idx < self._cmb_scaling.count():
+            self._cmb_scaling.setCurrentIndex(idx)
+
+        checklist = state.get("checklist", {})
+        for text, cb in self._checklist_boxes.items():
+            cb.setChecked(checklist.get(text, False))
+        self._update_checklist_status()
+
+    def clear_all(self):
+        """Reset planner to defaults."""
+        self._spn_prod_cells.setValue(1000000)
+        self._cmb_plan_dim.setCurrentIndex(0)
+        self._spn_target_r.setValue(1.5)
+        self._cmb_study_size.setCurrentIndex(0)
+        self._cmb_strategy.setCurrentIndex(0)
+        self._spn_baseline_time.setValue(1.0)
+        self._cmb_scaling.setCurrentIndex(1)
+        self._targets_table.setRowCount(0)
+        self._ratio_results_table.setRowCount(0)
+        self._resource_table.setRowCount(0)
+        self._resource_summary.clear()
+        self._guidance_targets.set_guidance("", 'green')
+        self._guidance_ratios.set_guidance("", 'green')
+        for cb in self._checklist_boxes.values():
+            cb.setChecked(False)
+        self._update_checklist_status()
 
 
 class GCIReportGenerator:
@@ -8103,10 +10649,12 @@ class GCIMainWindow(QMainWindow):
 
         self._tab_calc = GCICalculatorTab()
         self._tab_spatial = SpatialGCITab()
+        self._tab_planner = MeshStudyPlannerTab()
         self._tab_ref = GCIReferenceTab()
 
         self._tabs.addTab(self._tab_calc, "\U0001F4CA GCI Calculator")
         self._tabs.addTab(self._tab_spatial, "\U0001F30D Spatial GCI")
+        self._tabs.addTab(self._tab_planner, "\U0001F4D0 Study Planner")
         self._tabs.addTab(self._tab_ref, "\U0001F4D6 Reference")
 
         # Menu bar
@@ -8318,6 +10866,7 @@ class GCIMainWindow(QMainWindow):
         if reply == QMessageBox.Yes:
             self._tab_calc.clear_all()
             self._tab_spatial.clear_all()
+            self._tab_planner.clear_all()
             self.set_project_metadata({})
             self._project_path = None
             self._update_title()
@@ -8346,6 +10895,8 @@ class GCIMainWindow(QMainWindow):
             self._tab_calc.set_state(state)
             if "spatial" in state:
                 self._tab_spatial.set_state(state["spatial"])
+            if "planner" in state:
+                self._tab_planner.set_state(state["planner"])
             if "project_metadata" in state:
                 self.set_project_metadata(state["project_metadata"])
         except Exception as exc:
@@ -8378,6 +10929,7 @@ class GCIMainWindow(QMainWindow):
         """Perform the actual save to file."""
         state = self._tab_calc.get_state()
         state["spatial"] = self._tab_spatial.get_state()
+        state["planner"] = self._tab_planner.get_state()
         state["project_metadata"] = self.get_project_metadata()
         state["saved_at"] = datetime.datetime.now().isoformat()
 
@@ -8724,6 +11276,25 @@ class GCIMainWindow(QMainWindow):
 # =============================================================================
 
 def main():
+    import traceback as _tb
+
+    def _global_exception_handler(exc_type, exc_value, exc_traceback):
+        """Show unhandled exceptions in a dialog instead of crashing silently."""
+        error_text = "".join(
+            _tb.format_exception(exc_type, exc_value, exc_traceback))
+        try:
+            QMessageBox.critical(
+                None, f"{APP_NAME} v{APP_VERSION} — Unexpected Error",
+                f"An unexpected error occurred:\n\n"
+                f"{exc_value}\n\n"
+                f"Please report this issue with the details below:\n\n"
+                f"{error_text[:1500]}"
+            )
+        except Exception:
+            pass  # If GUI is dead, don't compound the problem
+
+    sys.excepthook = _global_exception_handler
+
     app = QApplication(sys.argv)
     app.setStyleSheet(get_dark_stylesheet())
     app.setStyle("Fusion")

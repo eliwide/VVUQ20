@@ -1,4 +1,4 @@
-# GCI Calculator v1.4.0 — User Guide & Technical Reference
+# GCI Calculator v1.5.0 — User Guide & Technical Reference
 
 **Grid Convergence Index Tool per Celik et al. (2008), Roache (1998), Xing & Stern (2010), and Eca & Hoekstra (2014)**
 
@@ -6,7 +6,20 @@
 
 ---
 
-## Revision Update (v1.4.0)
+## Revision Update (v1.5.0)
+
+- New **Study Planner** tab (`📐 Study Planner`) for planning grid convergence studies before running them.
+  - **Target Mesh Calculator** — enter your production mesh and get recommended cell counts for a 3/4/5-grid study.
+  - **Refinement Ratio Checker** — enter existing cell counts and verify the refinement ratios are suitable.
+  - **Resource Estimator** — estimate wall-clock time and memory for the planned study.
+  - **Study Checklist** — pre-run checklist covering mesh generation, solver settings, data extraction, and study design.
+  - **Quick Reference** — inline reference card for GCI study design.
+- New **Scheme Order Preset** combo box on both GCI Calculator and Spatial GCI tabs — select your CFD scheme (first-order upwind, second-order, third-order MUSCL/WENO, fourth-order spectral/DG) and the theoretical order is set automatically. A "Custom" option allows free entry.
+- New **Carry-Over Summary** subtab on both GCI Calculator and Spatial GCI tabs — shows exactly what values to carry into the Uncertainty Aggregator with distribution, DOF, sigma basis, and convergence status for each quantity.
+- Enhanced **divergent convergence advice** — guidance panels now classify divergent spread as SMALL/MODERATE/LARGE and provide CFD-solver-specific root causes plus a documented escalation path.
+- **Input validation hardening** — NaN/Inf detection, identical-solution checks, non-positive cell count guards, and a global exception handler for unhandled errors.
+
+### Previous Revision (v1.4.0)
 
 - Added **Decision Consequence** in the Project Info bar (`Low`, `Medium`, `High`).
 - HTML report now includes:
@@ -60,11 +73,14 @@
 22. [Built-In Example Datasets](#22-built-in-example-datasets)
 23. [Exporting Results](#23-exporting-results)
 24. [How to Use u_num in the Uncertainty Aggregator](#24-how-to-use-u_num-in-the-uncertainty-aggregator)
-25. [Tips for Getting a Good Grid Study](#25-tips-for-getting-a-good-grid-study)
-26. [Key Formulas Reference](#26-key-formulas-reference)
-27. [Standards References](#27-standards-references)
-28. [Glossary](#28-glossary)
-29. [Frequently Asked Questions](#29-frequently-asked-questions)
+25. [Scheme Order Presets](#25-scheme-order-presets)
+26. [Carry-Over Summary](#26-carry-over-summary)
+27. [Study Planner Tab](#27-study-planner-tab)
+28. [Tips for Getting a Good Grid Study](#28-tips-for-getting-a-good-grid-study)
+29. [Key Formulas Reference](#29-key-formulas-reference)
+30. [Standards References](#30-standards-references)
+31. [Glossary](#31-glossary)
+32. [Frequently Asked Questions](#32-frequently-asked-questions)
 
 ---
 
@@ -119,7 +135,7 @@ Because "finest" doesn't mean "fine enough." Your 5-million-cell mesh might stil
 |-------|-------------|---------------|----------------|
 | **2** | GCI with *assumed* order of accuracy. Cannot compute the observed order — you must assume it equals the theoretical order of your numerical scheme. | Fs = 3.0 (conservative) | **Minimum viable.** Quick estimate. Not recommended for certification or publication because you can't verify your assumption. |
 | **3** | GCI with *computed* observed order of accuracy. Can verify the grids are in the asymptotic range. Can perform the full Celik et al. procedure. Also enables the **Factor of Safety (FS)** alternative method (see [Section 20](#20-alternative-uncertainty-methods-fs-and-lsr)). | Fs = 1.25 (standard) | **Standard procedure.** This is what Celik et al. (2008) recommends and what most journals require. Use this for any formal work. |
-| **4+** | Same as 3-grid for the primary GCI (uses finest 3 grids), plus one extra triplet for cross-checking. Also enables the **Least Squares Root (LSR)** method (see [Section 20](#20-alternative-uncertainty-methods-fs-and-lsr)), which fits power-law models to all grids simultaneously. | Fs = 1.25 | **Good practice / best practice.** More grids give you consistency checks AND allow more sophisticated uncertainty methods. 4 grids is the minimum for LSR. |
+| **4+** | Primary GCI uses the finest 3 grids, plus additional triplets for cross-checking. If the finest-3 triplet is divergent, the tool **automatically evaluates all grid combinations** and selects the best monotonically-converging triplet (auto-triplet reselection). Also enables the **Least Squares Root (LSR)** method (see [Section 20](#20-alternative-uncertainty-methods-fs-and-lsr)), which fits power-law models to all grids simultaneously. | Fs = 1.25 | **Good practice / best practice.** More grids give you consistency checks, allow more sophisticated uncertainty methods, and provide a fallback if the finest triplet diverges. 4 grids is the minimum for LSR. |
 | **5-6** | Multiple cross-checking triplets. Very high confidence in the result. All three methods (GCI, FS, LSR) available for comparison. | Fs = 1.25 | **Best practice for safety-critical work.** Multiple independent GCI estimates and cross-method comparison should converge on the same answer. |
 
 ### What if I Only Have 2 Grids?
@@ -135,12 +151,14 @@ You can still get a GCI, but with important caveats:
 
 ### What if I Have More Than 3 Grids?
 
-Great — use them all. The tool accepts up to 6+ grids. The primary GCI is always computed from the finest 3 grids (because that's where the answer is most accurate), but the additional grids provide cross-checking:
+Great — use them all. The tool accepts up to 6+ grids. The primary GCI is computed from the finest 3 grids (because that's where the answer is most accurate), but the additional grids provide cross-checking and a safety net:
 
 - Each consecutive triplet (grids 1-2-3, grids 2-3-4, grids 3-4-5, etc.) produces its own observed order and convergence ratio
 - These are shown in the results under "Additional grid triplets"
 - If they all agree, your result is very robust
 - If they disagree, the coarser grids may not be in the asymptotic range (which is expected)
+
+**Auto-triplet reselection:** If the primary triplet (finest 3 grids) shows divergent convergence and you have 4+ grids, the tool automatically evaluates **all** C(N,3) combinations of your grids. It scores each for monotonic convergence, refinement ratio quality, inclusion of the production grid, and inclusion of the finest grid, then selects the best valid triplet. The results clearly indicate which grids were used and why the primary triplet was bypassed. This prevents the common frustration of getting "divergent — GCI not available" when a valid answer exists among other grid combinations.
 
 ---
 
@@ -152,7 +170,7 @@ Great — use them all. The tool accepts up to 6+ grids. The primary GCI is alwa
 | **2 grids** | **Used, but assumed** | RE requires knowing the order of accuracy p. With only 2 grids, p is underdetermined — you assume p = theoretical order and accept a larger safety factor. |
 | **Oscillatory convergence (-1 < R < 0)** | **No** | When solutions oscillate between grid levels (with damping oscillations), RE is unreliable. The GCI is computed from the oscillation range with a conservative Fs = 3.0. |
 | **Divergent convergence (R >= 1 or R <= -1)** | **No** | If the solution diverges with refinement, or oscillations are growing (R <= -1), GCI is invalid entirely. Fix your simulation first. |
-| **Grid-independent** | **Not needed** | If all grids give the same answer, numerical uncertainty is zero. |
+| **Grid-independent** | **Not needed** | If all grids give the same answer, numerical uncertainty is zero (exact case) or spread/2 (effective case where spread < 0.1% of mean — see [Section 12](#12-convergence-types-explained)). |
 
 ---
 
@@ -177,12 +195,13 @@ At the top of the window is a collapsible **Project Info** bar (click "▶ Proje
 
 These fields are saved with the `.gci` project file and included in HTML reports.
 
-Below the project bar, the application has **three tabs**:
+Below the project bar, the application has **four tabs**:
 
 | Tab | Icon | Purpose |
 |-----|------|---------|
 | **GCI Calculator** | 📊 | Single-point GCI calculation — input data, compute, see results |
 | **Spatial GCI** | 🌍 | Field/spatial GCI — point-by-point analysis over surface maps |
+| **Study Planner** | 📐 | Plan your grid convergence study — target mesh sizes, ratio checks, resource estimates, pre-run checklist |
 | **Reference** | 📖 | Built-in documentation covering the entire GCI procedure |
 
 ### Calculator Tab Layout
@@ -190,7 +209,7 @@ Below the project bar, the application has **three tabs**:
 The Calculator tab is split into two panels:
 
 **Left panel — Input:**
-- Grid Study Setup (number of grids, dimensions, theoretical order, safety factor, production grid)
+- Grid Study Setup (number of grids, dimensions, scheme order preset, theoretical order, safety factor, production grid)
 - Grid Data Table (cell counts and solution values)
 - Quantity management buttons (+ Add Quantity, - Remove Last, Paste from Clipboard)
 - Quantity Properties (unit labels per quantity)
@@ -198,11 +217,12 @@ The Calculator tab is split into two panels:
 - Three guidance panels (Convergence, Order, Asymptotic Range)
 
 **Right panel — Results (sub-tabs):**
-The right panel is organized into four sub-tabs:
+The right panel is organized into five sub-tabs:
 - **Results** — Full results text (monospace, copy-ready), including Method Comparison (new in v1.3)
 - **Summary Table** — GCI Results Summary table (color-coded)
 - **Convergence Plot** — Convergence plot with Richardson extrapolation and GCI band
 - **Report Statements** *(new in v1.3)* — Copy-pasteable regulatory paragraphs for V&V reports (see [Section 19](#19-report-statements))
+- **Carry-Over Summary** *(new in v1.5.0)* — Table of values to carry into the Uncertainty Aggregator, with distribution, DOF, sigma basis, and convergence status per quantity (see [Section 26](#26-carry-over-summary))
 
 ### Resizable and Auto-Width Table Columns
 
@@ -239,7 +259,8 @@ The window title shows the current project file name (e.g., "GCI Calculator — 
 |---------|---------------|----------|
 | **Number of grids** | 2–6 (default: 3) | Use 3 unless you have a good reason not to |
 | **Dimensions** | 2D or 3D | Match your CFD problem — affects how cell count converts to representative spacing |
-| **Theoretical order** | 1.0–4.0 (default: 2.0) | The formal order of your numerical scheme. Most CFD codes are 2nd-order. 1st-order upwind = 1.0. High-order DG = 3.0 or 4.0. |
+| **Scheme order preset** *(new in v1.5.0)* | Dropdown | Select your CFD scheme — "Second-order (most CFD codes)", "First-order upwind", "Third-order (MUSCL, WENO-3)", "Fourth-order (spectral, high-order DG)", or "Custom" for free entry. This sets the theoretical order automatically. |
+| **Theoretical order** | 1.0–4.0 (default: 2.0) | The formal order of your numerical scheme. Set automatically by the scheme preset, or enter manually (combo switches to "Custom"). |
 | **Safety factor Fs** | Auto (recommended) or 1.0–5.0 | Auto picks Fs = 1.25 for 3-grid monotonic, Fs = 3.0 for 2-grid or oscillatory. Only override if you have a specific requirement. |
 | **Production grid** | Grid 1 (default) to Grid N | Which grid is your production mesh — the one you use for actual analysis. Default is Grid 1 (finest). Change this if your production mesh is coarser. See [Section 8](#8-production-grid-selection). |
 | **Reference scale** *(new in v1.2)* | Auto (default) or a positive number | A characteristic scale value used to compute relative errors. Default "Auto" uses the fine-grid solution magnitude |f1|. Set this manually when your solution is near zero (e.g., a temperature difference that is close to 0). Near-zero solutions cause relative errors to blow up (division by a tiny number), producing misleading GCI percentages. Entering a physically meaningful reference scale (e.g., the overall temperature range, a freestream velocity, or a characteristic dimension) stabilizes the relative error calculation. |
@@ -273,6 +294,7 @@ The blue **Compute GCI** button runs the calculation.
 - Check the **reviewer checklist** — quick pass/fail assessment of your study quality
 - Check the **convergence plot** — visually confirm the grids are converging. For 3+ grids with monotonic convergence, the log-log subplot shows the order of accuracy visually
 - Check the **Report Statements** tab *(new in v1.3)* — copy-pasteable regulatory paragraphs for your V&V report. See [Section 19](#19-report-statements).
+- Check the **Carry-Over Summary** tab *(new in v1.5.0)* — a compact table showing exactly what to enter in the Uncertainty Aggregator for each quantity, including distribution, DOF, and convergence status. See [Section 26](#26-carry-over-summary).
 
 ### Step 5: Save Your Study
 
@@ -635,9 +657,11 @@ When you run a CFD case on 3 grids, the solutions fall into one of four converge
 | -1 < R < 0 | **Oscillatory** | The solution oscillates — grid 2 is on one side of the true answer, grid 1 is on the other side. Oscillations are damping with refinement. | **Yes, with caution** — uses oscillation range + Fs = 3.0 |
 | R <= -1 | **Divergent (oscillatory)** | The solution oscillates AND the oscillations are growing or not damping with refinement. This is classified as divergent because the oscillatory GCI procedure is unreliable when oscillations amplify. *(Updated in v1.2)* | **No** — GCI cannot be computed |
 | R >= 1 | **Divergent** | The solution gets *worse* with refinement. Something is wrong. | **No** — GCI cannot be computed |
-| R ≈ 0 (both e21 ≈ 0 AND e32 ≈ 0) | **Grid-independent** | All grids give essentially the same answer. Numerical uncertainty is zero (or negligible). Both consecutive differences must be near zero. *(Tightened in v1.2 — see note below)* | **Yes** — u_num ≈ 0 |
+| R ≈ 0 (both e21 ≈ 0 AND e32 ≈ 0) | **Grid-independent** | All grids give essentially the same answer. Numerical uncertainty is zero (or negligible). Both consecutive differences must be near zero. *(Tightened in v1.2, extended in v1.5.0 — see notes below)* | **Yes** — u_num ≈ 0 or u_num = spread/2 |
 
 **Grid-independent classification (v1.2 fix):** In previous versions, the tool could classify a triplet as "grid-independent" if only e32 (the coarse-pair difference) was near zero, even when e21 (the fine-pair difference) was large. This was a false positive — it indicated that the two coarser grids happened to agree, not that the solution was truly grid-independent. Starting in v1.2, the tool requires **both** |e21| ≈ 0 **and** |e32| ≈ 0 to classify a result as grid-independent. If only e32 ≈ 0 but e21 is significant, the result is classified as **divergent** because the fine grid departs from the coarser grids that have stalled.
+
+**Effective grid-independence threshold (v1.5.0):** In addition to the strict "both errors near machine-zero" check above, the tool now has an **effective grid-independence** gate. If the total spread across the three finest grid solutions is less than 0.1% of the mean solution value, the result is classified as grid-independent even though the individual errors may not be exactly zero. In this case, u_num is set conservatively to **spread / 2** (half the total spread) rather than zero, providing a small but nonzero uncertainty bound. This handles the practical scenario where all grids agree to within a tiny fraction of a percent — formally the convergence ratio might classify as oscillatory or even divergent due to noise, but the actual numerical uncertainty is negligible.
 
 ### What Causes Each Type
 
@@ -666,7 +690,16 @@ When you run a CFD case on 3 grids, the solutions fall into one of four converge
 
 ### What To Do When You Get Divergent Convergence
 
-If the GCI Calculator classifies your result as divergent, **do not try to force a numerical uncertainty value**. Divergent convergence means the Richardson extrapolation assumptions are violated and GCI is mathematically invalid. Instead, follow this remediation checklist:
+If the GCI Calculator classifies your result as divergent, **do not try to force a numerical uncertainty value**. Divergent convergence means the Richardson extrapolation assumptions are violated and GCI is mathematically invalid.
+
+*(Enhanced in v1.5.0)* The guidance panel now classifies the severity of divergence based on the spread across grid solutions:
+- **SMALL spread** (<2% of mean) — may be near the boundary between convergent and divergent; small adjustments may resolve it.
+- **MODERATE spread** (2–10%) — genuine divergence is likely; systematic investigation is needed.
+- **LARGE spread** (>10%) — strong divergence; fundamental issues with the setup are probable.
+
+The panel also lists CFD-solver-specific root causes (iterative convergence, y+ mismatch, first-order boundary gradients, mesh quality degradation, extraction point location) and an escalation path for cases where you must proceed with a documented conservative estimate.
+
+Follow this remediation checklist:
 
 **Step 1 — Verify iterative convergence on every grid.**
 Check that solver residuals have dropped at least 3-4 orders of magnitude on each grid level. A fine-grid solution that is only partially converged can appear worse than a fully-converged coarse-grid result, producing false divergence.
@@ -712,8 +745,10 @@ x, y, [z], f_grid1, f_grid2, f_grid3
 ```
 This is the simplest mode. You handle interpolation externally (e.g., in your post-processor).
 
+> **Tip:** Always include a header row for 3D datasets. Without headers, a 6-column file is ambiguous (is it 2D with 4 grids, or 3D with 3 grids?). The parser uses a range-based heuristic to guess, but adding a header row with coordinate names (e.g., `x, y, z, fine, medium, coarse`) removes all ambiguity.
+
 **2. Separate CSV files per grid**
-One CSV per grid with columns `x, y, [z], value`. Points are automatically interpolated onto the finest grid using inverse-distance-weighted (IDW) interpolation.
+One CSV per grid with columns `x, y, [z], value` (exactly 3 columns for 2D or 4 columns for 3D). Files with extra columns beyond the single value field are rejected. Points are automatically interpolated onto the finest grid using inverse-distance-weighted (IDW) interpolation.
 
 **3. Separate Fluent .prof files**
 One Fluent profile export per grid. Interpolation is handled automatically. *(New in v1.3:)* Multi-surface .prof files are now supported — if Fluent exports a .prof file containing multiple surface definitions (e.g., `upper-lipskin` and `lower-lipskin`), the parser automatically combines all surfaces into a single merged dataset. This is transparent; no special user action is needed.
@@ -1319,7 +1354,138 @@ Once you have u_num from the GCI Calculator, here's exactly how to enter it into
 
 ---
 
-## 25. Tips for Getting a Good Grid Study
+## 25. Scheme Order Presets
+
+*(New in v1.5.0)*
+
+The **Scheme order preset** dropdown (on both the GCI Calculator and Spatial GCI tabs) lets you quickly set the theoretical order of accuracy based on your CFD scheme, rather than remembering the number.
+
+| Preset | Theoretical Order | Typical Use |
+|--------|-------------------|-------------|
+| **Second-order (most CFD codes)** | 2.0 | Default. Covers most commercial and open-source finite-volume codes with second-order spatial discretization. |
+| **First-order upwind** | 1.0 | First-order upwind schemes. Rare in production, but used for initial convergence or comparison. |
+| **Third-order (MUSCL, WENO-3)** | 3.0 | Third-order MUSCL reconstruction or WENO-3 schemes. |
+| **Fourth-order (spectral, high-order DG)** | 4.0 | Spectral element methods, high-order Discontinuous Galerkin (DG), or 4th-order finite differences. |
+| **Custom** | (user-specified) | Select this if your scheme order is not in the list, then type the value directly in the spinbox. |
+
+**How it works:**
+- Selecting a preset automatically sets the theoretical order spinbox to the corresponding value.
+- Manually editing the spinbox value to a non-preset number automatically switches the dropdown to "Custom."
+- The preset selection is saved and restored with the `.gci` project file.
+
+---
+
+## 26. Carry-Over Summary
+
+*(New in v1.5.0)*
+
+The **Carry-Over Summary** subtab appears on both the GCI Calculator and Spatial GCI result panels. Its purpose is to show, in one compact table, exactly what values to enter into the Uncertainty Aggregator for each quantity of interest.
+
+### GCI Calculator Tab — Carry-Over Summary
+
+After computing GCI, switch to the **Carry-Over Summary** subtab in the right panel. The table has one row per quantity with these columns:
+
+| Column | Meaning |
+|--------|---------|
+| **Quantity** | Name of the quantity of interest |
+| **u_num** | The numerical uncertainty value (1-sigma) to carry forward |
+| **Unit** | Physical unit of the quantity |
+| **Distribution** | Normal (standard for GCI-derived uncertainty) |
+| **DOF** | Degrees of freedom — ∞ (conservative, per V&V 20) |
+| **Sigma Basis** | Whether the 1-sigma value is confirmed (monotonic/grid-independent) or conservative (oscillatory) |
+| **Convergence** | Convergence type (Monotonic, Oscillatory, Divergent, Grid-Independent) |
+| **Status** | Traffic-light indicator — green (ready to carry), yellow (carry with caution), red (do not carry) |
+
+**Color coding:**
+- **Green** rows (Monotonic, Grid-Independent) — u_num is reliable, carry directly.
+- **Yellow** rows (Oscillatory) — u_num is conservative, carry with a note in your report.
+- **Red** rows (Divergent) — u_num cannot be computed; fix the study first.
+
+Use the **Copy All** button to copy the entire table to clipboard in tab-separated format.
+
+### Spatial GCI Tab — Carry-Over Summary
+
+The Spatial GCI carry-over table shows the recommended value (95th percentile of the spatial u_num field) along with the mean and maximum for reference. It includes point count, divergent fraction, and convergence breakdown metadata.
+
+---
+
+## 27. Study Planner Tab
+
+*(New in v1.5.0)*
+
+The **Study Planner** tab (`📐 Study Planner`) helps you plan a grid convergence study *before* you start generating meshes and running simulations. It answers the practical question: "Given my production mesh, what other meshes do I need?"
+
+### Layout
+
+The tab is split into a left input panel and a right results panel with five subtabs.
+
+### Left Panel — Input Sections
+
+**Section A: Target Mesh Calculator**
+
+| Input | Purpose | Default |
+|-------|---------|---------|
+| **Production cell count** | Total cells in your current (production) mesh | — |
+| **Dimensions** | 2D or 3D — affects how cell count maps to refinement ratio | 3D |
+| **Target refinement ratio** | The desired ratio between consecutive grid levels | 1.5 |
+| **Study size** | Number of grids (3, 4, or 5) | 3 |
+| **Strategy** | Where the production mesh sits in the study | Coarsen from production |
+
+**Strategy options:**
+- **Refine from production** — production mesh is the coarsest; the tool computes finer grids above it.
+- **Coarsen from production** — production mesh is the finest; the tool computes coarser grids below it. (Most common.)
+- **Middle (production is mid-level)** — production mesh is in the middle; grids are placed above and below.
+
+Click **Compute Target Meshes** to populate the Mesh Targets subtab.
+
+**Section B: Refinement Ratio Checker**
+
+Enter 2–6 cell counts (from existing meshes you already have) and click **Check Ratios** to see whether the actual refinement ratios are suitable for a GCI study.
+
+- **Green** (1.3 ≤ r ≤ 2.0) — good ratio.
+- **Yellow** (marginally outside range) — usable but not ideal.
+- **Red** (r < 1.1 or r > 3.0) — problematic; consider regenerating meshes.
+
+**Section C: Resource Estimator**
+
+| Input | Purpose |
+|-------|---------|
+| **Baseline wall-clock time** | How long your production mesh takes to run (hours) |
+| **Baseline cell count** | Cell count for that timing |
+| **Scaling model** | Linear, N^1.5, or N^2 — how runtime scales with cell count |
+
+Click **Estimate Resources** to see per-grid time estimates and total study cost.
+
+### Right Panel — Result Subtabs
+
+1. **Mesh Targets** — Table of planned grid levels with cell counts, refinement ratios, and pass/fail assessment. Includes a guidance panel with study-specific recommendations.
+
+2. **Ratio Check** — Detailed ratio analysis for user-entered cell counts.
+
+3. **Resources** — Per-grid estimated wall-clock time, total study time, and guidance.
+
+4. **Study Checklist** — Grouped checkboxes covering four categories:
+   - *Mesh Generation* — consistent topology, quality metrics, refinement approach, boundary layer, feature resolution.
+   - *Solver Settings* — identical settings across grids, convergence criteria, boundary conditions, turbulence model, time stepping.
+   - *Data Extraction* — consistent extraction locations, format documentation, integral quantities, interpolation method, units.
+   - *Study Design* — at least 3 grids, adequate ratios, documented procedure, result recording plan, budget for extra grids.
+
+   Checklist state is saved with the `.gci` project file. Use "Check All" / "Uncheck All" buttons for bulk operations.
+
+5. **Quick Reference** — Read-only HTML reference card covering when to use 2/3/4+ grids, refinement ratio guidelines, common pitfalls, and key formulas.
+
+### Typical Workflow
+
+1. Open the **Study Planner** tab before starting your grid study.
+2. Enter your production mesh cell count and choose your strategy.
+3. Review the target cell counts and verify the refinement ratios are achievable.
+4. Check the resource estimate to confirm the study is within your budget.
+5. Work through the pre-run checklist.
+6. Generate your meshes, run the simulations, then switch to the **GCI Calculator** or **Spatial GCI** tab to compute the GCI.
+
+---
+
+## 28. Tips for Getting a Good Grid Study
 
 ### Grid Generation
 
@@ -1342,7 +1508,7 @@ Once you have u_num from the GCI Calculator, here's exactly how to enter it into
 
 ---
 
-## 26. Key Formulas Reference
+## 29. Key Formulas Reference
 
 ### Representative Cell Size
 ```
@@ -1420,7 +1586,7 @@ u_base = FS_LSR * |f1 - phi_0| / 2; u_num_LSR = sqrt(u_base^2 + std_model^2).
 
 ---
 
-## 27. Standards References
+## 30. Standards References
 
 | Standard | Full Title | What This Tool Uses It For |
 |----------|-----------|---------------------------|
@@ -1436,7 +1602,7 @@ u_base = FS_LSR * |f1 - phi_0| / 2; u_num_LSR = sqrt(u_base^2 + std_model^2).
 
 ---
 
-## 28. Glossary
+## 31. Glossary
 
 | Term | Plain English Definition |
 |------|------------------------|
@@ -1460,7 +1626,7 @@ u_base = FS_LSR * |f1 - phi_0| / 2; u_num_LSR = sqrt(u_base^2 + std_model^2).
 | **Oscillatory Convergence** | Solutions oscillate between grid levels with damping oscillations (-1 < R < 0). GCI uses a conservative bounding approach |
 | **Oscillatory Divergence** | Solutions oscillate between grid levels with growing oscillations (R <= -1). Classified as divergent — GCI is invalid |
 | **Divergent Convergence** | Solutions get worse with refinement (R >= 1 or R <= -1). GCI is invalid — fix the simulation |
-| **Grid-Independent** | All grids give the same answer (both e21 and e32 near zero). Numerical uncertainty is essentially zero |
+| **Grid-Independent** | All grids give essentially the same answer. Two sub-cases: *exact* (both e21 and e32 near machine-zero, u_num = 0) and *effective* (spread < 0.1% of mean, u_num = spread/2). See [Section 12](#12-convergence-types-explained) |
 | **Reference Scale** | A characteristic value used for relative error calculation. Set manually for near-zero solutions to avoid division-by-small-number issues |
 | **Farthest Point Sampling (FPS)** | A greedy maximin algorithm that selects approximately equally spaced points from a point cloud by iteratively picking the point farthest from all previously selected points |
 | **Cell Count (N)** | Total number of computational cells in a mesh |
@@ -1479,7 +1645,7 @@ u_base = FS_LSR * |f1 - phi_0| / 2; u_num_LSR = sqrt(u_base^2 + std_model^2).
 
 ---
 
-## 29. Frequently Asked Questions
+## 32. Frequently Asked Questions
 
 ### Q: My GCI calculation shows "divergent" — what's wrong?
 
@@ -1597,7 +1763,7 @@ For integral quantities (average temperature, total force, mass flow rate), sing
 
 ### Q: What format does the pre-interpolated CSV need?
 
-**A:** A simple CSV with columns: `x, y, [z], f_grid1, f_grid2, f_grid3, ...` where the first 2-3 columns are coordinates and the remaining columns are solution values from each grid level (finest first). Header row is optional but recommended. All grids must share the same point locations. Example:
+**A:** A simple CSV with columns: `x, y, [z], f_grid1, f_grid2, f_grid3, ...` where the first 2-3 columns are coordinates and the remaining columns are solution values from each grid level (finest first). All grids must share the same point locations. **A header row is strongly recommended**, especially for 3D data — without headers, a 6-column file is ambiguous (2D + 4 grids vs. 3D + 3 grids) and the parser must rely on a heuristic. Example:
 ```
 x, y, fine, medium, coarse
 0.0, 0.0, 423.15, 423.49, 424.51
@@ -1643,8 +1809,20 @@ See [Section 21](#21-method-comparison) for interpretation guidance.
 
 **A:** Oscillatory divergence occurs when the convergence ratio R is less than or equal to -1 (R <= -1). This means the solution oscillates between grid levels (the sign of the change alternates), **and** the oscillations are growing or staying the same magnitude with refinement rather than damping out. In v1.2, this is classified as **divergent** rather than oscillatory because the standard oscillatory GCI procedure (which bounds the oscillation range) assumes the oscillations are damping. When oscillations grow, that bounding approach underestimates the true uncertainty. Common causes include severe odd/even pressure-velocity decoupling, grids that are all too coarse for the asymptotic range, and solver instabilities that interact with the mesh. If you see oscillatory divergence, the recommended action is the same as for standard divergence: investigate mesh quality, solver convergence, and boundary conditions before attempting a GCI study.
 
+### Q: What is the Study Planner tab for?
+
+**A:** The Study Planner *(new in v1.5.0)* helps you plan your grid convergence study before you start generating meshes. Enter your production mesh cell count and it computes target cell counts for a 3-, 4-, or 5-grid study with the desired refinement ratio. It also includes a ratio checker for existing meshes, a resource estimator, and a pre-run checklist. See [Section 27](#27-study-planner-tab).
+
+### Q: What is the Carry-Over Summary tab?
+
+**A:** The Carry-Over Summary *(new in v1.5.0)* is a subtab on both the GCI Calculator and Spatial GCI tabs that shows exactly what values to enter into the Uncertainty Aggregator. Instead of reading through the full results text, you get a compact table with u_num, distribution (Normal), DOF (∞), sigma basis, and a traffic-light status for each quantity. See [Section 26](#26-carry-over-summary).
+
+### Q: How do I set the theoretical order for a high-order scheme?
+
+**A:** Use the **Scheme order preset** dropdown *(new in v1.5.0)* on the GCI Calculator or Spatial GCI tab. Select "Fourth-order (spectral, high-order DG)" for 4th-order schemes, or "Custom" to enter any value manually. See [Section 25](#25-scheme-order-presets).
+
 ---
 
-*GCI Calculator v1.4.0 — Compute defensible numerical uncertainty for your CFD grid convergence studies.*
+*GCI Calculator v1.5.0 — Compute defensible numerical uncertainty for your CFD grid convergence studies.*
 
 *Standards: Celik et al. (2008) JFE 130(7), Roache (1998), Xing & Stern (2010) JFE 132(6), Eca & Hoekstra (2014a) JCP 262, Eca & Hoekstra (2014b) IJNMF 75, ASME V&V 20-2009 Section 5.1*
