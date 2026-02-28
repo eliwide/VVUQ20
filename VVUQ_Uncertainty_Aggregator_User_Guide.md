@@ -21,6 +21,11 @@
 - Distribution auto-fit now uses **automatic GOF runtime guardrails**:
   - sparse datasets use KS screening automatically,
   - larger datasets use adaptive bootstrap sample counts.
+- **One-sided validation criterion** now correctly implemented: `Ē ≥ -U_val` (positive Ē always passes as conservative). Previously, the validation check always used the two-sided `|Ē| ≤ U_val` criterion regardless of the one-sided setting.
+- **Per-location validation**: Validate at each measurement location independently instead of pooling. Reports "Validated at N/M locations" with spatial breakdown. See per-location table on Tab 1 and per-location findings on Tab 4.
+- **Pooling default changed to OFF**: Per-location validation is now the default. Enable pooling explicitly in Tab 3 only when justified.
+- **Source scope** field added to uncertainty sources: "Global" (same at all locations) or "Per-location" (varies by T/C).
+- **Collapsible advanced sections** across all tools: Correlation groups, uncertainty classification, and other advanced settings are now behind expandable sections to reduce UI clutter.
 
 ### Quick Example (Multivariate Supplement)
 
@@ -28,9 +33,18 @@
 2. In **Tab 3**, set **Validation metric mode** to `Multivariate supplement (covariance-aware)`.
 3. Compute RSS.
 4. In **Tab 4**, review both:
-   - scalar check `|Ē| <= U_val`, and
+   - scalar check (one-sided: `Ē ≥ -U_val`, or two-sided: `|Ē| ≤ U_val`), and
    - multivariate p-value guidance.
 5. Export HTML and use the **Decision Card** section as the one-page transfer summary.
+
+### Quick Example (Per-Location Validation)
+
+1. Load comparison data with **multiple T/C locations × multiple operating conditions** in **Tab 1**.
+2. In **Tab 3**, ensure **Pooling** is unchecked (default) and **One-sided** is checked.
+3. Set uncertainty **Scope** on each source in **Tab 2** (most are Global; sensor placement may be Per-location).
+4. Compute RSS. The per-location breakdown on **Tab 1** now shows PASS/FAIL per location.
+5. Review **Tab 4** findings: per-location summary ("Validated at 47/50 locations") and which locations failed.
+6. Export HTML for the complete per-location validation report.
 
 ---
 
@@ -47,7 +61,7 @@
 9. [Tab 5: Monte Carlo Results](#9-tab-5-monte-carlo-results)
 10. [Tab 6: Comparison Roll-Up](#10-tab-6-comparison-roll-up)
 11. [Tab 7: Reference Library](#11-tab-7-reference-library)
-12. [Understanding the Math (Plain English)](#12-understanding-the-math-plain-english)
+12. [Understanding the Math (Plain English)](#12-understanding-the-math-plain-english) *(includes per-location validation, one-sided vs. two-sided criteria)*
 13. [Monte Carlo vs Latin Hypercube — What's the Difference?](#13-monte-carlo-vs-latin-hypercube--whats-the-difference)
 14. [Distributions — Which One Should I Pick?](#14-distributions--which-one-should-i-pick)
 15. [Reading the Guidance Panels](#15-reading-the-guidance-panels)
@@ -440,11 +454,22 @@ These two numbers define how conservative your uncertainty statement is.
 
 ### One-Sided vs. Two-Sided
 
-**One-sided (default):** You only care about the worst case in one direction. For example, "What's the hottest it could be?" This gives you a single bound.
+**One-sided (default):** You only care about underprediction — the model being too cold (or too low) is the safety risk. Overprediction (model too hot) is conservative and always acceptable. This affects **two things**:
 
-**Two-sided:** You care about both directions equally — "How far off could it be in either direction?" This gives you symmetric ± bounds.
+1. **The k-factor:** Uses the one-sided t-distribution (e.g., k = 1.645 instead of 1.96 for infinite DOF at 95%)
+2. **The validation criterion:** Changes from `|Ē| ≤ U_val` (two-sided) to `Ē ≥ -U_val` (one-sided). This means **positive Ē of any magnitude always passes** — the model is conservative. Only negative Ē (underprediction) exceeding -U_val triggers a failure.
 
-**For aerospace certification:** One-sided is more common because you typically care about the worst case (e.g., maximum temperature for material limits).
+**Two-sided:** You care about both directions equally — "How far off could it be in either direction?" Both over- and under-prediction count. The criterion is `|Ē| ≤ U_val`.
+
+**For aerospace thermal certification:** One-sided is standard because you care about maximum temperature for material limits. A model that predicts too hot gives you conservative design margins. See [Section 12](#12-understanding-the-math-plain-english) for detailed examples and diagrams.
+
+### Pooling
+
+**Pooling (default: OFF):** When unchecked, the tool performs **per-location validation** — each thermocouple or measurement location is validated independently, and you get a spatial summary ("validated at 47/50 locations"). This is the recommended approach when you have multiple measurement locations with different physics (laminar vs. turbulent regions, gradient vs. uniform regions).
+
+**When checked:** All comparison data points across all locations are pooled into a single dataset. One Ē, one s_E, one validation verdict. This is simpler but can hide spatial problems where some locations pass and others fail.
+
+**When pooling is appropriate:** Only when all locations have similar mean errors and similar scatter (i.e., the physics is the same everywhere). If in doubt, leave pooling OFF and use per-location validation. See [Section 12](#12-understanding-the-math-plain-english) for a detailed explanation of when pooling can be misleading.
 
 ### K-Factor Method
 
@@ -514,12 +539,13 @@ This is the heart of the analysis. It's a table listing every enabled uncertaint
 
 #### Uncertainty Classification
 
-Each uncertainty source can be classified using these fields (set in the source editor on Tab 2):
+Each uncertainty source can be classified using these fields (set in the source editor on Tab 2, under the collapsible "Advanced: Uncertainty Classification" section):
 
 - **Uncertainty Class** — Aleatoric (inherent variability), Epistemic (knowledge gap), or Mixed. This classification affects the class-split summary (U_A, U_E) shown in results.
 - **Basis Type** — How the uncertainty value was obtained: measured, assumed, spec_limit, expert_judgment, or model_ensemble.
 - **Reducibility** — Whether additional testing or analysis could reduce the uncertainty: low, medium, or high.
 - **Evidence Note** — Free-text field for documenting the basis or justification.
+- **Scope** — "Global (same at all locations)" or "Per-location (varies by T/C)". Global sources (grid convergence, iteration sensitivity, inlet BC) contribute identically to every location's U_val during per-location validation. Per-location sources (sensor placement accuracy in gradient regions) are tracked separately. See [Section 12](#12-understanding-the-math-plain-english) for details on per-location validation.
 
 The results text and HTML report include a class-split summary showing U_A (aleatoric), U_E (epistemic), and the epistemic fraction of total variance. When epistemic uncertainty exceeds 50% of total variance, a warning is displayed recommending knowledge-reduction actions.
 
@@ -587,10 +613,15 @@ Coverage Factor:
 Expanded Uncertainty:
   U_val = k × u_val = 5.6569 [°F]
 
-Validation Assessment:
-  |Ē| = 5.0000 [°F]
-  U_val = 5.6569 [°F]
-  |Ē| ≤ U_val → ✓ VALIDATED
+Validation Assessment (one-sided):
+  Ē ≥ -U_val:  +5.0000 vs -5.6569 → ✓ VALIDATED
+  (One-sided underprediction criterion: E ≥ -U_val)
+```
+
+In two-sided mode, the same results would display as:
+```
+Validation Assessment (two-sided):
+  |Ē| ≤ U_val:  5.0000 vs 5.6569 → ✓ VALIDATED
 ```
 
 ### The Four Guidance Panels
@@ -603,7 +634,7 @@ These traffic-light panels give you immediate, plain-language feedback:
 
 3. **Model Form Assessment:** Compares s_E (observed scatter) to u_val (known uncertainty). If s_E is much bigger than u_val, there are physics your model is missing.
 
-4. **Validation Assessment:** The big one — VALIDATED or NOT VALIDATED based on |Ē| vs U_val.
+4. **Validation Assessment:** The big one — VALIDATED or NOT VALIDATED. In one-sided mode, the criterion is `Ē ≥ -U_val` (positive Ē always passes). In two-sided mode, the criterion is `|Ē| ≤ U_val`.
 
 ### Plots
 
@@ -696,7 +727,7 @@ This is the executive summary — a single table that puts all the results side 
 | Lower bound | Ē - k·u_val | Ē - k·s_E | MC P5 | Data P5 |
 | Upper bound | Ē + k·u_val | Ē + k·s_E | MC P95 | Data P95 |
 | Mean error | Ē | Ē | MC mean | Data mean |
-| Validated? | \|Ē\| ≤ U_val? | \|Ē\| ≤ k·s_E? | 0 in [P5, P95]? | — |
+| Validated? | Ē ≥ -U_val? (one-sided) or \|Ē\| ≤ U_val? (two-sided) | \|Ē\| ≤ k·s_E? | 0 in [P5, P95]? | — |
 | Distribution | Normal | Normal | Actual (sampled) | Empirical |
 | Reference | V&V 20-2009 | V&V 20-2009 | JCGM 101:2008 | — |
 
@@ -822,14 +853,67 @@ When you combine multiple uncertainty sources, each with different amounts of da
 
 **Type B sources (supplier specs)** have infinite DOF, so they drop out of the formula entirely. They don't help or hurt your effective DOF — they're just taken at face value.
 
-### The Validation Check — "|Ē| ≤ U_val?"
+### The Validation Check — Two Modes
 
-This is the final pass/fail criterion. In plain terms:
+This is the final pass/fail criterion from ASME V&V 20. The exact rule depends on whether you selected **one-sided** or **two-sided** mode in Analysis Settings (Tab 3).
 
-> **"Is the average mismatch between CFD and test data small enough to be explained by the known uncertainties?"**
+#### Two-Sided Criterion: |Ē| ≤ U_val
 
-- **Yes (|Ē| ≤ U_val):** The model is validated at the stated coverage level. The bias could plausibly be zero — it's within the noise.
-- **No (|Ē| > U_val):** Something is systematically wrong. The bias is too large to be explained by known uncertainties. You have model form deficiency.
+Use this when **both over- and under-prediction matter equally** (rare in thermal certification, common in structural or aerodynamic applications).
+
+> **"Is the average mismatch small enough — in either direction — to be explained by the known uncertainties?"**
+
+- **Yes (|Ē| ≤ U_val):** Validated. The bias could plausibly be zero.
+- **No (|Ē| > U_val):** Not validated. The bias is too large in one direction or the other.
+
+```
+Two-sided criterion:
+
+  NOT VALIDATED       VALIDATED       NOT VALIDATED
+  ◄──────────────|─────────────────|──────────────────►
+              -U_val       0       +U_val
+                 ↑                    ↑
+          Ē must be between these two lines
+```
+
+#### One-Sided Underprediction Criterion: Ē ≥ -U_val
+
+Use this when **only underprediction is a concern** — the model being too cold (or too low) is the safety risk. **This is the default and the most common choice for aerospace thermal work.**
+
+> **"Is the model's underprediction small enough to be explained by the known uncertainties?"**
+
+The key insight: **overprediction (positive Ē) is always conservative.** If the model predicts hotter than reality, your design margins are on the safe side. So positive Ē — no matter how large — always passes.
+
+- **Ē = +50°F, U_val = 10°F → VALIDATED.** The model is conservative by 50°F. That's a feature, not a problem.
+- **Ē = +2°F, U_val = 10°F → VALIDATED.** Slight overprediction, well within uncertainty.
+- **Ē = -8°F, U_val = 10°F → VALIDATED.** The underprediction (-8°F) is within what the uncertainties can explain (-10°F).
+- **Ē = -15°F, U_val = 10°F → NOT VALIDATED.** The underprediction (-15°F) exceeds what the uncertainties can explain (-10°F). The model is too cold and we can't blame it on measurement noise.
+
+```
+One-sided underprediction criterion:
+
+  NOT VALIDATED          VALIDATED (always)
+  ◄──────────────|──────────────────────────────────────►
+              -U_val         0        +anything
+                ↑
+         Ē must be to the right of this line
+         (positive Ē always passes — it's conservative)
+```
+
+#### Which Mode Should I Use?
+
+| Situation | Mode | Why |
+|-----------|------|-----|
+| Thermal certification (max temp matters) | **One-sided** | You only care if the model underpredicts temperature. Overprediction is conservative. |
+| Structural certification (max stress matters) | **One-sided** | You only care if the model underpredicts stress. Overprediction is conservative. |
+| Aerodynamic lift/drag — both directions matter | **Two-sided** | Overpredicting drag is as bad as underpredicting it for performance guarantees. |
+| General scientific comparison | **Two-sided** | You want the model to be accurate, not just conservative. |
+
+#### Common Misconception
+
+> "My Ē is +50°F but my U_val is only 10°F — that means the model is terrible, right?"
+
+**No.** For one-sided underprediction, this is a pass. The model is very conservative (it predicts much hotter than reality), which is safe. A large positive Ē means your design has extra margin. Whether you *want* that much conservatism is an engineering judgment call — but the V&V 20 validation criterion is satisfied.
 
 ### Model Form Uncertainty — "What's Left Over"
 
@@ -840,6 +924,118 @@ u_model = √(s_E² - u_val²)
 ```
 
 This isn't something you can fix with better grids or better BCs — it requires improved physics modeling (e.g., better turbulence model, adding radiation, including conjugate heat transfer).
+
+### Per-Location Validation — When Pooling Doesn't Make Sense
+
+#### The Problem with Pooling
+
+Suppose you have 50 thermocouples (T/Cs), each measured at 12 operating conditions — that's 600 data points. The default approach in many V&V studies is to **pool** all 600 comparison errors together: compute one Ē, one s_E, one U_val, and get one pass/fail verdict.
+
+But pooling hides spatial problems. Consider this scenario:
+
+- TC-001 through TC-025: Ē ≈ +5°F (model overpredicts — conservative, great)
+- TC-026 through TC-050: Ē ≈ -15°F (model underpredicts — potentially unsafe)
+- Pooled Ē ≈ -5°F (looks OK — the good locations mask the bad ones)
+
+The pooled analysis says "validated" because the average across all locations is within the uncertainty band. But half your T/Cs are showing significant underprediction that's hidden by the other half's overprediction. That's dangerous.
+
+#### The Per-Location Approach
+
+Instead of pooling, validate **at each T/C location independently**:
+
+1. For each T/C, compute Ē_i (the mean comparison error across operating conditions at that location)
+2. Apply the validation criterion at each location: Ē_i ≥ -U_val (one-sided) or |Ē_i| ≤ U_val (two-sided)
+3. Report the result as: **"Validated at 47 of 50 locations (94%)"**
+
+This gives you:
+- **Spatial information:** Which T/Cs pass and which fail? Where is the model weak?
+- **Actionable results:** "The model underpredicts at TC-033, TC-041, and TC-048 — all in the recirculation zone" is far more useful than "the pooled result is 0.3°F from the threshold"
+- **No pooling justification needed:** Pooling requires proving that all locations have the same mean and variance (Levene's test, etc.). Per-location analysis avoids this entirely.
+
+#### When to Pool vs. When Not To
+
+| Scenario | Recommendation |
+|----------|---------------|
+| 50 T/Cs × 12 conditions, different physics at different locations | **Per-location** (do not pool) |
+| Single T/C × 30 repeated tests at identical conditions | **Pooling is fine** (same location, same physics) |
+| 5 nearly-identical T/Cs in a uniform region × 20 conditions | **Pooling is defensible** (verify with Levene's test) |
+| Comparing two CFD codes at the same T/C locations | **Per-location** (you want spatial comparison) |
+
+**Rule of thumb:** If the physics changes across locations (laminar vs. turbulent, attached vs. separated, hot-side vs. cold-side), don't pool. Use per-location validation.
+
+#### Global vs. Per-Location Uncertainty Sources
+
+When doing per-location validation, some uncertainty sources apply the same way at every location (they're **global**), while others can vary by location (they're **per-location**):
+
+| Source | Scope | Why |
+|--------|-------|-----|
+| Grid convergence (GCI) | **Global** | You ran one grid study — same numerical error estimate everywhere |
+| Iteration convergence | **Global** | Same residual targets apply to the whole model |
+| Inlet BC uncertainty | **Global** | Same boundary condition affects all locations equally |
+| Thermocouple accuracy | **Global** | All T/Cs are the same make/model with the same spec |
+| Sensor placement accuracy | **Per-location** | A T/C in a steep gradient region has more placement uncertainty than one in a uniform region |
+| Local mesh quality effects | **Per-location** | Some regions have better mesh quality than others |
+
+In the source editor (Tab 2), you can set each source's **Scope** to "Global" or "Per-location" under the Advanced: Uncertainty Classification section. Global sources contribute identically to every location's U_val. Per-location sources are included separately, allowing future support for location-specific values.
+
+The per-location U_val at each location is:
+
+```
+U_val,i = k × √(u_global² + u_per_loc²)
+```
+
+where `u_global²` is the RSS of all global-scope sources, and `u_per_loc²` is the RSS of all per-location-scope sources.
+
+#### Reading the Per-Location Table
+
+The per-location breakdown table (on Tab 1, in the collapsible "Per-Location Breakdown" section) shows:
+
+| Column | What It Shows |
+|--------|---------------|
+| Location | The T/C or location name (from your comparison data) |
+| Mean Ē | Average comparison error at this location across all conditions |
+| Std Dev | Standard deviation of comparison errors at this location |
+| n | Number of conditions (data points) at this location |
+| U_val | Expanded uncertainty at this location |
+| Verdict | PASS or FAIL based on the selected criterion |
+| Flag | Outlier flags (e.g., if this location has unusually high scatter) |
+
+A summary line below the table shows the overall result: **"Validated at 47/50 locations (94%)"**.
+
+#### Budget Covariance Check — The "One Number" Across All Locations
+
+Below the per-location table, the tool automatically computes a **budget covariance multivariate check** (V&V 20.1). This produces a single number that answers: *"Is the overall pattern of bias across all locations consistent with the uncertainty budget?"*
+
+**Why you need this in addition to per-location checks:**
+
+When you run 50 independent PASS/FAIL checks, you're implicitly treating shared uncertainties as 50 independent pieces of evidence. If DAQ calibration bias is ±0.5°F, it shifts all 50 T/Cs the same direction simultaneously — but 50 independent checks don't know this. The budget covariance check properly accounts for these shared uncertainties by building a covariance matrix where:
+
+- **Global sources** (grid convergence, DAQ calibration, inlet BC) create off-diagonal terms — they shift all locations together
+- **Per-location sources** (sensor placement) create diagonal-only terms — they're independent between locations
+
+**The number: d²/m**
+
+The metric produces a ratio called **d²/m** (Mahalanobis distance squared, normalized by the number of locations):
+
+| d²/m | What it means |
+|------|---------------|
+| **< 0.5** | The model errors are well within the uncertainty budget. The budget comfortably explains the bias pattern. |
+| **0.5 – 1.0** | The model errors are consistent with the budget. Normal result. |
+| **1.0 – 2.0** | The model errors are somewhat larger than the budget predicts. Some locations may have bias beyond what the current sources explain. |
+| **> 2.0** | The model errors significantly exceed the budget. The budget does not explain the observed bias pattern. Investigate. |
+
+The associated **p-value** is the probability of seeing this extreme a bias pattern if the model were perfect (all bias explained by the budget). p ≥ 0.05 → PASS; p < 0.05 → FAIL.
+
+**Concrete example:**
+
+Suppose all 50 T/Cs show Ē ≈ -3°F and your U_val = 5°F at each location.
+
+- **50 independent scalar checks:** All 50 pass (-3 ≥ -5). You report "50/50 validated." Looks great.
+- **Budget covariance check:** "Wait — all 50 locations are biased in the *same direction* by the *same amount*. The probability of this happening by random chance is essentially zero. There's a systematic -3°F bias that the shared uncertainties can't explain." **FAILS.**
+
+The per-location checks missed this because each one individually can explain -3°F, but the *pattern* of all 50 being -3°F is too coordinated to be random noise. The budget covariance check catches it because it looks at the joint probability, not 50 independent probabilities.
+
+**No user action needed** — this auto-computes whenever per-location validation runs. The result appears below the per-location table on Tab 1, in the findings on Tab 4, and in the HTML report.
 
 ---
 
@@ -1110,6 +1306,16 @@ For a certification submission, include:
 | **Type B evaluation** | Uncertainty estimated from other information (specs, handbooks, engineering judgment) |
 | **ppf** | Percent Point Function — the inverse of the CDF (given a probability, returns the value) |
 | **GUM** | Guide to the Expression of Uncertainty in Measurement (JCGM 100:2008) |
+| **Per-location validation** | Validating at each measurement location independently rather than pooling all data together |
+| **Pooling** | Combining comparison data from multiple locations into a single dataset for analysis |
+| **Source scope** | Whether an uncertainty source applies globally (same at all locations) or per-location (can vary by T/C) |
+| **One-sided criterion** | Validation check where only underprediction matters: Ē ≥ -U_val. Positive Ē (overprediction) always passes. |
+| **Two-sided criterion** | Validation check where both directions matter equally: \|Ē\| ≤ U_val |
+| **Conservative (overprediction)** | When the model predicts higher than reality (e.g., hotter temperature). Safe for certification because design margins have extra room. |
+| **Budget covariance check** | V&V 20.1 multivariate metric that tests the overall bias pattern against the uncertainty budget, accounting for shared (global) vs. independent (per-location) sources |
+| **d²/m** | Normalized Mahalanobis distance — the budget covariance metric. ≈1.0 means normal, <1.0 means better than budget, >1.0 means worse than budget |
+| **Mahalanobis distance** | A distance measure that accounts for correlations. Used in the budget covariance check to measure how far the bias pattern is from zero in uncertainty-normalized units |
+| **Compound symmetry** | The covariance structure used in the budget covariance check: all location pairs have the same correlation (driven by shared global uncertainties) |
 
 ---
 
@@ -1159,6 +1365,46 @@ For a certification submission, include:
 3. The model may need physics improvements for this particular quantity
 
 Many perfectly useful engineering models are "not validated" by the strict V&V 20 criterion. What matters is that you understand the limitations and document them.
+
+### Q: My Ē is +50°F but U_val is only 10°F — is that validated?
+
+**A:** **Yes, if you're using one-sided underprediction mode** (the default). The one-sided criterion is `Ē ≥ -U_val`. Your Ē = +50°F is far to the right of -10°F, so it passes easily. The model is very conservative — it overpredicts temperature by 50°F. That's safe for certification (the hardware will never get as hot as you predicted).
+
+If you're using **two-sided mode**, then no — `|Ē| = 50 > U_val = 10`, so it would fail. Two-sided mode penalizes overprediction just as much as underprediction.
+
+Whether you *want* 50°F of conservatism is an engineering judgment call (it might mean your design is heavier than necessary), but the V&V 20 validation criterion is satisfied in one-sided mode.
+
+### Q: Should I pool my thermocouple locations together?
+
+**A:** **Probably not.** Pooling is only justified when all locations have similar mean errors AND similar scatter — that is, the physics is essentially the same everywhere. In most real CFD validations, different T/C locations see different flow regimes (laminar vs. turbulent, attached vs. separated, near walls vs. freestream), and the model performance varies across those regions.
+
+Per-location validation gives you spatial information: "The model underpredicts at 3 T/Cs in the recirculation zone" is far more useful than "the pooled result is borderline." Start with per-location validation (pooling OFF) and only enable pooling if you have a specific justification.
+
+### Q: What's the difference between global and per-location uncertainty sources?
+
+**A:** **Global sources** have the same value at every measurement location. Grid convergence uncertainty, iteration convergence uncertainty, and inlet boundary condition uncertainty are all global — they come from one study or one setting that affects the entire model equally.
+
+**Per-location sources** can vary by measurement location. The classic example is sensor placement accuracy: a thermocouple in a steep temperature gradient has much more placement uncertainty than one in a uniform region. If you move the T/C by 1mm in a gradient of 50°F/mm, that's ±50°F of uncertainty. The same 1mm shift in a flat region might be ±0.1°F.
+
+In the source editor, set the **Scope** field (under Advanced: Uncertainty Classification) to "Global" or "Per-location". Both contribute to each location's U_val via RSS, but the tool tracks them separately for reporting.
+
+### Q: I switched from two-sided to one-sided and now more locations pass. Did I just game the system?
+
+**A:** **No — you chose the physically appropriate criterion.** If your application genuinely only cares about underprediction (e.g., maximum temperature for material limits), then one-sided is the correct choice. It's not "easier" — it's *different*. It says "I accept the risk of overprediction" (because overprediction is conservative for my application). You must document and justify the choice of one-sided vs. two-sided in your V&V report. The tool includes the criterion type in all findings and the HTML report.
+
+### Q: What does d²/m mean and when should I worry?
+
+**A:** d²/m is the budget covariance metric — a single number summarizing whether the overall pattern of bias across all your T/C locations is consistent with the uncertainty budget.
+
+Think of it as a "suspicion score":
+- **d²/m ≈ 0.3:** The model errors are well within the budget. Nothing to worry about.
+- **d²/m ≈ 0.9:** Normal. The bias pattern is about what you'd expect given the uncertainty sources.
+- **d²/m ≈ 1.5:** Getting elevated. The model has more bias than the budget predicts, but it might not be statistically significant yet. Check the p-value.
+- **d²/m ≈ 3.0:** The bias pattern is much larger than the budget can explain. Either you're missing uncertainty sources, or there's a systematic model issue the budget doesn't capture.
+
+The associated **p-value** gives the statistical significance: p ≥ 0.05 means PASS, p < 0.05 means FAIL. The d²/m ratio tells you *how far off* you are; the p-value tells you *whether it's statistically significant*.
+
+**Key insight:** This metric can fail even when all 50 per-location checks pass individually. That happens when the bias is coordinated across locations (e.g., all locations underpredicting by the same amount), which is exactly the signature of a shared systematic error that the per-location checks can't detect.
 
 ---
 

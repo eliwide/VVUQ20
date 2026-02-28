@@ -87,12 +87,11 @@ from scipy import stats as sp_stats
 from scipy.stats import norm, shapiro
 # ═══════════════════════════════════════════════════════════════════════════
 # SECTION: SHARED VVUQ REPORT COMPONENTS
-# Keep shared data (constants, terms, renderer) consistent across all four
-# VVUQ tools (Uncertainty Aggregator, GCI Calculator, Iterative Uncertainty,
-# Statistical Analyzer).
+# Keep shared data (constants, terms, renderer) consistent across CODE 1-4.
 # Import line and data definitions below must match across all four files.
 # Last synchronized: 2026-02-23
 # ═══════════════════════════════════════════════════════════════════════════
+from html import escape as _html_esc
 
 DECISION_CONSEQUENCE_LEVELS = ("Low", "Medium", "High")
 DEFAULT_DECISION_CONSEQUENCE = "Medium"
@@ -235,7 +234,7 @@ def render_decision_card_html(title, use_value, use_distribution, use_combinatio
         '<div class="highlight">'
         f"<p><strong>Use this value:</strong> {_html_esc(use_value)}</p>"
         f"<p><strong>Use this distribution:</strong> {_html_esc(use_distribution)}</p>"
-        f"<p><strong>Set Aggregator analysis mode:</strong> {_html_esc(use_combination)}</p>"
+        f"<p><strong>Set CODE 1 analysis mode:</strong> {_html_esc(use_combination)}</p>"
         "<p><strong>Do not proceed if any check fails:</strong></p>"
         f"<ul>{stop_list}</ul>"
         f"{notes_html}"
@@ -1305,9 +1304,6 @@ def compute_iterative_stats(values: np.ndarray, times: Optional[np.ndarray] = No
     result.sigma = float(np.std(converted, ddof=1))
     result.three_sigma = 3.0 * result.sigma
     result.p95 = float(np.percentile(converted, 95))
-    # Upper-tail metric by design: caps at max observed value to avoid
-    # overshoot in converged data.  Lower tail is not needed here because
-    # iterative uncertainty is a magnitude-based (non-directional) bound.
     result.corrected_3sigma = min(result.max_val, result.mean + result.three_sigma)
     result.difference = result.corrected_3sigma - result.final_value
     result.cov = result.sigma / abs(result.mean) if abs(result.mean) > 1e-15 else 0.0
@@ -1350,7 +1346,7 @@ def derive_carry_over_value(
     allow_stationarity_override: bool = False,
     override_reason: str = "",
 ) -> Dict[str, str]:
-    """Return a concrete carry-over recommendation for the Aggregator."""
+    """Return a concrete carry-over recommendation for CODE 1."""
     method = method.strip()
     sigma_pref = s.tw_sigma if np.isfinite(s.tw_sigma) and s.tw_sigma > 0 else s.sigma
 
@@ -1474,9 +1470,8 @@ def write_stats_csv(stats_list: List[IterativeStats], filepath: str):
         "N_eff", "rho1", "tau_int", "Trend p", "Drift Ratio",
         "Allan Ratio", "Stationarity Pass", "Stationarity Note",
     ]
-    with open(filepath, 'w', encoding='utf-8', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(headers)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        f.write(",".join(headers) + "\n")
         for s in stats_list:
             row = [
                 s.variable, s.converted_unit or s.unit, str(s.n_samples),
@@ -1489,9 +1484,9 @@ def write_stats_csv(stats_list: List[IterativeStats], filepath: str):
                 f"{s.n_eff:.8g}", f"{s.autocorr_rho1:.8g}", f"{s.autocorr_tau:.8g}",
                 f"{s.trend_pvalue:.8g}", f"{s.drift_ratio:.8g}",
                 f"{s.allan_ratio:.8g}", "1" if s.stationarity_pass else "0",
-                s.stationarity_note,
+                f'"{s.stationarity_note}"' if "," in s.stationarity_note else s.stationarity_note,
             ]
-            writer.writerow(row)
+            f.write(",".join(row) + "\n")
 
 
 # =============================================================================
@@ -1606,7 +1601,6 @@ class DataImportTab(QWidget):
         if folder:
             self._root_folder = folder
             self._edit_folder.setText(folder)
-            self._edit_folder.setToolTip(folder)
 
     def _scan_files(self):
         if not self._root_folder:
@@ -1655,8 +1649,6 @@ class DataImportTab(QWidget):
         rng = np.random.default_rng(7)
         self._parsed = {}
         self._cases = {}
-        self._root_folder = ""
-        self._edit_folder.clear()
         self._tree.clear()
 
         case_specs = {
@@ -1724,7 +1716,7 @@ class DataImportTab(QWidget):
         )
         self._guidance.set_guidance(
             "Loaded built-in transient example cases. Use Analysis -> Compute "
-            "to generate carry-over uncertainty values for the Aggregator.",
+            "to generate carry-over uncertainty values for CODE 1.",
             'green'
         )
 
@@ -1733,13 +1725,11 @@ class DataImportTab(QWidget):
 
         Purpose: demonstrate what non-converged iteration data looks like
         and how the stationarity gate correctly flags it as INVALID.
-        Temperature drifts upward ~20 °F over 500 iterations with +-2 °F noise.
+        Temperature drifts upward ~20 degF over 500 iterations with +-2 degF noise.
         """
         rng = np.random.default_rng(42)
         self._parsed = {}
         self._cases = {}
-        self._root_folder = ""
-        self._edit_folder.clear()
         self._tree.clear()
 
         case_name = "example_nonstationary"
@@ -1748,8 +1738,8 @@ class DataImportTab(QWidget):
         # Iteration indices 1..500
         iterations = np.arange(1, n_rows + 1, dtype=float)
 
-        # Temperature: starts ~350 °F, drifts upward ~20 °F over run
-        # Linear trend: 20 °F over 500 iterations = 0.04 °F/iteration
+        # Temperature: starts ~350 degF, drifts upward ~20 degF over run
+        # Linear trend: 20 degF over 500 iterations = 0.04 degF/iteration
         trend = 350.0 + (20.0 / n_rows) * iterations
         noise = rng.normal(0.0, 2.0, n_rows)
         temp = trend + noise
@@ -1769,7 +1759,7 @@ class DataImportTab(QWidget):
             is_transient=False,
             data=data,
             units={
-                headers[1]: "\u00b0F",
+                headers[1]: "degF",
             },
             format_type="synthetic_example",
             warnings=[],
@@ -1805,24 +1795,6 @@ class DataImportTab(QWidget):
 
     def get_root_folder(self) -> str:
         return self._root_folder
-
-    def clear(self):
-        """Reset all import state for a new project."""
-        self._root_folder = ""
-        self._cases = {}
-        self._parsed = {}
-        self._edit_folder.clear()
-        self._edit_folder.setToolTip(
-            "Root folder path. The scanner looks for Fluent .out files\n"
-            "in this folder and all subfolders (one subfolder = one case).")
-        self._tree.clear()
-        self._lbl_summary.setText("No files scanned.")
-        self._guidance.set_guidance(
-            "Select a root folder containing Fluent .out files. "
-            "Each subdirectory is treated as a separate case/condition. "
-            "Both Report Definition and legacy XY-plot formats are auto-detected. "
-            "You can also load built-in synthetic cases for a quick dry run.",
-            'green')
 
 
 # =============================================================================
@@ -1863,11 +1835,10 @@ class AnalysisTab(QWidget):
 
         top.addWidget(QLabel("Last N:"))
         self._spn_last_n = QSpinBox()
-        self._spn_last_n.setRange(20, 100000)
+        self._spn_last_n.setRange(10, 100000)
         self._spn_last_n.setValue(1000)
         self._spn_last_n.setToolTip(
             "Number of last iterations/time-steps to use for statistics.\n"
-            "Minimum 20 — below this, stationarity tests have low statistical power.\n"
             "Default: 1000 iterations for steady, 60s window for transient.")
         top.addWidget(self._spn_last_n)
 
@@ -1904,7 +1875,7 @@ class AnalysisTab(QWidget):
             "  \u2022 ITTC half-range uncertainty\n"
             "  \u2022 Stationarity diagnostics (trend, drift, Allan)\n"
             "  \u2022 Autocorrelation-adjusted effective sample size\n"
-            "  \u2022 Carry-over values for the Aggregator")
+            "  \u2022 Carry-over values for CODE 1")
         self._btn_compute.setStyleSheet(
             f"QPushButton {{ background-color: {DARK_COLORS['accent']}; "
             f"color: {DARK_COLORS['bg']}; font-weight: bold; }}"
@@ -1924,7 +1895,7 @@ class AnalysisTab(QWidget):
         self._spn_trend_alpha.setValue(0.05)
         self._spn_trend_alpha.setToolTip(
             "p-value threshold for the linear-regression trend test.\n"
-            "Lower values require stronger evidence to flag a trend (more stringent).\n"
+            "Lower values are more lenient (allow more trend).\n"
             "Default: 0.05 (standard 95% confidence level).")
         thresh_row.addWidget(self._spn_trend_alpha)
         thresh_row.addWidget(QLabel("Drift limit:"))
@@ -1957,7 +1928,7 @@ class AnalysisTab(QWidget):
         self._stats_table.setAlternatingRowColors(True)
         layout.addWidget(self._stats_table)
 
-        grp_carry = QGroupBox("Carry-Over to Aggregator")
+        grp_carry = QGroupBox("Carry-Over to CODE 1 (VVUQ Aggregator)")
         grp_carry.setToolTip(
             "Values to transfer into the VVUQ Uncertainty Aggregator.\n"
             "Each row is one variable\u2019s iterative convergence uncertainty.")
@@ -1967,16 +1938,11 @@ class AnalysisTab(QWidget):
         self._carry_table.setColumnCount(8)
         self._carry_table.setHorizontalHeaderLabels([
             "Variable", "Unit", "Carry u", "Sigma Basis",
-            "DOF", "Distribution for Aggregator", "Aggregator Analysis Mode",
+            "DOF", "Distribution for CODE 1", "CODE 1 Analysis Mode",
             "How Derived",
         ])
         self._carry_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeToContents)
-        # "How Derived" column (index 7) can be very wide; use Interactive mode
-        # so the user can resize it instead of it pushing the table out.
-        self._carry_table.horizontalHeader().setSectionResizeMode(
-            7, QHeaderView.Interactive)
-        self._carry_table.horizontalHeader().resizeSection(7, 250)
         carry_lay.addWidget(self._carry_table)
 
         override_row = QHBoxLayout()
@@ -2000,32 +1966,21 @@ class AnalysisTab(QWidget):
         self._guidance.set_guidance(
             "Select a case and file, set the window size (Last N), "
             "choose the method, and click Compute. Then use the carry-over "
-            "table to transfer a single value into the Aggregator. Stationarity "
+            "table to transfer a single value into CODE 1. Stationarity "
             "failures are blocked unless override is documented.", 'green')
         layout.addWidget(self._guidance)
 
     def populate_cases(self, parsed: Dict[str, List[FluentData]]):
-        prev_case = self._cmb_case.currentText()
         self._cmb_case.blockSignals(True)
         self._cmb_case.clear()
         for case_name in sorted(parsed.keys()):
             self._cmb_case.addItem(case_name)
-        # Restore previous selection if it still exists
-        if prev_case and self._cmb_case.findText(prev_case) >= 0:
-            self._cmb_case.setCurrentText(prev_case)
         self._cmb_case.blockSignals(False)
         if parsed:
             self._on_case_changed(self._cmb_case.currentText())
 
     def _on_case_changed(self, case_name):
         self._current_case = case_name
-        # Keep stats table and carry table in sync with the selected case
-        if case_name in self._all_stats:
-            self._display_stats(self._all_stats[case_name])
-            self._update_carry_table(self._all_stats[case_name])
-        else:
-            self._stats_table.setRowCount(0)
-            self._carry_table.setRowCount(0)
 
     def _on_file_changed(self, idx):
         self._current_file_idx = idx
@@ -2034,8 +1989,6 @@ class AnalysisTab(QWidget):
         case = self._cmb_case.currentText()
         if case in self._all_stats:
             self._update_carry_table(self._all_stats[case])
-        else:
-            self._carry_table.setRowCount(0)
 
     def update_file_list(self, parsed: Dict[str, List[FluentData]], case_name: str):
         self._cmb_file.blockSignals(True)
@@ -2050,10 +2003,6 @@ class AnalysisTab(QWidget):
         case = self._cmb_case.currentText()
         file_idx = self._cmb_file.currentIndex()
         if case not in parsed or file_idx < 0:
-            self._guidance.set_guidance(
-                "Select a case and file before computing. "
-                "Use the Data Import tab to scan or load example data first.",
-                'yellow')
             return []
 
         fd = parsed[case][file_idx]
@@ -2069,7 +2018,7 @@ class AnalysisTab(QWidget):
             self._guidance.set_guidance(
                 f"Warning: Last-N ({last_n}) exceeds 90% of available data "
                 f"rows ({n_rows}). Statistics may not reflect converged behaviour.",
-                'yellow')
+                'orange')
 
         # Time-based windowing for transient cases
         window_mode = self._cmb_window.currentText()
@@ -2079,7 +2028,7 @@ class AnalysisTab(QWidget):
             if not np.all(np.diff(time_col) >= 0):
                 self._guidance.set_guidance(
                     "Warning: time column is not monotonically increasing; sorting data.",
-                    'yellow')
+                    'orange')
                 sort_order = np.argsort(time_col)
                 data = data[sort_order]
                 time_col = data[:, fd.time_col_idx]
@@ -2137,7 +2086,7 @@ class AnalysisTab(QWidget):
             self._guidance.set_guidance(
                 f"Computed {len(stats_list)} variables using last {n_used}/{n_rows} rows. "
                 f"{n_corr_warn} variable(s) show serial correlation; N_eff-adjusted DOF is applied.\n\n"
-                "DO THIS NOW: use reported N_eff/DOF in the Aggregator (do not replace with N-1).",
+                "DO THIS NOW: use reported N_eff/DOF in CODE 1 (do not replace with N-1).",
                 'yellow'
             )
         else:
@@ -2145,7 +2094,7 @@ class AnalysisTab(QWidget):
                 f"Computed statistics for {len(stats_list)} variables "
                 f"using last {n_used} of {n_rows} rows. "
                 "Carry-over values are ready in the carry-over table.\n\n"
-                "DO THIS NOW: copy each row to the Aggregator exactly as shown.",
+                "DO THIS NOW: copy each row to CODE 1 exactly as shown.",
                 'green'
             )
         return stats_list
@@ -2158,9 +2107,6 @@ class AnalysisTab(QWidget):
             "ITTC U\u1d62", "TW Mean", "TW \u03c3", "TW CoV",
             "N_eff", "rho1", "Trend p", "Drift/sigma", "Allan ratio", "Stationary?",
         ]
-        STATIONARITY_COL = headers.index("Stationary?")
-        COV_COL = headers.index("CoV")
-        TW_COV_COL = headers.index("TW CoV")
         self._stats_table.setColumnCount(len(headers))
         self._stats_table.setHorizontalHeaderLabels(headers)
         self._stats_table.setRowCount(len(stats_list))
@@ -2181,20 +2127,20 @@ class AnalysisTab(QWidget):
                 s.drift_ratio, s.allan_ratio,
                 1.0 if s.stationarity_pass else 0.0,
             ], start=3):
-                if j == STATIONARITY_COL:
+                if j == 23:
                     item = QTableWidgetItem("PASS" if s.stationarity_pass else "FAIL")
                 else:
                     item = QTableWidgetItem(f"{val:.6g}")
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                # Color-code CoV columns
-                if j in (COV_COL, TW_COV_COL):
+                # Color-code CoV column
+                if j in (13, 17):  # CoV and TW CoV columns
                     if val < 0.001:
                         item.setForeground(QColor(DARK_COLORS['green']))
                     elif val < 0.01:
                         item.setForeground(QColor(DARK_COLORS['yellow']))
                     else:
                         item.setForeground(QColor(DARK_COLORS['red']))
-                if j == STATIONARITY_COL:
+                if j == 23:
                     item.setForeground(
                         QColor(DARK_COLORS['green'] if s.stationarity_pass else DARK_COLORS['red'])
                     )
@@ -2217,14 +2163,7 @@ class AnalysisTab(QWidget):
             self._carry_table.setItem(i, 1, QTableWidgetItem(unit))
             self._carry_table.setItem(i, 2, QTableWidgetItem(carry["u_carry"]))
             self._carry_table.setItem(i, 3, QTableWidgetItem(carry["sigma_basis"]))
-            dof = max(1, int(round(s.n_eff - 1)))
-            dof_item = QTableWidgetItem(str(dof))
-            if dof <= 2:
-                dof_item.setForeground(QColor(DARK_COLORS['red']))
-                dof_item.setToolTip(
-                    f"DOF = {dof} is very low. Results have high uncertainty.\n"
-                    "Consider increasing Last N or checking for strong autocorrelation.")
-            self._carry_table.setItem(i, 4, dof_item)
+            self._carry_table.setItem(i, 4, QTableWidgetItem(str(max(1, int(round(s.n_eff - 1))))))
             self._carry_table.setItem(i, 5, QTableWidgetItem(carry["distribution"]))
             self._carry_table.setItem(i, 6, QTableWidgetItem(carry["combine_method"]))
             self._carry_table.setItem(i, 7, QTableWidgetItem(carry["formula"]))
@@ -2248,23 +2187,6 @@ class AnalysisTab(QWidget):
 
     def get_stationarity_override_reason(self) -> str:
         return self._edit_override_reason.text().strip()
-
-    def clear(self):
-        """Reset all analysis state for a new project."""
-        self._all_stats = {}
-        self._current_case = ""
-        self._current_file_idx = 0
-        self._cmb_case.clear()
-        self._cmb_file.clear()
-        self._stats_table.setRowCount(0)
-        self._carry_table.setRowCount(0)
-        self._edit_override_reason.clear()
-        self._chk_stationarity_override.setChecked(False)
-        self._guidance.set_guidance(
-            "Select a case and file, set the window size (Last N), "
-            "choose the method, and click Compute. Then use the carry-over "
-            "table to transfer a single value into the Aggregator. Stationarity "
-            "failures are blocked unless override is documented.", 'green')
 
 
 # =============================================================================
@@ -2572,15 +2494,6 @@ class ChartsTab(QWidget):
     def get_figure(self) -> Figure:
         return self._fig
 
-    def clear(self):
-        """Reset charts for a new project."""
-        self._fluent_data = None
-        self._stats_list = []
-        self._last_n = 1000
-        self._cmb_var.clear()
-        self._fig.clear()
-        self._canvas.draw()
-
 
 # =============================================================================
 # TAB 4: BATCH
@@ -2614,9 +2527,9 @@ class BatchTab(QWidget):
         self._cmb_cross.setToolTip(
             "How to combine uncertainties across multiple cases:\n"
             "  Pooled Std Dev: pool all samples, compute single \u03c3.\n"
-            "  RMS of Per-Case \u03c3: RMS-combine each case\u2019s \u03c3.\n"
+            "  RSS of Per-Case \u03c3: RSS-combine each case\u2019s \u03c3.\n"
             "  Both: compute both and show side-by-side.")
-        self._cmb_cross.addItems(["Pooled Std Dev", "RMS of Per-Case \u03c3", "Both"])
+        self._cmb_cross.addItems(["Pooled Std Dev", "RSS of Per-Case \u03c3", "Both"])
         top.addWidget(self._cmb_cross)
 
         top.addWidget(QLabel("Variable keying:"))
@@ -2754,19 +2667,15 @@ class BatchTab(QWidget):
                     f"{case_name}: no valid data columns found — "
                     "check that files contain numeric data with at least 2 rows."
                 )
-            # Write per-case CSV (skip for synthetic example data)
+            # Write per-case CSV
             if case_stats:
                 case_folder = os.path.dirname(fd_list[0].filepath) if fd_list else ""
-                if case_folder and not case_folder.startswith("[example]"):
+                if case_folder:
                     csv_path = os.path.join(case_folder, f"stats_{case_name}.csv")
                     try:
                         write_stats_csv(case_stats, csv_path)
                     except Exception as exc:
                         csv_warnings.append(f"{case_name}: {exc}")
-                elif case_folder.startswith("[example]"):
-                    csv_warnings.append(
-                        f"{case_name}: CSV export skipped for built-in example data."
-                    )
 
         # Cross-case analysis: explicit keying policy to prevent silent overwrite.
         var_map: Dict[str, Dict[str, IterativeStats]] = {}
@@ -2811,16 +2720,15 @@ class BatchTab(QWidget):
             n_cases = len(case_dict)
             pooled_sigma = float(np.std(finals, ddof=1)) if n_cases > 1 else (
                 sigmas[0] if sigmas else 0)
-            # RMS (root-mean-square) of per-case sigmas
-            rms_sigma = float(np.sqrt(np.sum(np.array(sigmas) ** 2) / n_cases))
+            rss_sigma = float(np.sqrt(np.sum(np.array(sigmas) ** 2) / n_cases))
             if cross_method == "Pooled Std Dev":
                 selected_sigma = pooled_sigma
-                selected_method = "Std Dev" if n_cases == 1 else "Pooled Std Dev"
-            elif cross_method == "RMS of Per-Case σ":
-                selected_sigma = rms_sigma
-                selected_method = "RMS of Per-Case σ"
+                selected_method = "Pooled Std Dev"
+            elif cross_method == "RSS of Per-Case σ":
+                selected_sigma = rss_sigma
+                selected_method = "RSS of Per-Case σ"
             else:
-                selected_sigma = max(pooled_sigma, rms_sigma)
+                selected_sigma = max(pooled_sigma, rss_sigma)
                 selected_method = "Both (conservative max)"
             first_stats = list(case_dict.values())[0]
             first_unit = first_stats.converted_unit or first_stats.unit
@@ -2832,7 +2740,7 @@ class BatchTab(QWidget):
                 'n_cases': n_cases,
                 'mean_final': float(np.mean(finals)),
                 'pooled_sigma': pooled_sigma,
-                'rms_sigma': rms_sigma,
+                'rss_sigma': rss_sigma,
                 'selected_sigma': selected_sigma,
                 'selected_method': selected_method,
                 'mean_half_range': float(np.mean(half_ranges)),
@@ -2843,7 +2751,7 @@ class BatchTab(QWidget):
         # Display
         headers = [
             "Cross-Case Key", "Base Variable", "Unit", "Cases", "Mean Final",
-            "Pooled \u03c3", "RMS \u03c3", "Carry u (Selected)",
+            "Pooled \u03c3", "RSS \u03c3", "Carry u (Selected)",
             "Selected Method", "Mean ITTC U_I",
         ]
         self._batch_table.setColumnCount(len(headers))
@@ -2857,7 +2765,7 @@ class BatchTab(QWidget):
             self._batch_table.setItem(i, 2, QTableWidgetItem(r['unit']))
             self._batch_table.setItem(i, 3, QTableWidgetItem(str(r['n_cases'])))
             for j, key in enumerate([
-                'mean_final', 'pooled_sigma', 'rms_sigma', 'selected_sigma'
+                'mean_final', 'pooled_sigma', 'rss_sigma', 'selected_sigma'
             ], start=4):
                 item = QTableWidgetItem(f"{r[key]:.6g}")
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -2907,13 +2815,13 @@ class BatchTab(QWidget):
             self, "Export Combined CSV", os.path.expanduser("~"),
             "CSV Files (*.csv);;All Files (*)")
         if not filepath:
-            return  # Cancelled dialog — status bar keeps previous message (standard UX)
+            return
         try:
             with open(filepath, 'w', encoding='utf-8', newline='') as f:
                 writer = csv.writer(f, quoting=csv.QUOTE_MINIMAL)
                 writer.writerow(["Cross Key", "Base Variable", "Key Policy",
                                  "Unit", "N Cases", "Mean Final",
-                                 "Pooled Sigma", "RMS Sigma", "Carry Selected",
+                                 "Pooled Sigma", "RSS Sigma", "Carry Selected",
                                  "Selected Method", "Mean ITTC U_I", "Cases"])
                 for r in self._batch_results:
                     cases_str = "; ".join(r['cases'])
@@ -2921,7 +2829,7 @@ class BatchTab(QWidget):
                         r['variable_key'], r['base_variable'],
                         r['key_policy'], r['unit'], r['n_cases'],
                         f"{r['mean_final']:.8g}", f"{r['pooled_sigma']:.8g}",
-                        f"{r['rms_sigma']:.8g}", f"{r['selected_sigma']:.8g}",
+                        f"{r['rss_sigma']:.8g}", f"{r['selected_sigma']:.8g}",
                         r['selected_method'], f"{r['mean_half_range']:.8g}",
                         cases_str,
                     ])
@@ -3018,20 +2926,6 @@ class BatchTab(QWidget):
     def get_batch_results(self) -> List[Dict]:
         return self._batch_results
 
-    def clear(self):
-        """Reset batch state for a new project."""
-        self._batch_results = []
-        self._cross_case_data = {}
-        self._cross_case_samples = {}
-        self._batch_table.setRowCount(0)
-        self._cmb_batch_var.clear()
-        self._batch_fig.clear()
-        self._batch_canvas.draw()
-        self._btn_export_csv.setEnabled(False)
-        self._guidance.set_guidance(
-            "Process all cases and all files at once. Cross-case statistics "
-            "use the selected variable keying policy.", 'green')
-
 
 # =============================================================================
 # TAB 5: REPORT
@@ -3105,10 +2999,6 @@ class ReportTab(QWidget):
     def show_preview(self, html: str):
         """Display HTML report preview in the text pane."""
         self._preview.setHtml(html)
-
-    def clear(self):
-        """Reset report preview for a new project."""
-        self._preview.clear()
 
 
 # =============================================================================
@@ -3293,14 +3183,14 @@ def generate_itu_html_report(all_stats: Dict[str, List[IterativeStats]],
                 f"<tr><td>{_esc_html(str(r['variable_key']))}</td><td>{_esc_html(str(r['base_variable']))}</td>"
                 f"<td>{_esc_html(str(r['unit']))}</td><td>{r['n_cases']}</td>"
                 f"<td>{r['mean_final']:.6g}</td><td>{r['pooled_sigma']:.6g}</td>"
-                f"<td>{r['rms_sigma']:.6g}</td><td>{r['selected_sigma']:.6g}</td>"
+                f"<td>{r['rss_sigma']:.6g}</td><td>{r['selected_sigma']:.6g}</td>"
                 f"<td>{_esc_html(str(r['selected_method']))}</td><td>{r['mean_half_range']:.6g}</td>"
                 f"<td>{_esc_html(str(r.get('key_policy', 'merge_by_name')))}</td></tr>"
             )
         batch_html = (
             "<table><tr><th>Cross-Case Key</th><th>Base Variable</th><th>Unit</th>"
             "<th>Cases</th><th>Mean Final</th><th>Pooled \u03c3</th>"
-            "<th>RMS \u03c3</th><th>Carry u (Selected)</th>"
+            "<th>RSS \u03c3</th><th>Carry u (Selected)</th>"
             "<th>Selected Method</th><th>Mean ITTC U<sub>I</sub></th>"
             "<th>Key Policy</th></tr>"
             f"{brows}</table>"
@@ -3328,8 +3218,8 @@ def generate_itu_html_report(all_stats: Dict[str, List[IterativeStats]],
     carry_html = (
         "<table><tr><th>Case</th><th>Variable</th><th>Unit</th>"
         "<th>Carry u</th><th>Sigma Basis</th><th>DOF</th>"
-        "<th>Distribution for Aggregator</th>"
-        "<th>Aggregator Analysis Mode</th><th>How Derived</th></tr>"
+        "<th>Distribution for CODE 1</th>"
+        "<th>CODE 1 Analysis Mode</th><th>How Derived</th></tr>"
         f"{carry_rows}</table>"
         if carry_rows else "<p><i>No carry-over values available.</i></p>"
     )
@@ -3358,15 +3248,7 @@ def generate_itu_html_report(all_stats: Dict[str, List[IterativeStats]],
     evidence = {
         'inputs_documented': bool(program_raw.strip()) and bool(analyst_raw.strip()),
         'method_selected': True,
-        # Check units consistency per variable name rather than across all
-        # quantities — a study with both temperature and pressure is expected
-        # to have different units; the check should verify that each variable
-        # uses the same unit across all cases.
-        'units_consistent': all(
-            len({(s.converted_unit or s.unit)
-                 for s in all_rows if s.variable == var and (s.converted_unit or s.unit)}) <= 1
-            for var in {s.variable for s in all_rows}
-        ) if all_rows else True,
+        'units_consistent': len({(s.converted_unit or s.unit) for s in all_rows if (s.converted_unit or s.unit)}) <= 1,
         'data_quality': has_stats and all(s.n_samples >= 10 for s in all_rows),
         'diagnostics_pass': diagnostics_ok,
         'independent_review': False,
@@ -3375,18 +3257,18 @@ def generate_itu_html_report(all_stats: Dict[str, List[IterativeStats]],
     }
 
     decision_card_html = render_decision_card_html(
-        title="Decision Card (Carry to Aggregator)",
+        title="Decision Card (Carry to CODE 1)",
         use_value="Use Carry u and Sigma Basis values from Section 5.",
-        use_distribution="Use Distribution for Aggregator from Section 5.",
+        use_distribution="Use Distribution for CODE 1 from Section 5.",
         use_combination=(
-            "Set Aggregator analysis mode once using Section 5 recommendation "
+            "Set CODE 1 analysis mode once using Section 5 recommendation "
             "(RSS unless a program rule requires Monte Carlo)."
         ),
         stop_checks=[
             "Any row with stationarity FAIL",
             "Any row with carry value marked INVALID",
             "Any override without documented rationale",
-            "Any unit mismatch with Aggregator setup",
+            "Any unit mismatch with CODE 1 setup",
         ],
         notes="Stationarity failures are blocked by default to prevent misuse.",
     )
@@ -3452,7 +3334,7 @@ def generate_itu_html_report(all_stats: Dict[str, List[IterativeStats]],
 <h2>2. Executive Summary</h2>
 <p>Iterative convergence uncertainty analysis of {len(all_stats)} case(s) using
 {method} method. Statistics computed from the last N iterations/time-steps.
-Carry-over values for the Aggregator are listed in Section 5 as final values to transfer.</p>
+Carry-over values for CODE 1 are listed in Section 5 as final values to transfer.</p>
 
 <h2>3. Per-Case Statistics</h2>
 {case_tables if case_tables else '<p><i>Batch-only mode selected.</i></p>'}
@@ -3460,7 +3342,7 @@ Carry-over values for the Aggregator are listed in Section 5 as final values to 
 <h2>4. Cross-Case Batch Results</h2>
 {batch_html if batch_html else '<p><i>No batch results.</i></p>'}
 
-<h2>5. Carry-Over Summary for Aggregator</h2>
+<h2>5. Carry-Over Summary for CODE 1</h2>
 {carry_html}
 
 <h2>6. Charts</h2>
@@ -3680,9 +3562,7 @@ class IterativeUncertaintyWindow(QMainWindow):
         self._tabs.addTab(self._tab_report, "\U0001f4cb Report")
         self._tabs.addTab(self._tab_ref, "\U0001f4d6 Reference")
 
-        # Wire signals — cross-tab private member access is intentional here:
-        # the main window orchestrates tab interactions in a single-window
-        # architecture, so direct wiring avoids unnecessary public API surface.
+        # Wire signals
         self._tab_analysis._btn_compute.clicked.connect(self._run_analysis)
         self._tab_analysis._cmb_case.currentTextChanged.connect(
             lambda c: self._tab_analysis.update_file_list(
@@ -3770,8 +3650,6 @@ class IterativeUncertaintyWindow(QMainWindow):
             drift_limit=self._tab_analysis._spn_drift_limit.value(),
             allan_limit=self._tab_analysis._spn_allan_limit.value())
         if all_case_stats:
-            # Intentional: batch results replace single-case stats so that
-            # the report and carry-over table reflect the full batch run.
             self._tab_analysis._all_stats = all_case_stats
         self._status_bar.showMessage("Batch processing complete.", 5000)
 
@@ -3812,7 +3690,7 @@ class IterativeUncertaintyWindow(QMainWindow):
             self, "Export HTML Report", os.path.expanduser("~"),
             "HTML Files (*.html);;All Files (*)")
         if not filepath:
-            return  # Cancelled dialog — status bar keeps previous message (standard UX)
+            return
         try:
             with open(filepath, 'w', encoding='utf-8') as f:
                 f.write(html)
@@ -3869,11 +3747,11 @@ class IterativeUncertaintyWindow(QMainWindow):
         analysis_menu.addAction(act_batch)
 
         examples_menu = mb.addMenu("Examples")
-        act_example = QAction("Example 1: Steady Thermal (Stationary)", self)
+        act_example = QAction("Load Built-in Example Cases", self)
         act_example.triggered.connect(self._load_example_data)
         examples_menu.addAction(act_example)
 
-        act_example_ns = QAction("Example 2: Non-Stationary (Trending)", self)
+        act_example_ns = QAction("Example 4: Non-Stationary (Trending)", self)
         act_example_ns.triggered.connect(self._load_example_nonstationary_data)
         examples_menu.addAction(act_example_ns)
 
@@ -3892,12 +3770,6 @@ class IterativeUncertaintyWindow(QMainWindow):
         self._edit_notes.clear()
         self._cmb_consequence.setCurrentText("Medium")
         self._unsaved_changes = False
-        # Clear all tab state so nothing is stale
-        self._tab_import.clear()
-        self._tab_analysis.clear()
-        self._tab_charts.clear()
-        self._tab_batch.clear()
-        self._tab_report.clear()
 
     def _load_example_data(self):
         self._tab_import._load_example_dataset()

@@ -613,6 +613,10 @@ def _figure_to_base64(fig) -> str:
                 ax.title.set_color(props['title_color'])
             ax.xaxis.label.set_color(props['xlabel_color'])
             ax.yaxis.label.set_color(props['ylabel_color'])
+            # NOTE: Tick colors are restored from the global PLOT_STYLE rather
+            # than per-axis originals because tick_params() does not expose a
+            # getter. This is acceptable as long as all axes share the same
+            # tick color from the dark theme stylesheet.
             ax.tick_params(axis='x', colors=PLOT_STYLE['xtick.color'])
             ax.tick_params(axis='y', colors=PLOT_STYLE['ytick.color'])
             for s_name, s_color in props['spine_colors'].items():
@@ -1470,6 +1474,7 @@ class DataInputTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._columns: List[ColumnData] = [ColumnData(name="Variable 1")]
+        self._results_exist_fn = None  # Set by main window to check if results exist
         self._setup_ui()
 
     def _setup_ui(self):
@@ -1568,7 +1573,9 @@ class DataInputTab(QWidget):
         gc_lay.addLayout(form2)
 
         # Data mirroring controls
-        grp_mirror = QGroupBox("Data Mirroring")
+        grp_mirror = QGroupBox("Advanced: Data Mirroring")
+        grp_mirror.setCheckable(True)
+        grp_mirror.setChecked(False)
         grp_mirror.setToolTip(
             "Mirror data about a center value to create a symmetric dataset.\n"
             "Use this when you measured only one side of a symmetric phenomenon\n"
@@ -1669,9 +1676,19 @@ class DataInputTab(QWidget):
             return
         text = item.text().strip()
         if not text:
-            return  # empty cell is OK
+            # Even clearing a cell is a data modification
+            if self._results_exist_fn and self._results_exist_fn():
+                self._guidance.set_guidance(
+                    "Data modified \u2014 re-run analysis for updated results.",
+                    'yellow')
+            return
         try:
             float(text)
+            # Valid numeric edit — check for stale results
+            if self._results_exist_fn and self._results_exist_fn():
+                self._guidance.set_guidance(
+                    "Data modified \u2014 re-run analysis for updated results.",
+                    'yellow')
         except ValueError:
             # Flash cell red to indicate rejected value
             original_bg = item.background()
@@ -1714,10 +1731,13 @@ class DataInputTab(QWidget):
         self._update_summary()
 
     def _update_combo(self):
+        saved_idx = self._cmb_active_col.currentIndex()
         self._cmb_active_col.blockSignals(True)
         self._cmb_active_col.clear()
         for i, col in enumerate(self._columns):
             self._cmb_active_col.addItem(f"{i+1}: {col.name}")
+        if 0 <= saved_idx < self._cmb_active_col.count():
+            self._cmb_active_col.setCurrentIndex(saved_idx)
         self._cmb_active_col.blockSignals(False)
 
     def _update_summary(self):
@@ -1804,7 +1824,11 @@ class DataInputTab(QWidget):
         idx = self._cmb_active_col.currentIndex()
         if 0 <= idx < len(self._columns):
             self._columns[idx].unit_category = cat
-            if units:
+            current_unit = self._columns[idx].unit
+            if current_unit and current_unit in units:
+                # Preserve existing unit if it is valid in the new category
+                self._cmb_unit.setCurrentText(current_unit)
+            elif units:
                 self._columns[idx].unit = units[0]
                 self._cmb_unit.setCurrentText(units[0])
 
@@ -1849,11 +1873,37 @@ class DataInputTab(QWidget):
 
     def _set_rows(self):
         n = self._spn_rows.value()
+        # Check if reducing rows would truncate existing data
+        current_rows = self._data_table.rowCount()
+        if n < current_rows:
+            max_data_row = -1
+            for ci in range(self._data_table.columnCount()):
+                for ri in range(n, current_rows):
+                    item = self._data_table.item(ri, ci)
+                    if item and item.text().strip():
+                        max_data_row = max(max_data_row, ri)
+            if max_data_row >= n:
+                reply = QMessageBox.question(
+                    self, "Confirm Row Reduction",
+                    f"Reducing rows from {current_rows} to {n} will discard "
+                    f"data in rows {n + 1}\u2013{max_data_row + 1}. Continue?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if reply != QMessageBox.Yes:
+                    self._spn_rows.blockSignals(True)
+                    self._spn_rows.setValue(current_rows)
+                    self._spn_rows.blockSignals(False)
+                    return
         self._data_table.setRowCount(n)
 
     @staticmethod
     def _parse_tabular_text(text: str) -> Tuple[List[str], List[List[float]], bool]:
-        """Parse CSV/TSV block and return headers, data rows, and header flag."""
+        """Parse CSV/TSV block and return headers, data rows, and header flag.
+
+        NOTE: Header detection uses a heuristic — if any cell in the first row
+        cannot be parsed as a float, the row is treated as a header. This means
+        purely numeric column names (e.g. "1", "2.5") will be misidentified as
+        data. This is a reasonable trade-off for the common case.
+        """
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
         if not lines:
             return [], [], False
@@ -1901,6 +1951,8 @@ class DataInputTab(QWidget):
             vals = [r[ci] for r in data_rows]
             self._columns.append(ColumnData(name=name, values=vals))
         self._rebuild_table()
+        # Sync mirror UI controls to the new active column
+        self._on_active_col_changed(self._cmb_active_col.currentIndex())
 
     def _table_is_effectively_empty(self) -> bool:
         self._sync_table_to_columns()
@@ -1991,19 +2043,30 @@ class DataInputTab(QWidget):
             return
         n_cols = max(len(r) for r in data_rows)
 
+        # Count NaN values introduced from non-numeric cells
+        nan_count = sum(
+            1 for row in data_rows for val in row if np.isnan(val)
+        )
+
         if has_header and self._table_is_effectively_empty():
             self._replace_dataset(headers, data_rows)
-            self._guidance.set_guidance(
-                f"Pasted {len(data_rows)} rows \u00d7 {n_cols} columns as a new dataset.",
-                'green'
-            )
+            msg = f"Pasted {len(data_rows)} rows \u00d7 {n_cols} columns as a new dataset."
+            if nan_count > 0:
+                self._guidance.set_guidance(
+                    f"{msg} Warning: {nan_count} non-numeric value(s) were "
+                    f"converted to empty cells.", 'yellow')
+            else:
+                self._guidance.set_guidance(msg, 'green')
             return
 
         n_rows, n_cols = self._paste_into_existing_columns(headers, data_rows, has_header)
-        self._guidance.set_guidance(
-            f"Pasted {n_rows} rows \u00d7 {n_cols} columns at selected cell anchor.",
-            'green'
-        )
+        msg = f"Pasted {n_rows} rows \u00d7 {n_cols} columns at selected cell anchor."
+        if nan_count > 0:
+            self._guidance.set_guidance(
+                f"{msg} Warning: {nan_count} non-numeric value(s) were "
+                f"converted to empty cells.", 'yellow')
+        else:
+            self._guidance.set_guidance(msg, 'green')
 
     def _load_example_dataset(self):
         """Populate a reproducible CFD-style example for quick validation."""
@@ -2164,6 +2227,7 @@ class StatisticsTab(QWidget):
 
         # Summary statistics table
         self._summary_table = QTableWidget()
+        self._summary_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._summary_table.setToolTip(
             "Summary statistics for the selected variable.\n"
             "DOF uses autocorrelation-adjusted N_eff \u2212 1.\n"
@@ -2187,6 +2251,7 @@ class StatisticsTab(QWidget):
             "[JCGM 100:2008 \u00a74.3, JCGM 101:2008]")
         gd_lay = QVBoxLayout(grp_dist)
         self._dist_table = QTableWidget()
+        self._dist_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._dist_table.setColumnCount(13)
         self._dist_table.setHorizontalHeaderLabels([
             "Rank", "Distribution", "Parameters", "AICc", "Delta AICc",
@@ -2260,8 +2325,9 @@ class StatisticsTab(QWidget):
             ("Best-Fit GOF Method", (
                 "Bootstrap AD" if (r.best_fit and r.best_fit.gof_method == "bootstrap_ad")
                 else "KS screening (fast mode)" if (r.best_fit and r.best_fit.gof_method == "ks_screening")
-                else "KS fallback (bootstrap failed)" if r.best_fit
-                else "—"
+                else "KS fallback (bootstrap failed)" if (r.best_fit and r.best_fit.gof_method == "ks_fallback")
+                else r.best_fit.gof_method if r.best_fit
+                else "\u2014"
             )),
             ("Best-Fit GOF Pass?",
              "Yes" if (r.best_fit and r.best_fit.passed_gof) else "No"),
@@ -2332,6 +2398,17 @@ class StatisticsTab(QWidget):
         else:
             sev = 'red'
         self._guidance.set_guidance(r.recommendation, sev)
+
+    def clear(self):
+        """Reset statistics tab to initial state."""
+        self._results = []
+        self._cmb_var.blockSignals(True)
+        self._cmb_var.clear()
+        self._cmb_var.blockSignals(False)
+        self._summary_table.setRowCount(0)
+        self._dist_table.setRowCount(0)
+        self._guidance.set_guidance(
+            "Click 'Compute Statistics' after entering data.", 'green')
 
     def get_results(self) -> List[ColumnStatistics]:
         return self._results
@@ -2406,10 +2483,10 @@ class ChartsTab(QWidget):
         if idx < 0 or idx >= len(self._results):
             return None, None
         r = self._results[idx]
-        # Find matching column
-        for c in self._columns:
-            if c.name == r.variable:
-                return c.analysis_values(), r
+        # Match column by index position in the results list rather than by
+        # name, which avoids ambiguity when duplicate column names exist.
+        if idx < len(self._columns):
+            return self._columns[idx].analysis_values(), r
         return None, None
 
     def _update_charts(self):
@@ -2540,6 +2617,16 @@ class ChartsTab(QWidget):
             QMessageBox.critical(self, "Export Error", str(e))
         self._canvas.draw()
 
+    def clear(self):
+        """Reset charts tab to initial state."""
+        self._columns = []
+        self._results = []
+        self._cmb_var.blockSignals(True)
+        self._cmb_var.clear()
+        self._cmb_var.blockSignals(False)
+        self._fig.clear()
+        self._canvas.draw()
+
     def get_figure(self) -> Figure:
         return self._fig
 
@@ -2554,6 +2641,7 @@ class CarryOverTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._override_widgets: Dict[int, Tuple[QComboBox, QComboBox, QLineEdit]] = {}
+        self._carry_results: List[ColumnStatistics] = []
         self._setup_ui()
 
     def _setup_ui(self):
@@ -2569,6 +2657,7 @@ class CarryOverTab(QWidget):
         layout.addWidget(lbl)
 
         self._table = QTableWidget()
+        self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.setToolTip(
             "Each row is one variable's carry-over package for the Aggregator.\n"
             "\u03c3 = population standard deviation (1-sigma).\n"
@@ -2693,8 +2782,8 @@ class CarryOverTab(QWidget):
             note_item.setData(Qt.UserRole, note_item.text())
             self._table.setItem(i, 12, note_item)
 
-            if i in prev:
-                prev_dist, prev_method, prev_reason = prev[i]
+            if r.variable in prev:
+                prev_dist, prev_method, prev_reason = prev[r.variable]
                 if prev_dist in [cmb_dist.itemText(j) for j in range(cmb_dist.count())]:
                     cmb_dist.setCurrentText(prev_dist)
                 if prev_method in [cmb_method.itemText(j) for j in range(cmb_method.count())]:
@@ -2703,11 +2792,18 @@ class CarryOverTab(QWidget):
 
         self._refresh_final_decisions()
 
-    def _capture_override_state(self) -> Dict[int, Tuple[str, str, str]]:
-        state: Dict[int, Tuple[str, str, str]] = {}
+    def _capture_override_state(self) -> Dict[str, Tuple[str, str, str]]:
+        """Capture override state keyed by variable name (not row index)."""
+        state: Dict[str, Tuple[str, str, str]] = {}
         for row, widgets in self._override_widgets.items():
+            name_item = self._table.item(row, 0)
+            if name_item is None:
+                continue
+            var_name = name_item.text().strip()
+            if not var_name:
+                continue
             dist_cmb, method_cmb, reason_edit = widgets
-            state[row] = (
+            state[var_name] = (
                 dist_cmb.currentText().strip(),
                 method_cmb.currentText().strip(),
                 reason_edit.text().strip(),
@@ -2808,7 +2904,7 @@ class CarryOverTab(QWidget):
         """Return result objects with carry-over overrides applied."""
         effective: List[ColumnStatistics] = []
         for i, r in enumerate(results):
-            rr = copy.copy(r)
+            rr = copy.deepcopy(r)
             widgets = self._override_widgets.get(i)
             rationale = ""
             if widgets:
@@ -2854,6 +2950,17 @@ class CarryOverTab(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "Clipboard Error",
                                 f"Could not copy to clipboard:\n{e}")
+
+    def clear(self):
+        """Reset carry-over tab to initial state."""
+        self._carry_results = []
+        self._override_widgets = {}
+        self._table.setRowCount(0)
+        self._guidance.set_guidance(
+            "After computing statistics, this table is auto-populated with "
+            "the values you should enter into the VVUQ Uncertainty Aggregator "
+            "as uncertainty sources. Use overrides only when justified, and "
+            "always provide a rationale.", 'green')
 
 
 # =============================================================================
@@ -3017,7 +3124,7 @@ class ReferenceTab(QWidget):
         <tr><td>Shapiro-Wilk</td><td>Normality test (p &gt; 0.05 \u2192 normal)</td></tr>
         <tr><td>Skewness</td><td>Measure of asymmetry (0 = symmetric)</td></tr>
         <tr><td>Kurtosis</td><td>Measure of tail weight (0 = Normal-like)</td></tr>
-        <tr><td>u<sub>mean</sub></td><td>Standard uncertainty of the mean = \u03c3/\u221aN</td></tr>
+        <tr><td>u<sub>mean</sub></td><td>Standard uncertainty of the mean = \u03c3/\u221aN<sub>eff</sub>, where N<sub>eff</sub> is the autocorrelation-adjusted effective sample size</td></tr>
         <tr><td>Coverage factor k</td><td>Multiplier for expanded uncertainty U = k \u00b7 u</td></tr>
         </table>
         </body></html>"""
@@ -3100,8 +3207,9 @@ def generate_html_report(results: List[ColumnStatistics], project_meta: dict,
 
     rec_html = ""
     for r in results:
-        color = '#a6e3a1' if r.n >= 30 and r.is_normal else (
-            '#f9e2af' if r.n >= 10 else '#f38ba8')
+        # Use dark, high-contrast colors readable on the white report background
+        color = '#2d8a4e' if r.n >= 30 and r.is_normal else (
+            '#b8860b' if r.n >= 10 else '#c0392b')
         rec_html += (
             f'<p style="color:{color};"><b>{_esc_html(r.variable)}:</b> '
             f'{_esc_html(r.recommendation)}</p>'
@@ -3470,6 +3578,10 @@ class StatisticalAnalyzerWindow(QMainWindow):
         self._tab_carry = CarryOverTab()
         self._tab_ref = ReferenceTab()
 
+        # Let DataInputTab know when analysis results exist so it can
+        # show a stale-analysis warning after data edits
+        self._tab_data._results_exist_fn = lambda: bool(self._tab_stats.get_results())
+
         self._tabs.addTab(self._tab_data, "\U0001f4e5 Data Input")
         self._tabs.addTab(self._tab_stats, "\U0001f4ca Statistics")
         self._tabs.addTab(self._tab_charts, "\U0001f4c8 Charts")
@@ -3507,6 +3619,31 @@ class StatisticalAnalyzerWindow(QMainWindow):
 
     def _mark_unsaved(self):
         self._unsaved_changes = True
+
+    def _check_unsaved_changes(self) -> bool:
+        """Check for unsaved changes; return True to proceed, False to cancel."""
+        if not self._unsaved_changes:
+            return True
+        reply = QMessageBox.question(
+            self, "Unsaved Changes",
+            "You have unsaved changes. Do you want to save before continuing?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+        if reply == QMessageBox.Save:
+            self._save_project()
+            return True
+        elif reply == QMessageBox.Discard:
+            return True
+        else:  # Cancel
+            return False
+
+    def closeEvent(self, event):
+        """Prompt to save before closing the application."""
+        if self._check_unsaved_changes():
+            event.accept()
+        else:
+            event.ignore()
 
     def get_project_metadata(self) -> dict:
         return {
@@ -3613,7 +3750,12 @@ class StatisticalAnalyzerWindow(QMainWindow):
     # ---- save / load ----
 
     def _new_project(self):
+        if not self._check_unsaved_changes():
+            return
         self._tab_data._clear_data()
+        self._tab_stats.clear()
+        self._tab_charts.clear()
+        self._tab_carry.clear()
         self._project_path = ""
         self._project_name = "Untitled"
         self._lbl_project_name.setText("Untitled")
@@ -3626,6 +3768,8 @@ class StatisticalAnalyzerWindow(QMainWindow):
         self._status_bar.showMessage("New project created.", 3000)
 
     def _load_example_data(self):
+        if not self._check_unsaved_changes():
+            return
         self._tab_data._load_example_dataset()
         self._tabs.setCurrentWidget(self._tab_data)
         self._status_bar.showMessage(
@@ -3633,6 +3777,8 @@ class StatisticalAnalyzerWindow(QMainWindow):
         )
 
     def _load_example_small_sample(self):
+        if not self._check_unsaved_changes():
+            return
         self._tab_data._load_example_small_sample()
         self._tabs.setCurrentWidget(self._tab_data)
         self._status_bar.showMessage(
@@ -3640,6 +3786,8 @@ class StatisticalAnalyzerWindow(QMainWindow):
         )
 
     def _load_example_autocorrelated(self):
+        if not self._check_unsaved_changes():
+            return
         self._tab_data._load_example_autocorrelated()
         self._tabs.setCurrentWidget(self._tab_data)
         self._status_bar.showMessage(
@@ -3681,6 +3829,8 @@ class StatisticalAnalyzerWindow(QMainWindow):
             QMessageBox.critical(self, "Save Error", f"Could not save:\n{e}")
 
     def _open_project(self):
+        if not self._check_unsaved_changes():
+            return
         filepath, _ = QFileDialog.getOpenFileName(
             self, "Open Project", os.path.expanduser("~"),
             "Statistical Analyzer Project (*.sta);;All Files (*)")
@@ -3713,6 +3863,8 @@ class StatisticalAnalyzerWindow(QMainWindow):
         if not filepath:
             return
         try:
+            # By design, the embedded chart is a snapshot of whatever the user
+            # last viewed on the Charts tab — it is not regenerated here.
             chart_fig = self._tab_charts.get_figure()
             effective_results = self._tab_carry.get_effective_results(results)
             html = generate_html_report(
@@ -3732,7 +3884,8 @@ class StatisticalAnalyzerWindow(QMainWindow):
 
         rows: List[Tuple[str, int, float, float]] = []
         for col in columns:
-            vals = col.valid_values()
+            # Use mirrored (analysis) values when mirror is enabled
+            vals = col.analysis_values() if col.mirror else col.valid_values()
             if len(vals) == 0:
                 continue
             weight = 1.0 / len(vals)

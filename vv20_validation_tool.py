@@ -143,6 +143,20 @@ VVUQ_TERMS: list = [
      "Uncertainty from missing or imperfect physics, closures, or assumptions in the model."),
     ("Carry-Over value",
      "Single uncertainty value selected for transfer into the aggregator workflow."),
+    ("Probability box (p-box)",
+     "Pair of bounding CDFs [F_lower, F_upper] that enclose all possible CDFs "
+     "consistent with the available epistemic information. Produced by double-loop "
+     "Monte Carlo propagation (Oberkampf & Roy 2010; Ferson et al. 2003)."),
+    ("Double-loop Monte Carlo",
+     "Nested sampling strategy where the outer loop varies epistemic parameters "
+     "(intervals or distributions) and the inner loop propagates aleatory "
+     "uncertainty. Produces a family of CDFs whose envelope is a p-box. "
+     "Also known as nested-loop or second-order probability propagation "
+     "(Roy & Oberkampf 2011)."),
+    ("Validation fraction",
+     "Proportion of double-loop epistemic realizations for which the inner-loop "
+     "prediction interval brackets the ideal agreement value (zero). Ranges 0-1; "
+     "higher values indicate more robust validation across the epistemic space."),
 ]
 
 _CHECK_LABELS = {
@@ -886,6 +900,265 @@ def compute_multivariate_validation(cd: 'ComparisonData') -> dict:
     return out
 
 
+def compute_per_location_validation(
+    comp_data: 'ComparisonData',
+    sources: List['UncertaintySource'],
+    k_factor: float,
+    one_sided: bool,
+) -> 'PerLocationValidationResults':
+    """Compute independent validation at each sensor location.
+
+    Parameters
+    ----------
+    comp_data : ComparisonData
+        Comparison error matrix (rows=locations, cols=conditions).
+    sources : list of UncertaintySource
+        Enabled uncertainty sources (already filtered).
+    k_factor : float
+        Coverage factor to use for expanded uncertainty.
+    one_sided : bool
+        If True, use one-sided underprediction criterion (E >= -U_val).
+
+    Returns
+    -------
+    PerLocationValidationResults
+        Per-location verdicts and summary fraction.
+    """
+    result = PerLocationValidationResults(
+        one_sided=one_sided,
+        k_factor=k_factor,
+    )
+
+    loc_stats = comp_data.per_location_stats()
+    if not loc_stats:
+        return result
+
+    # Separate sources by scope
+    global_sigmas = []
+    per_loc_sigmas = []
+    for src in sources:
+        sigma = src.get_standard_uncertainty()
+        if sigma <= 0:
+            continue
+        scope = getattr(src, 'source_scope', 'global')
+        if scope == 'per-location':
+            per_loc_sigmas.append(sigma)
+        else:
+            global_sigmas.append(sigma)
+
+    u_val_global = float(np.sqrt(sum(s ** 2 for s in global_sigmas))) if global_sigmas else 0.0
+    u_val_per_loc = float(np.sqrt(sum(s ** 2 for s in per_loc_sigmas))) if per_loc_sigmas else 0.0
+    u_val_combined = float(np.sqrt(u_val_global ** 2 + u_val_per_loc ** 2))
+    U_val = k_factor * u_val_combined
+
+    result.global_u_val = u_val_global
+    result.per_loc_u_val = u_val_per_loc
+
+    n_pass = 0
+    for ls in loc_stats:
+        loc = PerLocationResult(
+            name=ls['name'],
+            E_mean=ls['mean'],
+            s_E=ls['std'],
+            n=ls['n'],
+            u_val_local=u_val_combined,
+            U_val_local=U_val,
+            orig_row=ls.get('orig_row', 0),
+        )
+
+        # Compute worst/best E from raw data
+        row_idx = ls.get('orig_row', 0)
+        if comp_data.data.ndim == 2 and row_idx < comp_data.data.shape[0]:
+            row = comp_data.data[row_idx, :]
+            row = row[~np.isnan(row)]
+            if len(row) > 0:
+                loc.worst_E = float(np.min(row))
+                loc.best_E = float(np.max(row))
+
+        # Apply validation criterion
+        if one_sided:
+            loc.bias_explained = loc.E_mean >= -U_val
+        else:
+            loc.bias_explained = abs(loc.E_mean) <= U_val
+
+        if loc.bias_explained:
+            n_pass += 1
+        result.locations.append(loc)
+
+    result.n_total = len(result.locations)
+    result.n_validated = n_pass
+    result.fraction_validated = (
+        n_pass / result.n_total if result.n_total > 0 else 0.0
+    )
+    result.computed = True
+
+    # --- Budget-based multivariate validation (V&V 20.1 covariance) ---
+    if result.n_total >= 2 and (u_val_global > 0 or u_val_per_loc > 0):
+        mv = compute_budget_multivariate_validation(
+            comp_data, u_val_global, u_val_per_loc
+        )
+        result.budget_mv_computed = mv['computed']
+        result.budget_mv_d_squared = mv['d_squared']
+        result.budget_mv_d_sq_per_m = mv['d_sq_per_m']
+        result.budget_mv_m = mv['m']
+        result.budget_mv_p_value = mv['p_value']
+        result.budget_mv_verdict = mv['verdict']
+        result.budget_mv_interpretation = mv['interpretation']
+        result.budget_mv_note = mv['note']
+        result.budget_mv_edge_case = mv['edge_case']
+
+    return result
+
+
+def compute_budget_multivariate_validation(
+    comp_data: 'ComparisonData',
+    sigma_global: float,
+    sigma_per_loc: float,
+) -> dict:
+    """Compute budget-based covariance multivariate validation metric.
+
+    Builds the covariance matrix from the uncertainty budget structure
+    (V&V 20.1 compound symmetry approach) rather than from observed
+    scatter.  Global uncertainty sources create off-diagonal terms
+    (all locations shift together); per-location sources create
+    diagonal-only terms (independent between locations).
+
+    The analytic Sherman-Morrison inverse avoids matrix inversion entirely.
+
+    Parameters
+    ----------
+    comp_data : ComparisonData
+        Comparison error matrix (rows=locations, cols=conditions).
+    sigma_global : float
+        RSS standard uncertainty of all global-scope sources (1-sigma).
+    sigma_per_loc : float
+        RSS standard uncertainty of all per-location-scope sources (1-sigma).
+
+    Returns
+    -------
+    dict with keys:
+        computed, d_squared, d_sq_per_m, m, p_value,
+        verdict, interpretation, note, edge_case,
+        sigma_global_used, sigma_per_loc_used
+    """
+    out = {
+        'computed': False,
+        'd_squared': 0.0,
+        'd_sq_per_m': 0.0,
+        'm': 0,
+        'p_value': 1.0,
+        'verdict': '',
+        'interpretation': '',
+        'note': '',
+        'sigma_global_used': sigma_global,
+        'sigma_per_loc_used': sigma_per_loc,
+        'edge_case': '',
+    }
+
+    # Guard: need sources
+    if sigma_global <= 0 and sigma_per_loc <= 0:
+        out['note'] = ("Budget covariance metric not computed: "
+                       "no uncertainty sources with positive sigma.")
+        return out
+
+    # Get per-location mean errors
+    loc_stats = comp_data.per_location_stats()
+    if not loc_stats:
+        out['note'] = "Budget covariance metric not computed: no location data."
+        return out
+
+    m = len(loc_stats)
+    if m < 2:
+        out['note'] = ("Budget covariance metric requires at least 2 locations. "
+                       "With 1 location, use the standard scalar V&V 20 check.")
+        return out
+
+    E_bar = np.array([ls['mean'] for ls in loc_stats], dtype=float)
+
+    var_global = sigma_global ** 2
+    var_per_loc = sigma_per_loc ** 2
+
+    # Edge case: all sources global (sigma_per_loc ≈ 0)
+    # Σ = var_global × J  → rank 1, not invertible.
+    # Reduce to scalar test on grand mean.
+    if var_per_loc < 1e-30:
+        out['edge_case'] = 'all_global'
+        grand_mean = float(np.mean(E_bar))
+        # Under H₀: grand_mean ~ N(0, var_global), so d² = grand_mean²/var_global ~ χ²(1)
+        d2 = grand_mean ** 2 / var_global
+        p_val = float(1.0 - chi2.cdf(d2, df=1))
+        out.update({
+            'computed': True,
+            'd_squared': d2,
+            'd_sq_per_m': d2,   # effective m=1
+            'm': 1,
+            'p_value': p_val,
+            'verdict': 'PASS' if p_val >= 0.05 else 'FAIL',
+            'note': ("All uncertainty sources are global-scope. The covariance "
+                     "matrix is rank 1 (all locations shift together). Reduced "
+                     "to a scalar test on the grand mean of location errors."),
+        })
+    else:
+        # Standard case: compound symmetry matrix
+        # Σ = var_global × J + var_per_loc × I
+        #
+        # Analytic inverse (Sherman-Morrison):
+        # Σ⁻¹ = (1/var_pl) × [I − var_g/(var_pl + m·var_g) × J]
+        #
+        # d² = Ē⃗ᵀ Σ⁻¹ Ē⃗
+        #    = (1/var_pl) × [Σ Ēᵢ² − var_g/(var_pl + m·var_g) × (Σ Ēᵢ)²]
+        sum_sq = float(np.sum(E_bar ** 2))
+        sum_E = float(np.sum(E_bar))
+        alpha = var_global / (var_per_loc + m * var_global)
+
+        d2 = (1.0 / var_per_loc) * (sum_sq - alpha * sum_E ** 2)
+        d2 = max(d2, 0.0)  # numerical guard
+
+        p_val = float(1.0 - chi2.cdf(d2, df=m))
+        d_sq_per_m = d2 / m
+
+        out.update({
+            'computed': True,
+            'd_squared': d2,
+            'd_sq_per_m': d_sq_per_m,
+            'm': m,
+            'p_value': p_val,
+            'verdict': 'PASS' if p_val >= 0.05 else 'FAIL',
+        })
+
+        # Note for all-per-location edge case
+        if var_global < 1e-30:
+            out['edge_case'] = 'all_per_location'
+            out['note'] = ("All uncertainty sources are per-location scope. "
+                           "The covariance matrix is diagonal (independent "
+                           "checks combined).")
+
+    # Plain-English interpretation
+    ratio = out['d_sq_per_m']
+    p = out['p_value']
+    m_eff = out['m']
+    if ratio <= 0.5:
+        interp = (f"The model errors are well within the uncertainty budget "
+                  f"(d\u00b2/m = {ratio:.2f}). The budget comfortably explains "
+                  f"the observed bias pattern across all {m_eff} locations.")
+    elif ratio <= 1.0:
+        interp = (f"The model errors are consistent with the uncertainty budget "
+                  f"(d\u00b2/m = {ratio:.2f}). The budget adequately explains "
+                  f"the bias pattern across {m_eff} locations.")
+    elif ratio <= 2.0:
+        interp = (f"The model errors are somewhat larger than the budget predicts "
+                  f"(d\u00b2/m = {ratio:.2f}, p = {p:.3f}). Some locations may "
+                  f"have bias beyond what the current uncertainty sources explain.")
+    else:
+        interp = (f"The model errors significantly exceed the uncertainty budget "
+                  f"(d\u00b2/m = {ratio:.2f}, p = {p:.4f}). The budget does not "
+                  f"explain the observed bias pattern. Consider additional "
+                  f"uncertainty sources or investigate systematic modeling errors.")
+    out['interpretation'] = interp
+
+    return out
+
+
 def assess_distribution(stats_dict):
     """
     Provide automated distribution assessment based on descriptive statistics.
@@ -1543,6 +1816,8 @@ class UncertaintySource:
     # Interval bounds for epistemic interval representation (double-loop MC)
     interval_lower: float = 0.0            # lower bound when representation="interval"
     interval_upper: float = 0.0            # upper bound when representation="interval"
+    # Source scope for per-location validation
+    source_scope: str = "global"           # "global" or "per-location"
     # Asymmetric uncertainty (GUM §4.3.8, Barlow 2004)
     asymmetric: bool = False                # Enable asymmetric mode
     sigma_upper: float = 0.0               # σ⁺ (positive direction)
@@ -1641,7 +1916,8 @@ class ComparisonData:
     sensor_names: List[str] = field(default_factory=list)
     condition_names: List[str] = field(default_factory=list)
     unit: str = "°F"
-    is_pooled: bool = True
+    is_pooled: bool = False
+    pooling_rationale: str = ""
 
     def flat_data(self) -> np.ndarray:
         """Return all data as a flat 1D array."""
@@ -1682,6 +1958,7 @@ class ComparisonData:
             'condition_names': self.condition_names,
             'unit': self.unit,
             'is_pooled': self.is_pooled,
+            'pooling_rationale': self.pooling_rationale,
         }
 
     @staticmethod
@@ -1692,6 +1969,7 @@ class ComparisonData:
         cd.condition_names = d.get('condition_names', [])
         cd.unit = d.get('unit', '°F')
         cd.is_pooled = d.get('is_pooled', True)
+        cd.pooling_rationale = d.get('pooling_rationale', '')
         return cd
 
 
@@ -1747,6 +2025,7 @@ class RSSResults:
     u_model: float = 0.0
     model_form_pct: float = 0.0
     bias_explained: Optional[bool] = None
+    one_sided: bool = False                # True if one-sided criterion was used
     source_contributions: List[dict] = field(default_factory=list)
     computed: bool = False
     has_correlations: bool = False
@@ -1767,6 +2046,117 @@ class RSSResults:
     multivariate_n_locations: int = 0
     multivariate_n_conditions: int = 0
     multivariate_note: str = ""
+
+
+@dataclass
+class PerLocationResult:
+    """Validation result for a single sensor location."""
+    name: str = ""
+    E_mean: float = 0.0          # mean comparison error at this location
+    s_E: float = 0.0             # std dev of comparison errors
+    n: int = 0                   # number of conditions
+    u_val_local: float = 0.0     # combined standard uncertainty for this location
+    U_val_local: float = 0.0     # expanded uncertainty (k * u_val_local)
+    bias_explained: Optional[bool] = None
+    worst_E: float = 0.0         # most negative single-condition E
+    best_E: float = 0.0          # most positive single-condition E
+    orig_row: int = 0            # row index in comparison data
+
+
+@dataclass
+class PerLocationValidationResults:
+    """Container for per-location validation across all sensor locations."""
+    locations: List[PerLocationResult] = field(default_factory=list)
+    n_validated: int = 0
+    n_total: int = 0
+    fraction_validated: float = 0.0
+    global_u_val: float = 0.0    # RSS of global-scope sources
+    per_loc_u_val: float = 0.0   # RSS of per-location-scope sources
+    one_sided: bool = True
+    k_factor: float = 2.0
+    computed: bool = False
+    # Budget-based multivariate validation (V&V 20.1 covariance-aware)
+    budget_mv_computed: bool = False
+    budget_mv_d_squared: float = 0.0
+    budget_mv_d_sq_per_m: float = 0.0
+    budget_mv_m: int = 0
+    budget_mv_p_value: float = 1.0
+    budget_mv_verdict: str = ""
+    budget_mv_interpretation: str = ""
+    budget_mv_note: str = ""
+    budget_mv_edge_case: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            'locations': [
+                {
+                    'name': loc.name,
+                    'E_mean': loc.E_mean,
+                    's_E': loc.s_E,
+                    'n': loc.n,
+                    'u_val_local': loc.u_val_local,
+                    'U_val_local': loc.U_val_local,
+                    'bias_explained': loc.bias_explained,
+                    'worst_E': loc.worst_E,
+                    'best_E': loc.best_E,
+                    'orig_row': loc.orig_row,
+                }
+                for loc in self.locations
+            ],
+            'n_validated': self.n_validated,
+            'n_total': self.n_total,
+            'fraction_validated': self.fraction_validated,
+            'global_u_val': self.global_u_val,
+            'per_loc_u_val': self.per_loc_u_val,
+            'one_sided': self.one_sided,
+            'k_factor': self.k_factor,
+            'computed': self.computed,
+            'budget_mv_computed': self.budget_mv_computed,
+            'budget_mv_d_squared': self.budget_mv_d_squared,
+            'budget_mv_d_sq_per_m': self.budget_mv_d_sq_per_m,
+            'budget_mv_m': self.budget_mv_m,
+            'budget_mv_p_value': self.budget_mv_p_value,
+            'budget_mv_verdict': self.budget_mv_verdict,
+            'budget_mv_interpretation': self.budget_mv_interpretation,
+            'budget_mv_note': self.budget_mv_note,
+            'budget_mv_edge_case': self.budget_mv_edge_case,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> 'PerLocationValidationResults':
+        r = PerLocationValidationResults()
+        r.n_validated = d.get('n_validated', 0)
+        r.n_total = d.get('n_total', 0)
+        r.fraction_validated = d.get('fraction_validated', 0.0)
+        r.global_u_val = d.get('global_u_val', 0.0)
+        r.per_loc_u_val = d.get('per_loc_u_val', 0.0)
+        r.one_sided = d.get('one_sided', True)
+        r.k_factor = d.get('k_factor', 2.0)
+        r.computed = d.get('computed', False)
+        r.budget_mv_computed = d.get('budget_mv_computed', False)
+        r.budget_mv_d_squared = d.get('budget_mv_d_squared', 0.0)
+        r.budget_mv_d_sq_per_m = d.get('budget_mv_d_sq_per_m', 0.0)
+        r.budget_mv_m = d.get('budget_mv_m', 0)
+        r.budget_mv_p_value = d.get('budget_mv_p_value', 1.0)
+        r.budget_mv_verdict = d.get('budget_mv_verdict', '')
+        r.budget_mv_interpretation = d.get('budget_mv_interpretation', '')
+        r.budget_mv_note = d.get('budget_mv_note', '')
+        r.budget_mv_edge_case = d.get('budget_mv_edge_case', '')
+        for loc_d in d.get('locations', []):
+            loc = PerLocationResult(
+                name=loc_d.get('name', ''),
+                E_mean=loc_d.get('E_mean', 0.0),
+                s_E=loc_d.get('s_E', 0.0),
+                n=loc_d.get('n', 0),
+                u_val_local=loc_d.get('u_val_local', 0.0),
+                U_val_local=loc_d.get('U_val_local', 0.0),
+                bias_explained=loc_d.get('bias_explained'),
+                worst_E=loc_d.get('worst_E', 0.0),
+                best_E=loc_d.get('best_E', 0.0),
+                orig_row=loc_d.get('orig_row', 0),
+            )
+            r.locations.append(loc)
+        return r
 
 
 @dataclass
@@ -1864,6 +2254,19 @@ class DoubleLoopMCResults:
                 continue  # skip any remaining arrays
             d[k] = v
         return d
+
+    @staticmethod
+    def from_dict(d: dict) -> 'DoubleLoopMCResults':
+        """Reconstruct from serialized dict (scalar fields only).
+
+        Large arrays (p-box, per-realization bounds) are NOT restored
+        because they are excluded from ``to_dict()`` for file-size reasons.
+        The ``computed`` flag is preserved so the roll-up / report can still
+        display the scalar summary values.
+        """
+        known = DoubleLoopMCResults.__dataclass_fields__
+        filtered = {k: v for k, v in d.items() if k in known}
+        return DoubleLoopMCResults(**filtered)
 
 
 # =============================================================================
@@ -2651,11 +3054,12 @@ class ComparisonDataTab(QWidget):
         form.addRow("Total Sample Count (n):", self._lbl_n_total)
 
         self._chk_pooled = QCheckBox("Treat as pooled data")
-        self._chk_pooled.setChecked(True)
+        self._chk_pooled.setChecked(False)
         self._chk_pooled.setToolTip(
             "When checked, all sensor locations are pooled into a single\n"
-            "sample for computing E\u0304 and s_E. This assumes the comparison\n"
+            "sample for computing \u0112 and s_E. This assumes the comparison\n"
             "error distribution is stationary across locations.\n"
+            "When unchecked (recommended), per-location validation is used.\n"
             "[ASME V&V 20 \u00a72.4, GUM \u00a74.2]"
         )
         form.addRow(self._chk_pooled)
@@ -2668,6 +3072,31 @@ class ComparisonDataTab(QWidget):
         note.setWordWrap(True)
         note.setStyleSheet(f"color: {DARK_COLORS['fg_dim']}; font-size: 11px;")
         form.addRow(note)
+
+        self._lbl_pooling_rationale = QLabel("Pooling rationale:")
+        self._txt_pooling_rationale = QPlainTextEdit()
+        self._txt_pooling_rationale.setPlaceholderText(
+            "Describe which structural region, T/C locations, and operating "
+            "conditions are pooled and why this is justified.\n\n"
+            "Example: \"Comparison errors from 12 thermocouple locations on "
+            "the forward fuselage crown panel (FS 400\u2013520) across 3 flight "
+            "conditions (Mach 0.8/1.2/1.6 at 35 kft) are pooled into a "
+            "single sample of N=36. Pooling is justified because (a) the "
+            "thermal environment is similar across this panel zone, (b) the "
+            "Levene test p=0.42 shows no significant variance difference "
+            "across locations, and (c) pooling provides the sample size "
+            "needed for reliable statistical characterization.\""
+        )
+        self._txt_pooling_rationale.setMaximumHeight(90)
+        self._txt_pooling_rationale.setToolTip(
+            "This text is included verbatim in the Assumptions section\n"
+            "and HTML report to document the pooling justification.\n"
+            "Required for audit traceability when pooling across\n"
+            "locations and/or conditions."
+        )
+        self._lbl_pooling_rationale.setVisible(True)
+        self._txt_pooling_rationale.setVisible(True)
+        form.addRow(self._lbl_pooling_rationale, self._txt_pooling_rationale)
 
         self._cmb_unit = QComboBox()
         self._cmb_unit.addItems(UNIT_OPTIONS)
@@ -2740,24 +3169,48 @@ class ComparisonDataTab(QWidget):
 
     # -- Per-Location Breakdown (collapsible) --
     def _build_per_location_section(self):
-        self._grp_locations = QGroupBox("Per-Location Breakdown")
+        self._grp_locations = QGroupBox("Per-Location Validation Breakdown")
         self._grp_locations.setCheckable(True)
         self._grp_locations.setChecked(False)
         self._grp_locations.setToolTip(
-            "Statistics for each individual sensor location.\n"
-            "Locations whose mean deviates more than 2\u03c3 from the\n"
-            "overall mean are flagged as potential outlier locations.\n"
+            "Per-location validation: each sensor location is assessed\n"
+            "independently against the expanded uncertainty. Locations\n"
+            "whose mean deviates more than 2\u03c3 from the overall mean\n"
+            "are also flagged as potential outliers.\n"
             "[ASME V&V 20 \u00a72.4]"
         )
         self._loc_layout = QVBoxLayout(self._grp_locations)
+
+        # Summary label
+        self._lbl_loc_summary = QLabel("")
+        self._lbl_loc_summary.setWordWrap(True)
+        self._lbl_loc_summary.setStyleSheet(
+            f"font-weight: bold; padding: 4px; color: {DARK_COLORS['fg']};"
+        )
+        self._loc_layout.addWidget(self._lbl_loc_summary)
+
         self._loc_table = QTableWidget()
-        self._loc_table.setColumnCount(4)
-        self._loc_table.setHorizontalHeaderLabels(["Location", "Mean", "Std Dev", "Flag"])
+        self._loc_table.setColumnCount(7)
+        self._loc_table.setHorizontalHeaderLabels([
+            "Location", "Mean \u0112", "Std Dev", "n",
+            "U_val", "Verdict", "Flag"
+        ])
         style_table(self._loc_table,
-                    column_widths={0: 120, 1: 90, 2: 90, 3: 100},
+                    column_widths={0: 120, 1: 80, 2: 80, 3: 40,
+                                   4: 80, 5: 70, 6: 60},
                     stretch_col=0)
         self._loc_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._loc_layout.addWidget(self._loc_table)
+
+        # Budget covariance multivariate summary (V&V 20.1)
+        self._lbl_budget_mv = QLabel("")
+        self._lbl_budget_mv.setWordWrap(True)
+        self._lbl_budget_mv.setStyleSheet(
+            f"font-size: 11px; padding: 4px 8px; color: {DARK_COLORS['fg']};"
+            f"border-left: 3px solid {DARK_COLORS['border']}; margin-top: 4px;"
+        )
+        self._lbl_budget_mv.setVisible(False)
+        self._loc_layout.addWidget(self._lbl_budget_mv)
 
         self._left_layout.addWidget(self._grp_locations)
 
@@ -2800,6 +3253,9 @@ class ComparisonDataTab(QWidget):
         self._btn_clear.clicked.connect(self._on_clear)
         self._data_table.cellChanged.connect(self._on_table_edited)
         self._chk_pooled.stateChanged.connect(self._on_pooled_changed)
+        self._txt_pooling_rationale.textChanged.connect(
+            self._on_pooling_rationale_changed
+        )
         self._cmb_unit.currentTextChanged.connect(self._on_unit_changed)
 
     # -----------------------------------------------------------------
@@ -2907,6 +3363,7 @@ class ComparisonDataTab(QWidget):
             condition_names=condition_names,
             unit=self._cmb_unit.currentText(),
             is_pooled=self._chk_pooled.isChecked(),
+            pooling_rationale=self._txt_pooling_rationale.toPlainText().strip(),
         )
 
     def _on_paste(self):
@@ -2952,12 +3409,18 @@ class ComparisonDataTab(QWidget):
         self._data_table.setColumnCount(0)
         self._data_table.blockSignals(False)
         self._stats = {}
+        self._per_loc_results = None
         self._update_metadata_labels()
         self._clear_stat_labels()
         self._dist_guidance.clear()
         self._sample_guidance.clear()
+        self._lbl_loc_summary.clear()
+        self._lbl_budget_mv.clear()
+        self._lbl_budget_mv.setVisible(False)
         self._loc_table.setRowCount(0)
         self._clear_plots()
+        if hasattr(self, '_logged_warnings'):
+            self._logged_warnings.clear()
         audit_log.log("DATA_CLEAR", "Comparison data cleared.")
         self.data_changed.emit()
 
@@ -3003,7 +3466,13 @@ class ComparisonDataTab(QWidget):
         self._update_metadata_labels()
 
     def _on_table_edited(self, row, col):
-        """Handle user edits to the data table."""
+        """Handle user edits to the data table.
+
+        Note: The bounds checks (row < shape[0], col < shape[1]) are intentional
+        defensive code. Qt can emit cellChanged signals for rows/cols outside the
+        backing array (e.g. during resize or row removal). Edits that fall outside
+        the array bounds are silently ignored — this is by design.
+        """
         item = self._data_table.item(row, col)
         if item is None:
             return
@@ -3050,6 +3519,11 @@ class ComparisonDataTab(QWidget):
         self.update_stats()
         self.update_plots()
         self.data_changed.emit()
+
+    def _on_pooling_rationale_changed(self):
+        self._comp_data.pooling_rationale = (
+            self._txt_pooling_rationale.toPlainText().strip()
+        )
 
     def _on_unit_changed(self, unit_text):
         self._comp_data.unit = unit_text
@@ -3156,10 +3630,15 @@ class ComparisonDataTab(QWidget):
     # -----------------------------------------------------------------
     # PER-LOCATION BREAKDOWN
     # -----------------------------------------------------------------
-    def _update_per_location(self):
+    def _update_per_location(self, sources=None, rss_results=None):
+        """Update per-location table with validation verdict when available."""
         loc_stats = self._comp_data.per_location_stats()
         self._loc_table.setRowCount(len(loc_stats))
+        self._per_loc_results = None  # reset
         if not loc_stats:
+            self._lbl_loc_summary.setText("")
+            self._lbl_budget_mv.setText("")
+            self._lbl_budget_mv.setVisible(False)
             return
 
         overall_mean = self._stats.get('mean', 0.0)
@@ -3167,15 +3646,55 @@ class ComparisonDataTab(QWidget):
         if overall_std == 0:
             overall_std = 1.0
 
+        # Compute per-location validation if sources and RSS are available
+        pl_results = None
+        if sources and rss_results and rss_results.computed:
+            enabled = [
+                s for s in sources
+                if getattr(s, 'enabled', True) and s.get_standard_uncertainty() > 0
+            ]
+            pl_results = compute_per_location_validation(
+                self._comp_data,
+                enabled,
+                rss_results.k_factor,
+                getattr(rss_results, 'one_sided', False),
+            )
+            self._per_loc_results = pl_results
+
+        # Build a map from location name to PerLocationResult for lookup
+        pl_map = {}
+        if pl_results and pl_results.computed:
+            for plr in pl_results.locations:
+                pl_map[plr.name] = plr
+
         for i, ls in enumerate(loc_stats):
             name_item = QTableWidgetItem(ls['name'])
-            mean_item = QTableWidgetItem(f"{ls['mean']:.6g}")
-            std_item = QTableWidgetItem(f"{ls['std']:.6g}")
+            mean_item = QTableWidgetItem(f"{ls['mean']:+.4g}")
+            std_item = QTableWidgetItem(f"{ls['std']:.4g}")
+            n_item = QTableWidgetItem(str(ls['n']))
+            n_item.setTextAlignment(Qt.AlignCenter)
 
+            plr = pl_map.get(ls['name'])
+            if plr is not None:
+                uval_item = QTableWidgetItem(f"{plr.U_val_local:.4g}")
+                uval_item.setTextAlignment(Qt.AlignCenter)
+                if plr.bias_explained:
+                    verdict_item = QTableWidgetItem("PASS")
+                    verdict_item.setForeground(QColor(DARK_COLORS['green']))
+                else:
+                    verdict_item = QTableWidgetItem("FAIL")
+                    verdict_item.setForeground(QColor(DARK_COLORS['red']))
+                verdict_item.setTextAlignment(Qt.AlignCenter)
+            else:
+                uval_item = QTableWidgetItem("\u2014")
+                verdict_item = QTableWidgetItem("\u2014")
+
+            # Outlier flag (same logic as before)
             deviation = abs(ls['mean'] - overall_mean)
             if deviation > 2.0 * overall_std:
-                flag_item = QTableWidgetItem(
-                    f"\u26A0 |mean - \u0112| = {deviation:.4g} > 2\u03c3 = {2*overall_std:.4g}"
+                flag_item = QTableWidgetItem("\u26A0")
+                flag_item.setToolTip(
+                    f"|mean - \u0112| = {deviation:.4g} > 2\u03c3 = {2*overall_std:.4g}"
                 )
                 flag_item.setForeground(QColor(DARK_COLORS['red']))
                 warn_key = f"loc_outlier_{ls['name']}"
@@ -3191,11 +3710,71 @@ class ComparisonDataTab(QWidget):
             else:
                 flag_item = QTableWidgetItem("OK")
                 flag_item.setForeground(QColor(DARK_COLORS['green']))
+            flag_item.setTextAlignment(Qt.AlignCenter)
 
             self._loc_table.setItem(i, 0, name_item)
             self._loc_table.setItem(i, 1, mean_item)
             self._loc_table.setItem(i, 2, std_item)
-            self._loc_table.setItem(i, 3, flag_item)
+            self._loc_table.setItem(i, 3, n_item)
+            self._loc_table.setItem(i, 4, uval_item)
+            self._loc_table.setItem(i, 5, verdict_item)
+            self._loc_table.setItem(i, 6, flag_item)
+
+        # Update summary label
+        if pl_results and pl_results.computed:
+            n_v = pl_results.n_validated
+            n_t = pl_results.n_total
+            pct = pl_results.fraction_validated * 100
+            if n_v == n_t:
+                color = DARK_COLORS['green']
+                icon = "\u2713"
+            elif pl_results.fraction_validated >= 0.5:
+                color = DARK_COLORS['orange']
+                icon = "\u26A0"
+            else:
+                color = DARK_COLORS['red']
+                icon = "\u2717"
+            self._lbl_loc_summary.setText(
+                f"{icon} Validated at {n_v}/{n_t} locations ({pct:.0f}%)"
+            )
+            self._lbl_loc_summary.setStyleSheet(
+                f"font-weight: bold; padding: 4px; color: {color};"
+            )
+        else:
+            self._lbl_loc_summary.setText(
+                "Run RSS analysis (Tab 4) to enable per-location validation."
+            )
+
+        # Budget covariance multivariate summary (V&V 20.1)
+        if pl_results and pl_results.budget_mv_computed:
+            mv = pl_results
+            ratio_str = f"{mv.budget_mv_d_sq_per_m:.2f}"
+            if mv.budget_mv_p_value >= 0.001:
+                p_str = f"{mv.budget_mv_p_value:.3f}"
+            else:
+                p_str = f"{mv.budget_mv_p_value:.1e}"
+
+            if mv.budget_mv_verdict == "PASS":
+                v_icon = "\u2713"
+                v_color = DARK_COLORS['green']
+            else:
+                v_icon = "\u2717"
+                v_color = DARK_COLORS['red']
+
+            self._lbl_budget_mv.setText(
+                f"{v_icon} Budget Covariance Check (V&V 20.1): "
+                f"d\u00b2/m = {ratio_str}, p = {p_str} \u2014 "
+                f"{mv.budget_mv_verdict}\n"
+                f"{mv.budget_mv_interpretation}"
+            )
+            self._lbl_budget_mv.setStyleSheet(
+                f"font-size: 11px; padding: 4px 8px; color: {v_color};"
+                f"border-left: 3px solid {v_color}; margin-top: 4px;"
+            )
+            self._lbl_budget_mv.setVisible(True)
+        else:
+            self._lbl_budget_mv.setText("")
+            self._lbl_budget_mv.setVisible(False)
 
     # -----------------------------------------------------------------
     # PLOTS
@@ -3351,8 +3930,14 @@ class ComparisonDataTab(QWidget):
         Parameters:
             comp_data: A ComparisonData instance containing the error matrix.
         """
+        self._per_loc_results = None
+        if hasattr(self, '_logged_warnings'):
+            self._logged_warnings.clear()
         self._comp_data = comp_data
         self._chk_pooled.setChecked(comp_data.is_pooled)
+        self._txt_pooling_rationale.setPlainText(
+            comp_data.pooling_rationale or ""
+        )
         idx = self._cmb_unit.findText(comp_data.unit)
         if idx >= 0:
             self._cmb_unit.setCurrentIndex(idx)
@@ -3372,7 +3957,23 @@ class ComparisonDataTab(QWidget):
         """
         self._comp_data.is_pooled = self._chk_pooled.isChecked()
         self._comp_data.unit = self._cmb_unit.currentText()
+        self._comp_data.pooling_rationale = (
+            self._txt_pooling_rationale.toPlainText().strip()
+        )
         return self._comp_data
+
+    def refresh_per_location_validation(self, sources, rss_results):
+        """Re-run per-location validation with current RSS results.
+
+        Called from MainWindow after RSS computation completes.
+        """
+        if self._comp_data.flat_data().size == 0:
+            return
+        self._update_per_location(sources=sources, rss_results=rss_results)
+
+    def get_per_location_results(self) -> Optional[PerLocationValidationResults]:
+        """Return the most recent per-location validation results."""
+        return getattr(self, '_per_loc_results', None)
 
 
 # =============================================================================
@@ -3715,7 +4316,13 @@ class _SigmaValuePanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._distribution = "Normal"  # updated by parent source tab
         self._setup_ui()
+
+    def set_distribution(self, distribution: str):
+        """Update the distribution used for sigma basis conversion."""
+        self._distribution = distribution
+        self._on_changed()  # refresh converted display
 
     def _setup_ui(self):
         layout = QFormLayout(self)
@@ -3894,7 +4501,7 @@ class _SigmaValuePanel(QWidget):
     def _on_changed(self):
         raw = self._spn_sigma.value()
         basis = self._cmb_basis.currentText()
-        converted = sigma_from_basis(raw, basis)
+        converted = sigma_from_basis(raw, basis, self._distribution)
         self._lbl_converted.setText(f"{converted:.6g}")
 
         # Basis warning
@@ -3939,7 +4546,8 @@ class _SigmaValuePanel(QWidget):
 
     def get_converted_sigma(self) -> float:
         return sigma_from_basis(self._spn_sigma.value(),
-                                self._cmb_basis.currentText())
+                                self._cmb_basis.currentText(),
+                                self._distribution)
 
     # -- asymmetric public API --
     def is_asymmetric(self) -> bool:
@@ -4475,45 +5083,6 @@ class UncertaintySourcesTab(QWidget):
         self._cmb_unit.setToolTip("Engineering unit for this uncertainty source.")
         form.addRow("Unit:", self._cmb_unit)
 
-        # Correlation Group
-        self._edt_corr_group = QLineEdit()
-        self._edt_corr_group.setPlaceholderText("Leave blank = independent")
-        self._edt_corr_group.setToolTip(
-            "Correlation group label. Sources sharing the same non-empty\n"
-            "group label AND category are treated as correlated in both RSS\n"
-            "and Monte Carlo computations. Cross-category correlation terms\n"
-            "are intentionally not applied. Leave blank for independent sources.\n"
-            "[ASME V&V 20-2009 §4.3.3]"
-        )
-        form.addRow("Corr. Group:", self._edt_corr_group)
-
-        # Correlation Coefficient
-        self._spn_corr_coeff = QDoubleSpinBox()
-        self._spn_corr_coeff.setRange(-1.0, 1.0)
-        self._spn_corr_coeff.setSingleStep(0.05)
-        self._spn_corr_coeff.setDecimals(2)
-        self._spn_corr_coeff.setValue(0.0)
-        self._spn_corr_coeff.setToolTip(
-            "Pairwise correlation coefficient ρ with the group reference source.\n"
-            "ρ = 1.0 = fully correlated, ρ = 0.0 = independent (uncorrelated),\n"
-            "ρ = −1.0 = fully anti-correlated.\n"
-            "The reference source (first alphabetically in each group) always\n"
-            "has ρ = 1.0 enforced automatically. Other sources specify their\n"
-            "correlation with the reference. Pairwise: ρ(a,b) = ρ_a × ρ_b.\n"
-            "Range: −1.0 to +1.0. [ASME V&V 20-2009 §4.3.3]"
-        )
-        form.addRow("Corr. ρ:", self._spn_corr_coeff)
-
-        # Reference source hint (shown when this source is the group reference)
-        self._lbl_corr_ref_hint = QLabel("")
-        self._lbl_corr_ref_hint.setStyleSheet(
-            f"color: {DARK_COLORS['yellow']}; font-size: 11px; "
-            f"padding: 2px 0;"
-        )
-        self._lbl_corr_ref_hint.setWordWrap(True)
-        self._lbl_corr_ref_hint.hide()
-        form.addRow("", self._lbl_corr_ref_hint)
-
         # Notes
         self._edt_notes = QLineEdit()
         self._edt_notes.setPlaceholderText("Optional notes or reference...")
@@ -4533,8 +5102,53 @@ class UncertaintySourcesTab(QWidget):
 
         self._right_layout.addWidget(grp)
 
+        # --- Correlation group (collapsible advanced section) ---
+        corr_grp = QGroupBox("Advanced: Correlation")
+        corr_grp.setCheckable(True)
+        corr_grp.setChecked(False)
+        corr_form = QFormLayout(corr_grp)
+        corr_form.setSpacing(6)
+
+        self._edt_corr_group = QLineEdit()
+        self._edt_corr_group.setPlaceholderText("Leave blank = independent")
+        self._edt_corr_group.setToolTip(
+            "Correlation group label. Sources sharing the same non-empty\n"
+            "group label AND category are treated as correlated in both RSS\n"
+            "and Monte Carlo computations. Cross-category correlation terms\n"
+            "are intentionally not applied. Leave blank for independent sources.\n"
+            "[ASME V&V 20-2009 \u00a74.3.3]"
+        )
+        corr_form.addRow("Corr. Group:", self._edt_corr_group)
+
+        self._spn_corr_coeff = QDoubleSpinBox()
+        self._spn_corr_coeff.setRange(-1.0, 1.0)
+        self._spn_corr_coeff.setSingleStep(0.05)
+        self._spn_corr_coeff.setDecimals(2)
+        self._spn_corr_coeff.setValue(0.0)
+        self._spn_corr_coeff.setToolTip(
+            "Pairwise correlation coefficient \u03c1 with the group reference source.\n"
+            "\u03c1 = 1.0 = fully correlated, \u03c1 = 0.0 = independent,\n"
+            "\u03c1 = \u22121.0 = fully anti-correlated.\n"
+            "[ASME V&V 20-2009 \u00a74.3.3]"
+        )
+        corr_form.addRow("Corr. \u03c1:", self._spn_corr_coeff)
+
+        self._lbl_corr_ref_hint = QLabel("")
+        self._lbl_corr_ref_hint.setStyleSheet(
+            f"color: {DARK_COLORS['yellow']}; font-size: 11px; "
+            f"padding: 2px 0;"
+        )
+        self._lbl_corr_ref_hint.setWordWrap(True)
+        self._lbl_corr_ref_hint.hide()
+        corr_form.addRow("", self._lbl_corr_ref_hint)
+
+        self._right_layout.addWidget(corr_grp)
+
         # --- Classification group (epistemic/aleatoric, Section 6.2) ---
-        class_grp = QGroupBox("Uncertainty Classification")
+        # Collapsible advanced section — starts collapsed
+        class_grp = QGroupBox("Advanced: Uncertainty Classification")
+        class_grp.setCheckable(True)
+        class_grp.setChecked(False)
         class_form = QFormLayout(class_grp)
         class_form.setSpacing(6)
 
@@ -4597,6 +5211,56 @@ class UncertaintySourcesTab(QWidget):
             "test report ID, standard section)."
         )
         class_form.addRow("Evidence:", self._edt_evidence)
+
+        # Source scope for per-location validation
+        self._cmb_source_scope = QComboBox()
+        self._cmb_source_scope.addItems([
+            "Global (same at all locations)",
+            "Per-location (varies by T/C)",
+        ])
+        self._cmb_source_scope.setToolTip(
+            "Scope of this uncertainty source:\n"
+            "  \u2022 Global: Same value at every sensor location\n"
+            "    (e.g., grid convergence, iteration sensitivity, BCs)\n"
+            "  \u2022 Per-location: Value varies by thermocouple location\n"
+            "    (e.g., sensor placement accuracy in gradient regions)\n\n"
+            "This affects per-location validation: global sources contribute\n"
+            "identically to every location's U_val, while per-location sources\n"
+            "are combined separately."
+        )
+        class_form.addRow("Scope:", self._cmb_source_scope)
+
+        # Interval bounds (visible only when representation = "interval")
+        self._lbl_interval_lower = QLabel("Interval lower:")
+        self._spn_interval_lower = QDoubleSpinBox()
+        self._spn_interval_lower.setRange(-1e12, 1e12)
+        self._spn_interval_lower.setDecimals(6)
+        self._spn_interval_lower.setToolTip(
+            "Lower bound of the epistemic interval.\n"
+            "Used in double-loop MC when representation = 'interval'.\n"
+            "Units must match the global analysis unit."
+        )
+        class_form.addRow(self._lbl_interval_lower, self._spn_interval_lower)
+
+        self._lbl_interval_upper = QLabel("Interval upper:")
+        self._spn_interval_upper = QDoubleSpinBox()
+        self._spn_interval_upper.setRange(-1e12, 1e12)
+        self._spn_interval_upper.setDecimals(6)
+        self._spn_interval_upper.setToolTip(
+            "Upper bound of the epistemic interval.\n"
+            "Used in double-loop MC when representation = 'interval'.\n"
+            "Units must match the global analysis unit."
+        )
+        class_form.addRow(self._lbl_interval_upper, self._spn_interval_upper)
+
+        # Initially hidden; toggled by representation combo
+        for w in (self._lbl_interval_lower, self._spn_interval_lower,
+                  self._lbl_interval_upper, self._spn_interval_upper):
+            w.setVisible(False)
+
+        self._cmb_representation.currentTextChanged.connect(
+            self._on_representation_changed
+        )
 
         self._right_layout.addWidget(class_grp)
 
@@ -4926,6 +5590,18 @@ class UncertaintySourcesTab(QWidget):
             self._cmb_basis_type.setCurrentText(src.basis_type)
             self._cmb_reducibility.setCurrentText(src.reducibility)
             self._edt_evidence.setText(src.evidence_note)
+            # Interval bounds
+            self._spn_interval_lower.setValue(
+                getattr(src, 'interval_lower', 0.0))
+            self._spn_interval_upper.setValue(
+                getattr(src, 'interval_upper', 0.0))
+            self._on_representation_changed(src.representation)
+            # Source scope
+            scope = getattr(src, 'source_scope', 'global')
+            if scope == 'per-location':
+                self._cmb_source_scope.setCurrentIndex(1)
+            else:
+                self._cmb_source_scope.setCurrentIndex(0)
 
             # Switch stacked widget
             stack_idx = self._input_type_index.get(src.input_type, 1)
@@ -4936,6 +5612,7 @@ class UncertaintySourcesTab(QWidget):
                 self._panel_tabular.set_data(src.tabular_data)
                 self._panel_tabular.set_centered(src.is_centered_on_zero)
             elif src.input_type == "Sigma Value Only":
+                self._panel_sigma.set_distribution(src.distribution)
                 self._panel_sigma.set_sigma(src.raw_sigma_value)
                 self._panel_sigma.set_basis(src.sigma_basis)
                 self._panel_sigma.set_sample_size(src.sample_size)
@@ -4985,6 +5662,13 @@ class UncertaintySourcesTab(QWidget):
         src.basis_type = self._cmb_basis_type.currentText()
         src.reducibility = self._cmb_reducibility.currentText()
         src.evidence_note = self._edt_evidence.text()
+        src.interval_lower = self._spn_interval_lower.value()
+        src.interval_upper = self._spn_interval_upper.value()
+        # Source scope
+        src.source_scope = (
+            "per-location" if self._cmb_source_scope.currentIndex() == 1
+            else "global"
+        )
 
         # Input-type-specific
         if src.input_type == "Tabular Data":
@@ -5079,11 +5763,21 @@ class UncertaintySourcesTab(QWidget):
         """Called when any common field changes."""
         if self._updating_ui:
             return
+        # Keep sigma panel in sync with the current distribution setting
+        self._panel_sigma.set_distribution(self._cmb_distribution.currentText())
         self._save_editor_to_source()
         self._refresh_table()
         if self._current_index >= 0 and self._current_index < len(self._sources):
             self._update_source_warnings(self._sources[self._current_index])
         self.sources_changed.emit()
+
+    def _on_representation_changed(self, text: str):
+        """Show/hide interval bound fields based on representation."""
+        is_interval = text == "interval"
+        self._lbl_interval_lower.setVisible(is_interval)
+        self._spn_interval_lower.setVisible(is_interval)
+        self._lbl_interval_upper.setVisible(is_interval)
+        self._spn_interval_upper.setVisible(is_interval)
 
     def _on_input_type_changed(self):
         """Called when the Input Type combo changes."""
@@ -5618,7 +6312,86 @@ class AnalysisSettingsTab(QWidget):
         )
         form.addRow("", self._chk_bootstrap)
 
+        # -- Double-loop MC mode selector --
+        self._cmb_mc_mode = QComboBox()
+        self._cmb_mc_mode.addItem("Single-Loop", "Single-Loop")
+        self._cmb_mc_mode.addItem("Double-Loop (Corners)", "Double-Loop (Corners)")
+        self._cmb_mc_mode.addItem("Double-Loop (Full)", "Double-Loop (Full)")
+        self._cmb_mc_mode.setToolTip(
+            "Single-Loop: standard MC \u2014 all sources sampled together "
+            "(V&V 20 / JCGM 101).\n"
+            "Double-Loop (Corners): evaluate 2\u207f worst-case corners of the "
+            "epistemic parameter space. Fast; guaranteed p-box bounds.\n"
+            "Double-Loop (Full): stochastically sample the epistemic space "
+            "(N_outer draws). Produces richer validation-fraction metric.\n\n"
+            "Double-loop modes produce probability boxes (p-boxes) that separate "
+            "epistemic and aleatory uncertainty.\n"
+            "[Oberkampf & Roy 2010; Ferson et al. 2003]"
+        )
+        form.addRow("MC mode:", self._cmb_mc_mode)
+
+        # -- N_outer (epistemic realizations, Full mode only) --
+        self._lbl_n_outer = QLabel("N_outer (epistemic):")
+        self._spn_n_outer = QSpinBox()
+        self._spn_n_outer.setRange(50, 10000)
+        self._spn_n_outer.setValue(200)
+        self._spn_n_outer.setToolTip(
+            "Number of outer-loop epistemic realizations (Full mode only).\n"
+            "200 is a good starting point; increase for tighter p-box bounds."
+        )
+        form.addRow(self._lbl_n_outer, self._spn_n_outer)
+
+        # -- N_inner (aleatory trials per realization) --
+        self._lbl_n_inner = QLabel("N_inner (aleatory):")
+        self._cmb_n_inner = QComboBox()
+        for n in [1000, 5000, 10000, 50000]:
+            self._cmb_n_inner.addItem(f"{n:,}", n)
+        self._cmb_n_inner.setCurrentIndex(2)  # default 10,000
+        self._cmb_n_inner.setToolTip(
+            "Aleatory trials per epistemic realization.\n"
+            "10,000 is usually sufficient for the inner loop."
+        )
+        form.addRow(self._lbl_n_inner, self._cmb_n_inner)
+
+        # -- Mixed-class treatment --
+        self._lbl_mixed = QLabel("Mixed sources:")
+        self._cmb_mixed_treatment = QComboBox()
+        self._cmb_mixed_treatment.addItem(
+            "Treat as epistemic", "Treat as epistemic")
+        self._cmb_mixed_treatment.addItem(
+            "Treat as aleatory", "Treat as aleatory")
+        self._cmb_mixed_treatment.setToolTip(
+            "How to treat 'mixed' class sources in double-loop separation.\n"
+            "Conservative choice: treat as epistemic (widens p-box)."
+        )
+        form.addRow(self._lbl_mixed, self._cmb_mixed_treatment)
+
+        # Initially hide double-loop controls
+        for w in (self._lbl_n_outer, self._spn_n_outer,
+                  self._lbl_n_inner, self._cmb_n_inner,
+                  self._lbl_mixed, self._cmb_mixed_treatment):
+            w.setVisible(False)
+
+        self._cmb_mc_mode.currentIndexChanged.connect(self._on_mc_mode_changed)
+
         self._main_layout.addWidget(grp)
+
+    def _on_mc_mode_changed(self):
+        """Show/hide double-loop-specific MC settings based on mode."""
+        mode = self._cmb_mc_mode.currentData()
+        is_double = mode != "Single-Loop"
+        is_full = mode == "Double-Loop (Full)"
+        # N_outer only for Full mode
+        self._lbl_n_outer.setVisible(is_full)
+        self._spn_n_outer.setVisible(is_full)
+        # N_inner and mixed treatment for both double-loop modes
+        self._lbl_n_inner.setVisible(is_double)
+        self._cmb_n_inner.setVisible(is_double)
+        self._lbl_mixed.setVisible(is_double)
+        self._cmb_mixed_treatment.setVisible(is_double)
+        # Single-loop trial count hidden in double-loop (inner loop replaces it)
+        self._cmb_mc_trials.setVisible(not is_double)
+        self.settings_changed.emit()
 
     # =================================================================
     # SECTION 4: BOUND TYPE SELECTION
@@ -5754,6 +6527,14 @@ class AnalysisSettingsTab(QWidget):
         )
         self._spn_seed.valueChanged.connect(self._emit_settings_changed)
         self._chk_bootstrap.toggled.connect(self._emit_settings_changed)
+        # Double-loop MC
+        self._spn_n_outer.valueChanged.connect(self._emit_settings_changed)
+        self._cmb_n_inner.currentIndexChanged.connect(
+            self._emit_settings_changed
+        )
+        self._cmb_mixed_treatment.currentIndexChanged.connect(
+            self._emit_settings_changed
+        )
 
         # Bound type
         self._bg_bound.idToggled.connect(
@@ -5825,6 +6606,10 @@ class AnalysisSettingsTab(QWidget):
             mc_sampling_method=mc_sampling_method,
             bound_type=bound_type,
             validation_mode=validation_mode,
+            mc_mode=self._cmb_mc_mode.currentData(),
+            mc_n_outer=self._spn_n_outer.value(),
+            mc_n_inner=self._cmb_n_inner.currentData(),
+            mc_mixed_treatment=self._cmb_mixed_treatment.currentData(),
         )
 
     def set_settings(self, settings: AnalysisSettings):
@@ -5907,6 +6692,26 @@ class AnalysisSettingsTab(QWidget):
                 if self._cmb_validation_mode.itemData(idx) == val_mode:
                     self._cmb_validation_mode.setCurrentIndex(idx)
                     break
+
+            # Double-loop MC mode (backward-compat: default to Single-Loop)
+            mc_mode = getattr(settings, 'mc_mode', "Single-Loop")
+            for idx in range(self._cmb_mc_mode.count()):
+                if self._cmb_mc_mode.itemData(idx) == mc_mode:
+                    self._cmb_mc_mode.setCurrentIndex(idx)
+                    break
+            self._spn_n_outer.setValue(getattr(settings, 'mc_n_outer', 200))
+            n_inner = getattr(settings, 'mc_n_inner', 10000)
+            for idx in range(self._cmb_n_inner.count()):
+                if self._cmb_n_inner.itemData(idx) == n_inner:
+                    self._cmb_n_inner.setCurrentIndex(idx)
+                    break
+            mixed_treat = getattr(settings, 'mc_mixed_treatment',
+                                  "Treat as epistemic")
+            for idx in range(self._cmb_mixed_treatment.count()):
+                if self._cmb_mixed_treatment.itemData(idx) == mixed_treat:
+                    self._cmb_mixed_treatment.setCurrentIndex(idx)
+                    break
+            self._on_mc_mode_changed()  # sync visibility
         finally:
             self.blockSignals(False)
             self._loading = False
@@ -6388,15 +7193,13 @@ class RSSResultsTab(QWidget):
             k_factor = settings.manual_k
             if k_factor <= 0:
                 audit_log.log_warning(
-                    "MANUAL_K_INVALID",
-                    f"Manual k = {k_factor:.4f} is not valid (must be > 0). "
-                    f"Falling back to k = 2.0."
+                    f"MANUAL_K_INVALID: Manual k = {k_factor:.4f} is not valid "
+                    f"(must be > 0). Falling back to k = 2.0."
                 )
                 k_factor = 2.0
             elif k_factor < 1.0:
                 audit_log.log_warning(
-                    "MANUAL_K_LOW",
-                    f"Manual k = {k_factor:.4f} is unusually low. "
+                    f"MANUAL_K_LOW: Manual k = {k_factor:.4f} is unusually low. "
                     f"Typical values range from 1.5 to 3.0. A low k-factor "
                     f"may produce a non-conservative expanded uncertainty."
                 )
@@ -6458,12 +7261,24 @@ class RSSResultsTab(QWidget):
         # 8. Validation assessment (V&V 20 Eq. 1)
         # ----------------------------------------------------------
         if n_data > 0:
-            bias_explained = abs(E_mean) <= U_val
-            audit_log.log_computation(
-                "RSS_VALIDATION",
-                f"|E_mean| = {abs(E_mean):.6g} vs U_val = {U_val:.6g} => "
-                f"Bias {'IS' if bias_explained else 'IS NOT'} explained"
-            )
+            if settings.one_sided:
+                # One-sided underprediction: E >= -U_val means validated.
+                # Positive E (overprediction = conservative) always passes.
+                bias_explained = E_mean >= -U_val
+                audit_log.log_computation(
+                    "RSS_VALIDATION",
+                    f"One-sided: E_mean = {E_mean:+.6g} vs -U_val = {-U_val:.6g} => "
+                    f"Bias {'IS' if bias_explained else 'IS NOT'} explained "
+                    f"(E \u2265 -U_val criterion)"
+                )
+            else:
+                # Two-sided: |E| <= U_val
+                bias_explained = abs(E_mean) <= U_val
+                audit_log.log_computation(
+                    "RSS_VALIDATION",
+                    f"Two-sided: |E_mean| = {abs(E_mean):.6g} vs U_val = {U_val:.6g} => "
+                    f"Bias {'IS' if bias_explained else 'IS NOT'} explained"
+                )
         else:
             bias_explained = None  # Cannot determine without comparison data
             audit_log.log_computation(
@@ -6547,6 +7362,7 @@ class RSSResultsTab(QWidget):
             u_model=float(u_model),
             model_form_pct=float(model_form_pct),
             bias_explained=bias_explained,
+            one_sided=settings.one_sided,
             source_contributions=contributions,
             computed=True,
             has_correlations=has_any_correlation,
@@ -6578,7 +7394,8 @@ class RSSResultsTab(QWidget):
         self._update_budget_table(unit)
         self._update_results_text(unit, settings, p5, p95)
         self._update_guidance_panels(contributions, u_val, nu_eff, s_E,
-                                     bias_explained, E_mean, U_val, unit)
+                                     bias_explained, E_mean, U_val, unit,
+                                     one_sided=settings.one_sided)
         self._update_plots(contributions, u_val, u_num, u_input, u_D,
                            E_mean, s_E, k_factor, p5, p95, unit, settings)
 
@@ -6633,12 +7450,16 @@ class RSSResultsTab(QWidget):
                            u_val: float, unit: str) -> List[dict]:
         """Build the budget data list with subtotals and grand total."""
         budget = []
+        # NOTE: When correlations are present, individual σ²/u² percentages
+        # will not sum to 100% because cross-terms (2·ρ·σ_i·σ_j) contribute
+        # to u² but are not attributed to any single source. This is expected
+        # and documented in the budget table footnote.
         u_val_sq = u_val ** 2 if u_val > 0 else 1.0
 
         # Group by category key
         by_cat = {"u_num": [], "u_input": [], "u_D": []}
         for c in contributions:
-            by_cat[c['category_key']].append(c)
+            by_cat.setdefault(c['category_key'], []).append(c)
 
         cat_labels = {
             "u_num": "Numerical (u_num)",
@@ -6916,10 +7737,12 @@ class RSSResultsTab(QWidget):
             lines.append(
                 "  Caveat: Epistemic sources dominate this budget (>50%). The RSS "
                 "assumption of random cancellation may be non-conservative for "
-                "systematic/knowledge-gap uncertainties. For stricter separation, "
-                "frameworks such as Oberkampf & Roy (2010) recommend double-loop "
-                "Monte Carlo producing probability boxes (p-boxes). This tool "
-                "follows V&V 20's pragmatic engineering approach."
+                "systematic/knowledge-gap uncertainties. Roy & Oberkampf (2011) "
+                "recommend that epistemic and aleatory uncertainties always be "
+                "separated via nested-loop (double-loop) Monte Carlo propagation "
+                "producing probability boxes (p-boxes), rather than combined via "
+                "RSS.  The V&V 20 RSS approach is a pragmatic simplification; use "
+                "the Double-Loop MC mode (Monte Carlo tab) for rigorous separation."
             )
 
         # Dominant drivers by class
@@ -6978,10 +7801,19 @@ class RSSResultsTab(QWidget):
             bias_result = ("Bias IS explained by known uncertainties"
                            if r.bias_explained else
                            "Bias IS NOT explained by known uncertainties")
-            lines.append(
-                f"  |\u0112| vs U_val: {abs(r.E_mean):.4f} vs {r.U_val:.4f} "
-                f"\u2192 [{bias_result}]"
-            )
+            if getattr(r, 'one_sided', False):
+                lines.append(
+                    f"  \u0112 \u2265 -U_val:  {r.E_mean:+.4f} vs {-r.U_val:.4f} "
+                    f"\u2192 [{bias_result}]"
+                )
+                lines.append(
+                    f"  (One-sided underprediction criterion: E \u2265 -U_val)"
+                )
+            else:
+                lines.append(
+                    f"  |\u0112| \u2264 U_val:  {abs(r.E_mean):.4f} vs {r.U_val:.4f} "
+                    f"\u2192 [{bias_result}]"
+                )
         lines.append("")
 
         if getattr(r, 'multivariate_enabled', False):
@@ -7092,7 +7924,8 @@ class RSSResultsTab(QWidget):
     def _update_guidance_panels(self, contributions: List[dict],
                                 u_val: float, nu_eff: float,
                                 s_E: float, bias_explained: Optional[bool],
-                                E_mean: float, U_val: float, unit: str):
+                                E_mean: float, U_val: float, unit: str,
+                                one_sided: bool = False):
         """Update all guidance panels based on computation results."""
         u_val_sq = u_val ** 2 if u_val > 0 else 1.0
 
@@ -7221,9 +8054,17 @@ class RSSResultsTab(QWidget):
                 'yellow'
             )
         elif bias_explained:
+            if one_sided:
+                criterion_str = (
+                    f"\u0112 = {E_mean:+.4f} \u2265 -U_val = {-U_val:.4f} [{unit}]"
+                )
+            else:
+                criterion_str = (
+                    f"|\u0112| = {abs(E_mean):.4f} \u2264 U_val = {U_val:.4f} [{unit}]"
+                )
             if mv_warn:
                 self._guidance_bias.set_guidance(
-                    f"|\u0112| = {abs(E_mean):.4f} \u2264 U_val = {U_val:.4f} [{unit}] "
+                    f"{criterion_str} "
                     f"\u2014 Scalar V&V 20 validation passes, but the covariance-aware "
                     f"multivariate supplement reports p = {mv_p:.4f} (< 0.05). "
                     f"This suggests residual structured bias across locations/conditions. "
@@ -7231,19 +8072,31 @@ class RSSResultsTab(QWidget):
                     'yellow'
                 )
             else:
+                side_note = (
+                    " (one-sided underprediction criterion)"
+                    if one_sided else ""
+                )
                 self._guidance_bias.set_guidance(
-                    f"|\u0112| = {abs(E_mean):.4f} \u2264 U_val = {U_val:.4f} [{unit}] "
+                    f"{criterion_str} "
                     f"\u2014 The mean comparison error is within the expanded "
-                    f"uncertainty. The model is validated at the specified "
+                    f"uncertainty{side_note}. The model is validated at the specified "
                     f"coverage level for this comparison metric. "
                     f"[ASME V&V 20 \u00a76, Eq. (1)]",
                     'green'
                 )
         else:
+            if one_sided:
+                fail_str = (
+                    f"\u0112 = {E_mean:+.4f} < -U_val = {-U_val:.4f} [{unit}]"
+                )
+            else:
+                fail_str = (
+                    f"|\u0112| = {abs(E_mean):.4f} > U_val = {U_val:.4f} [{unit}]"
+                )
             self._guidance_bias.set_guidance(
                 f"RESULT: NOT VALIDATED \u2014 the comparison error exceeds "
                 f"the known uncertainty.\n"
-                f"|Ē| = {abs(E_mean):.4f} > U_val = {U_val:.4f} [{unit}]\n\n"
+                f"{fail_str}\n\n"
                 f"This means either:\n"
                 f"1. The CFD model has a deficiency that produces bias "
                 f"beyond what uncertainties explain\n"
@@ -7880,6 +8733,15 @@ class _DoubleLoopMCWorkerThread(QThread):
                 "Consider classifying sources or using Single-Loop mode."
             )
 
+        # ---- Degenerate case: no aleatory sources ----
+        if n_ale == 0:
+            notes.append(
+                "No aleatory sources found. Inner loop has no stochastic "
+                "variation — each realization collapses to a deterministic "
+                "offset (epistemic + E_mean). P-box bounds reflect only "
+                "the epistemic spread."
+            )
+
         # ---- Step 2: determine outer-loop realizations ----
         is_corners = settings.mc_mode == "Double-Loop (Corners)"
         n_inner = settings.mc_n_inner
@@ -7986,11 +8848,19 @@ class _DoubleLoopMCWorkerThread(QThread):
                     else:
                         sigma = src.get_standard_uncertainty()
                         mean = src.mean_value if not src.is_centered_on_zero else 0.0
-                        sample = _sample_fn(
-                            src.distribution, sigma, mean, 1,
-                            rng=rng,
-                        )
-                        epi_offsets[j] = float(sample[0])
+                        try:
+                            sample = _sample_fn(
+                                src.distribution, sigma, mean, 1,
+                                rng=rng,
+                            )
+                            epi_offsets[j] = float(sample[0])
+                        except Exception as exc:
+                            notes.append(
+                                f"Sampling failed for epistemic source "
+                                f"'{src.name}' ({src.distribution}): {exc}. "
+                                f"Using mean={mean} as fallback."
+                            )
+                            epi_offsets[j] = mean
 
             total_epi_offset = float(np.sum(epi_offsets))
 
@@ -8003,13 +8873,21 @@ class _DoubleLoopMCWorkerThread(QThread):
                 mean = src.mean_value if not src.is_centered_on_zero else 0.0
                 su = src.get_sigma_upper() if src.asymmetric else None
                 sl = src.get_sigma_lower() if src.asymmetric else None
-                samples = _sample_fn(
-                    src.distribution, sigma, mean, n_inner,
-                    rng=rng,
-                    sigma_upper=su,
-                    sigma_lower=sl,
-                )
-                combined += samples
+                try:
+                    samples = _sample_fn(
+                        src.distribution, sigma, mean, n_inner,
+                        rng=rng,
+                        sigma_upper=su,
+                        sigma_lower=sl,
+                    )
+                    combined += samples
+                except Exception as exc:
+                    if i_outer == 0:
+                        notes.append(
+                            f"Sampling failed for aleatory source "
+                            f"'{src.name}' ({src.distribution}): {exc}. "
+                            f"Source skipped in inner loop."
+                        )
 
             # Add fixed epistemic offset + comparison-error mean
             combined += total_epi_offset + E_mean
@@ -8097,8 +8975,10 @@ class MonteCarloResultsTab(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._mc_results = MCResults()
+        self._dl_mc_results: Optional[DoubleLoopMCResults] = None
         self._rss_results: Optional[RSSResults] = None
         self._worker: Optional[_MCWorkerThread] = None
+        self._dl_worker: Optional[_DoubleLoopMCWorkerThread] = None
         self._setup_ui()
 
     # =================================================================
@@ -8122,9 +9002,12 @@ class MonteCarloResultsTab(QWidget):
         if self._worker is not None and self._worker.isRunning():
             self._worker.abort()
             self._worker.wait(2000)
+        if self._dl_worker is not None and self._dl_worker.isRunning():
+            self._dl_worker.abort()
+            self._dl_worker.wait(2000)
 
         self._rss_results = rss_results
-        self._display_unit = settings.global_unit  # Store unit for plot/text labels
+        self._display_unit = settings.global_unit
         self._status_label.setText("Running...")
         self._progress_bar.setValue(0)
         self._progress_bar.setVisible(True)
@@ -8133,22 +9016,57 @@ class MonteCarloResultsTab(QWidget):
 
         # Deep-copy inputs so the worker thread is isolated from GUI edits
         enabled = [copy.deepcopy(s) for s in sources if s.enabled]
-        self._worker = _MCWorkerThread(
-            enabled, copy.deepcopy(comp_data), copy.deepcopy(settings),
-            parent=self,
-        )
-        self._worker.progress_updated.connect(self._on_progress)
-        self._worker.finished_result.connect(self._on_finished)
-        self._worker.error_occurred.connect(self._on_error)
-        self._worker.start()
+
+        if settings.mc_mode == "Single-Loop":
+            # ---- Standard single-loop MC (unchanged) ----
+            self._worker = _MCWorkerThread(
+                enabled, copy.deepcopy(comp_data), copy.deepcopy(settings),
+                parent=self,
+            )
+            self._worker.progress_updated.connect(self._on_progress)
+            self._worker.finished_result.connect(self._on_finished)
+            self._worker.error_occurred.connect(self._on_error)
+            self._worker.start()
+        else:
+            # ---- Double-loop MC (corners or full) ----
+            self._dl_worker = _DoubleLoopMCWorkerThread(
+                enabled, copy.deepcopy(comp_data), copy.deepcopy(settings),
+                parent=self,
+            )
+            self._dl_worker.progress_updated.connect(self._on_progress)
+            self._dl_worker.finished_result.connect(self._on_dl_finished)
+            self._dl_worker.error_occurred.connect(self._on_error)
+            self._dl_worker.start()
 
     def get_results(self) -> MCResults:
         """Return the most recent MC results (may be empty if not yet run)."""
         return self._mc_results
 
+    def get_dl_results(self) -> Optional[DoubleLoopMCResults]:
+        """Return the most recent double-loop MC results, or None."""
+        return self._dl_mc_results
+
+    def set_dl_results(self, dl: Optional[DoubleLoopMCResults]):
+        """Restore double-loop MC results (e.g. from a loaded project).
+
+        Only scalar summary fields are available after deserialization;
+        the p-box arrays and per-realization bounds are not restored.
+        The status label and text panel are updated but plots are skipped
+        because the large arrays are absent.
+        """
+        self._dl_mc_results = dl
+        if dl is not None and getattr(dl, 'computed', False):
+            self._status_label.setText(
+                f"Double-loop MC (restored from project): "
+                f"{dl.n_outer} outer \u00d7 {dl.n_inner:,} inner — "
+                f"validation fraction {dl.validation_fraction:.1%}"
+            )
+            self._populate_dl_results_text(dl)
+
     def clear_results(self):
         """Reset MC results and clear all displays."""
         self._mc_results = MCResults()
+        self._dl_mc_results = None
         self._rss_results = None
         self._results_text.clear()
         self._status_label.setText("Not yet run")
@@ -8355,12 +9273,237 @@ class MonteCarloResultsTab(QWidget):
         self._update_plots(mc_results)
         self.mc_finished.emit()
 
+    def _on_dl_finished(self, dl_results: DoubleLoopMCResults):
+        """Handle completion of the double-loop MC worker."""
+        self._dl_mc_results = dl_results
+        self._progress_bar.setValue(100)
+        self._progress_bar.setVisible(False)
+        self._btn_run.setEnabled(True)
+        mode_label = "Corners" if dl_results.mode == "corners" else "Full"
+        self._status_label.setText(
+            f"Complete \u2014 Double-Loop ({mode_label}, "
+            f"{dl_results.n_outer} outer \u00d7 {dl_results.n_inner:,} inner)"
+        )
+        self._populate_dl_results_text(dl_results)
+        self._update_dl_guidance(dl_results)
+        self._update_dl_plots(dl_results)
+        self.mc_finished.emit()
+
     @Slot(str)
     def _on_error(self, msg: str):
         self._progress_bar.setVisible(False)
         self._btn_run.setEnabled(True)
         self._status_label.setText("Error")
         self._results_text.setPlainText(f"Monte Carlo run failed:\n{msg}")
+
+    # =================================================================
+    # DOUBLE-LOOP MC RESULTS (p-box display)
+    # =================================================================
+    def _populate_dl_results_text(self, dl: DoubleLoopMCResults):
+        """Fill the text panel with double-loop MC summary."""
+        unit = getattr(self, '_display_unit', 'unit')
+        mode = "Corners (2\u207f worst-case)" if dl.mode == "corners" else "Full (stochastic)"
+        sided = "one-sided" if dl._one_sided else "two-sided"
+
+        lines = [
+            f"Double-Loop Monte Carlo Results",
+            f"{'=' * 40}",
+            f"  Mode:          {mode}",
+            f"  N_outer:       {dl.n_outer}",
+            f"  N_inner:       {dl.n_inner:,}",
+            f"  Total samples: {dl.n_outer * dl.n_inner:,}",
+            f"",
+            f"Epistemic/Aleatory Split:",
+            f"  Epistemic sources (outer loop): {dl.n_epistemic_sources}",
+            f"  Aleatory sources (inner loop):  {dl.n_aleatory_sources}",
+        ]
+        if dl.epistemic_source_names:
+            lines.append(f"  Epistemic names: {', '.join(dl.epistemic_source_names)}")
+        lines += [
+            f"",
+            f"P-Box Bounds ({dl._coverage*100:.0f}% {sided}):",
+            f"  Worst-case lower bound: {dl.lower_bound_min:+.4f} [{unit}]",
+            f"  Best-case lower bound:  {dl.lower_bound_max:+.4f} [{unit}]",
+            f"  Best-case upper bound:  {dl.upper_bound_min:+.4f} [{unit}]",
+            f"  Worst-case upper bound: {dl.upper_bound_max:+.4f} [{unit}]",
+            f"",
+            f"Epistemic Spread:",
+            f"  Mean of inner-loop means: {dl.mean_of_means:+.4f} [{unit}]",
+            f"  Std of inner-loop means:  {dl.std_of_means:.4f} [{unit}]",
+            f"",
+            f"Validation Metric:",
+            f"  Fraction of epistemic realizations bracketing zero: "
+            f"{dl.validation_fraction:.1%}",
+        ]
+        if dl.validation_fraction >= 1.0:
+            lines.append(
+                "  \u2192 VALIDATED across ALL epistemic realizations."
+            )
+        elif dl.validation_fraction >= 0.5:
+            lines.append(
+                f"  \u2192 PARTIALLY VALIDATED \u2014 {dl.validation_fraction:.0%} "
+                f"of epistemic scenarios bracket zero."
+            )
+        else:
+            lines.append(
+                f"  \u2192 NOT VALIDATED \u2014 majority of epistemic scenarios "
+                f"do not bracket zero."
+            )
+
+        if dl.notes:
+            lines.append("")
+            lines.append("Notes:")
+            for note in dl.notes:
+                lines.append(f"  \u2022 {note}")
+
+        self._results_text.setPlainText("\n".join(lines))
+
+    def _update_dl_guidance(self, dl: DoubleLoopMCResults):
+        """Set guidance panels for double-loop MC results."""
+        # Convergence guidance
+        if hasattr(self, '_guidance_mc_convergence'):
+            if dl.mode == "corners":
+                self._guidance_mc_convergence.set_guidance(
+                    "Corners mode: all 2\u207f epistemic corners evaluated "
+                    "\u2014 p-box bounds are exact (no sampling uncertainty).",
+                    "green"
+                )
+            else:
+                # Check stability: compare first-half vs second-half envelope
+                n_half = dl.n_outer // 2
+                if n_half >= 10:
+                    first_half_width = (
+                        np.max(dl.realization_upper_bounds[:n_half])
+                        - np.min(dl.realization_lower_bounds[:n_half])
+                    )
+                    full_width = (dl.upper_bound_max - dl.lower_bound_min)
+                    ratio = first_half_width / full_width if full_width > 0 else 1.0
+                    if ratio > 0.95:
+                        self._guidance_mc_convergence.set_guidance(
+                            f"P-box envelope appears converged "
+                            f"(first-half/full width ratio = {ratio:.3f}).",
+                            "green"
+                        )
+                    else:
+                        self._guidance_mc_convergence.set_guidance(
+                            f"P-box envelope may not be fully converged "
+                            f"(first-half/full width ratio = {ratio:.3f}). "
+                            f"Consider increasing N_outer.",
+                            "yellow"
+                        )
+                else:
+                    self._guidance_mc_convergence.set_guidance(
+                        "Too few outer-loop realizations to assess convergence.",
+                        "yellow"
+                    )
+
+        # Validation guidance
+        if hasattr(self, '_guidance_mc_vs_rss'):
+            vf = dl.validation_fraction
+            if vf >= 1.0:
+                self._guidance_mc_vs_rss.set_guidance(
+                    f"Validated across all {dl.n_outer} epistemic realizations. "
+                    f"The model passes validation even under worst-case "
+                    f"epistemic assumptions.",
+                    "green"
+                )
+            elif vf >= 0.5:
+                pct = vf * 100.0
+                self._guidance_mc_vs_rss.set_guidance(
+                    f"Partially validated: {pct:.0f}% of epistemic realizations "
+                    f"bracket zero. Consider reducing epistemic uncertainty on: "
+                    f"{', '.join(dl.epistemic_source_names[:3])}.",
+                    "yellow"
+                )
+            else:
+                pct = vf * 100.0
+                self._guidance_mc_vs_rss.set_guidance(
+                    f"Not validated: only {pct:.0f}% of epistemic realizations "
+                    f"bracket zero. Epistemic uncertainty dominates \u2014 "
+                    f"significant knowledge gaps need to be addressed.",
+                    "red"
+                )
+
+    def _update_dl_plots(self, dl: DoubleLoopMCResults):
+        """Draw p-box visualization for double-loop MC results."""
+        self._fig.clear()
+        unit = getattr(self, '_display_unit', 'unit')
+
+        # --- Subplot 1: P-box envelope ---
+        ax1 = self._fig.add_subplot(1, 3, 1)
+        n_pts = len(dl.pbox_cdf_lower)
+        prob_levels = np.linspace(0.0, 1.0, n_pts) if n_pts > 0 else np.array([])
+
+        if n_pts > 0:
+            ax1.fill_betweenx(
+                prob_levels, dl.pbox_cdf_lower, dl.pbox_cdf_upper,
+                alpha=0.3, color='steelblue', label='P-box envelope'
+            )
+            ax1.plot(dl.pbox_cdf_lower, prob_levels, 'b-', linewidth=1.5,
+                     label='Lower CDF bound')
+            ax1.plot(dl.pbox_cdf_upper, prob_levels, 'r-', linewidth=1.5,
+                     label='Upper CDF bound')
+            ax1.axvline(0, color='k', linestyle='--', linewidth=0.8,
+                        label='Zero (validation ref)')
+
+        ax1.set_xlabel(f'Combined Error [{unit}]')
+        ax1.set_ylabel('Cumulative Probability')
+        ax1.set_title('P-Box Envelope')
+        ax1.legend(fontsize=7, loc='best')
+        ax1.grid(True, alpha=0.3)
+
+        # --- Subplot 2: Per-realization bounds spread ---
+        ax2 = self._fig.add_subplot(1, 3, 2)
+        n_real = dl.n_outer
+        if n_real > 0 and len(dl.realization_lower_bounds) == n_real:
+            x_indices = np.arange(n_real)
+            # Sort by midpoint for visual clarity
+            midpoints = (dl.realization_lower_bounds
+                         + dl.realization_upper_bounds) / 2.0
+            sort_idx = np.argsort(midpoints)
+            lb_sorted = dl.realization_lower_bounds[sort_idx]
+            ub_sorted = dl.realization_upper_bounds[sort_idx]
+
+            # Color by whether realization brackets zero
+            brackets = (lb_sorted <= 0) & (ub_sorted >= 0)
+            colors = np.where(brackets, '#2ca02c', '#d62728')
+
+            for j in range(min(n_real, 200)):  # cap for readability
+                ax2.plot(
+                    [lb_sorted[j], ub_sorted[j]], [j, j],
+                    color=colors[j], linewidth=0.8, alpha=0.7
+                )
+            ax2.axvline(0, color='k', linestyle='--', linewidth=0.8)
+            ax2.set_xlabel(f'Bounds [{unit}]')
+            ax2.set_ylabel('Realization (sorted)')
+            n_shown = min(n_real, 200)
+            ax2.set_ylim(-0.5, n_shown - 0.5)
+
+        ax2.set_title('Per-Realization Bounds')
+        ax2.grid(True, alpha=0.3)
+
+        # --- Subplot 3: Validation fraction summary ---
+        ax3 = self._fig.add_subplot(1, 3, 3)
+        vf = dl.validation_fraction
+        bar_colors = ['#2ca02c' if vf >= 1.0
+                      else '#ff7f0e' if vf >= 0.5
+                      else '#d62728']
+        ax3.barh(['Validation\nFraction'], [vf], color=bar_colors, height=0.4)
+        ax3.set_xlim(0, 1.05)
+        ax3.axvline(1.0, color='green', linestyle=':', linewidth=1,
+                    label='Full validation')
+        ax3.set_xlabel('Fraction Bracketing Zero')
+        ax3.set_title(f'Validation: {vf:.0%}')
+        ax3.legend(fontsize=7)
+
+        # Add text annotation
+        ax3.text(
+            vf + 0.02, 0, f'{vf:.1%}',
+            va='center', fontsize=10, fontweight='bold'
+        )
+
+        self._fig.tight_layout()
+        self._canvas.draw_idle()
 
     # =================================================================
     # RESULTS FORMATTING
@@ -8440,7 +9583,7 @@ class MonteCarloResultsTab(QWidget):
 
         Ref: JCGM 101:2008 §7.9 — adaptive MC procedure.
         """
-        if mc.samples.size == 0:
+        if mc.samples is None or mc.samples.size == 0:
             self._guidance_mc_convergence.set_guidance(
                 "No MC samples available.", "green")
             return
@@ -8464,6 +9607,15 @@ class MonteCarloResultsTab(QWidget):
             f_p95 = float(kde.evaluate([mc.pct_95])[0])
         except Exception:
             f_p5 = f_p95 = 0.0
+
+        # Degenerate distribution (point mass or near-zero spread): KDE density
+        # will be zero or near-zero at both percentiles. A point mass is inherently
+        # converged — report it as such rather than showing a false warning.
+        if f_p5 < 1e-12 and f_p95 < 1e-12:
+            self._guidance_mc_convergence.set_guidance(
+                "MC distribution is degenerate (near-zero spread). "
+                "Convergence is trivially satisfied.", "green")
+            return
 
         se_p5 = np.sqrt(lo_q * (1 - lo_q) / n) / max(f_p5, 1e-15)
         se_p95 = np.sqrt(hi_q * (1 - hi_q) / n) / max(f_p95, 1e-15)
@@ -8870,6 +10022,7 @@ class ComparisonRollUpTab(QWidget):
         super().__init__(parent)
         self._rss: Optional[RSSResults] = None
         self._mc: Optional[MCResults] = None
+        self._dl_mc: Optional[DoubleLoopMCResults] = None
         self._comp: Optional[ComparisonData] = None
         self._settings: Optional[AnalysisSettings] = None
         self._sources: list = []
@@ -8888,6 +10041,7 @@ class ComparisonRollUpTab(QWidget):
         comp_data: ComparisonData,
         settings: AnalysisSettings,
         sources: list,
+        dl_mc_results: Optional[DoubleLoopMCResults] = None,
     ):
         """
         Populate every section of the roll-up tab with current results.
@@ -8904,9 +10058,12 @@ class ComparisonRollUpTab(QWidget):
             Current analysis settings.
         sources : list[UncertaintySource]
             All uncertainty sources (enabled + disabled).
+        dl_mc_results : DoubleLoopMCResults, optional
+            Double-loop MC p-box results.
         """
         self._rss = rss_results
         self._mc = mc_results
+        self._dl_mc = dl_mc_results
         self._comp = comp_data
         self._settings = settings
         self._sources = sources
@@ -9046,6 +10203,9 @@ class ComparisonRollUpTab(QWidget):
 
         self._findings_edit = QTextEdit()
         self._findings_edit.setReadOnly(False)  # user may append notes
+        self._findings_edit.setToolTip(
+            "Auto-generated findings. You may edit or append notes before exporting."
+        )
         self._findings_edit.setMinimumHeight(180)
         self._findings_edit.setPlaceholderText(
             "Run both RSS and Monte Carlo analyses to auto-generate findings."
@@ -9174,15 +10334,32 @@ class ComparisonRollUpTab(QWidget):
             _set(4, 1, f"{rss.upper_bound_uval:.4f}"
                  if not np.isnan(rss.upper_bound_uval) else "\u2014")
             _set(5, 1, f"{rss.E_mean:.4f}")
-            # Validation verdict
+            # Validation verdict — update row label for one-sided
+            rss_one_sided = getattr(rss, 'one_sided', False)
+            if rss_one_sided:
+                lbl_item = QTableWidgetItem("\u0112 \u2265 -U_val ?  (Validated?)")
+                lbl_item.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                self._table.setItem(6, 0, lbl_item)
+            else:
+                lbl_item = QTableWidgetItem(self._ROW_LABELS[6])
+                lbl_item.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                self._table.setItem(6, 0, lbl_item)
             if rss.U_val > 0:
-                ratio = abs(rss.E_mean) / rss.U_val
-                if ratio <= 1.0:
-                    _set(6, 1, f"YES ({ratio:.3f} \u2264 1.0)",
-                         DARK_COLORS.get('green', '#66bb6a'))
+                if rss_one_sided:
+                    if rss.bias_explained:
+                        _set(6, 1, f"YES (\u0112={rss.E_mean:+.3f} \u2265 {-rss.U_val:.3f})",
+                             DARK_COLORS.get('green', '#66bb6a'))
+                    else:
+                        _set(6, 1, f"NO (\u0112={rss.E_mean:+.3f} < {-rss.U_val:.3f})",
+                             DARK_COLORS.get('red', '#ef5350'))
                 else:
-                    _set(6, 1, f"NO ({ratio:.3f} > 1.0)",
-                         DARK_COLORS.get('red', '#ef5350'))
+                    ratio = abs(rss.E_mean) / rss.U_val
+                    if ratio <= 1.0:
+                        _set(6, 1, f"YES ({ratio:.3f} \u2264 1.0)",
+                             DARK_COLORS.get('green', '#66bb6a'))
+                    else:
+                        _set(6, 1, f"NO ({ratio:.3f} > 1.0)",
+                             DARK_COLORS.get('red', '#ef5350'))
             else:
                 _set(6, 1, "\u2014")
             _set(7, 1, "No")
@@ -9204,13 +10381,22 @@ class ComparisonRollUpTab(QWidget):
                  if not np.isnan(rss.upper_bound_sE) else "\u2014")
             _set(5, 2, f"{rss.E_mean:.4f}")
             if U_sE > 0:
-                ratio_sE = abs(rss.E_mean) / U_sE
-                if ratio_sE <= 1.0:
-                    _set(6, 2, f"YES ({ratio_sE:.3f} \u2264 1.0)",
-                         DARK_COLORS.get('green', '#66bb6a'))
+                if rss_one_sided:
+                    # One-sided: Ē ≥ -U_sE ?
+                    if rss.E_mean >= -U_sE:
+                        _set(6, 2, f"YES (\u0112={rss.E_mean:+.3f} \u2265 {-U_sE:.3f})",
+                             DARK_COLORS.get('green', '#66bb6a'))
+                    else:
+                        _set(6, 2, f"NO (\u0112={rss.E_mean:+.3f} < {-U_sE:.3f})",
+                             DARK_COLORS.get('red', '#ef5350'))
                 else:
-                    _set(6, 2, f"NO ({ratio_sE:.3f} > 1.0)",
-                         DARK_COLORS.get('red', '#ef5350'))
+                    ratio_sE = abs(rss.E_mean) / U_sE
+                    if ratio_sE <= 1.0:
+                        _set(6, 2, f"YES ({ratio_sE:.3f} \u2264 1.0)",
+                             DARK_COLORS.get('green', '#66bb6a'))
+                    else:
+                        _set(6, 2, f"NO ({ratio_sE:.3f} > 1.0)",
+                             DARK_COLORS.get('red', '#ef5350'))
             else:
                 _set(6, 2, "\u2014")
             _set(7, 2, "Yes")
@@ -9326,6 +10512,18 @@ class ComparisonRollUpTab(QWidget):
                             f"the model is NOT validated at the {settings.coverage*100:.0f}% / "
                             f"{settings.confidence*100:.0f}% level."
                         )
+            # Pooling transparency sub-statement
+            if comp is not None and comp.is_pooled:
+                n_locs = comp.data.shape[0] if comp.data.ndim == 2 else 0
+                n_conds = comp.data.shape[1] if comp.data.ndim == 2 else 0
+                n_total = comp.flat_data().size
+                lines.append(
+                    f"   Data basis: {n_locs} location(s) \u00d7 {n_conds} "
+                    f"condition(s) pooled \u2192 N = {n_total}."
+                )
+                rationale = getattr(comp, 'pooling_rationale', '')
+                if rationale:
+                    lines.append(f"   Pooling rationale: {rationale}")
             lines.append("")
 
         # --- Underprediction bounds from each method --------------------
@@ -9405,7 +10603,7 @@ class ComparisonRollUpTab(QWidget):
             lines.append("    Load experimental comparison data (E = S − D) on Tab 1")
             lines.append("    to enable the ASME V&V 20 validation assessment.")
         elif rss is not None and rss.computed and rss.U_val > 0:
-            ratio = abs(rss.E_mean) / rss.U_val
+            rss_one_sided = getattr(rss, 'one_sided', False)
             bound_type = getattr(settings, 'bound_type', 'Both (for comparison)')
             corr_info = ("Independent" if not rss.has_correlations
                          else f"Correlated (groups: {', '.join(rss.correlation_groups)})")
@@ -9424,23 +10622,37 @@ class ComparisonRollUpTab(QWidget):
             lines.append(f"    Data sufficiency: {suff_label}  (n = {rss.n_data})")
             lines.append(f"    u_val:            {rss.u_val:.4f} [{unit}]  (combined standard uncertainty)")
             lines.append(f"    U_val:            {rss.U_val:.4f} [{unit}]  (expanded uncertainty = k \u00d7 u_val)")
-            lines.append(f"    |\u0112|:              {abs(rss.E_mean):.4f} [{unit}]  (mean comparison error magnitude)")
-            lines.append(f"    |\u0112| / U_val:      {ratio:.4f}")
+            if rss_one_sided:
+                lines.append(f"    \u0112:                {rss.E_mean:+.4f} [{unit}]  (mean comparison error)")
+                lines.append(f"    Criterion:        \u0112 \u2265 -U_val  (one-sided underprediction)")
+            else:
+                ratio = abs(rss.E_mean) / rss.U_val
+                lines.append(f"    |\u0112|:              {abs(rss.E_mean):.4f} [{unit}]  (mean comparison error magnitude)")
+                lines.append(f"    |\u0112| / U_val:      {ratio:.4f}")
             lines.append(f"    Class split:      U_A = {rss.u_aleatoric:.4f}, U_E = {rss.u_epistemic:.4f} (epistemic: {rss.pct_epistemic:.1f}%)")
             if not np.isnan(rss.lower_bound_uval):
                 lines.append(f"    Prediction band (u_val):  [{rss.lower_bound_uval:+.4f}, {rss.upper_bound_uval:+.4f}] [{unit}]")
             if not np.isnan(rss.lower_bound_sE):
                 lines.append(f"    Prediction band (s_E):    [{rss.lower_bound_sE:+.4f}, {rss.upper_bound_sE:+.4f}] [{unit}]")
-            if ratio <= 1.0:
+            if rss.bias_explained:
                 lines.append(f"")
-                lines.append(f"    \u2713 VALIDATED: The mean comparison error (|\u0112| = {abs(rss.E_mean):.4f}) is")
-                lines.append(f"      within the expanded validation uncertainty (U_val = {rss.U_val:.4f}).")
+                if rss_one_sided:
+                    lines.append(f"    \u2713 VALIDATED: The mean comparison error (\u0112 = {rss.E_mean:+.4f}) satisfies")
+                    lines.append(f"      the one-sided criterion \u0112 \u2265 -U_val ({-rss.U_val:.4f}).")
+                else:
+                    lines.append(f"    \u2713 VALIDATED: The mean comparison error (|\u0112| = {abs(rss.E_mean):.4f}) is")
+                    lines.append(f"      within the expanded validation uncertainty (U_val = {rss.U_val:.4f}).")
                 lines.append(f"      The model is validated at {cov_pct} coverage / {conf_pct} confidence")
                 lines.append(f"      for the tested conditions per ASME V&V 20 \u00a76, Eq. (1).")
             else:
                 lines.append(f"")
-                lines.append(f"    \u2717 NOT VALIDATED: The mean comparison error (|\u0112| = {abs(rss.E_mean):.4f})")
-                lines.append(f"      exceeds the expanded validation uncertainty (U_val = {rss.U_val:.4f}).")
+                if rss_one_sided:
+                    lines.append(f"    \u2717 NOT VALIDATED: The mean comparison error (\u0112 = {rss.E_mean:+.4f})")
+                    lines.append(f"      is below -U_val ({-rss.U_val:.4f}), indicating underprediction")
+                    lines.append(f"      that exceeds the identified uncertainty sources.")
+                else:
+                    lines.append(f"    \u2717 NOT VALIDATED: The mean comparison error (|\u0112| = {abs(rss.E_mean):.4f})")
+                    lines.append(f"      exceeds the expanded validation uncertainty (U_val = {rss.U_val:.4f}).")
                 lines.append(f"      A statistically significant model bias exists that is not")
                 lines.append(f"      explained by the identified uncertainty sources.")
                 lines.append(f"      Recommendation: investigate systematic errors in boundary")
@@ -9483,6 +10695,81 @@ class ComparisonRollUpTab(QWidget):
         else:
             lines.append("    RSS analysis not available or U_val = 0.")
         lines.append("")
+
+        # --- 5a-ii. Per-Location Validation Assessment (when not pooled) ---
+        pl_results = None
+        if comp is not None and not comp.is_pooled:
+            # Try to get per-location results from the comparison data tab
+            # (stored by refresh_per_location_validation)
+            main_win = self.window()
+            if hasattr(main_win, '_tab_comparison'):
+                pl_results = main_win._tab_comparison.get_per_location_results()
+
+        if pl_results is not None and pl_results.computed and pl_results.n_total > 0:
+            lines.append("5a-ii. PER-LOCATION VALIDATION ASSESSMENT:")
+            criterion = (
+                "\u0112_i \u2265 -U_val,i" if pl_results.one_sided
+                else "|\u0112_i| \u2264 U_val,i"
+            )
+            n_v = pl_results.n_validated
+            n_t = pl_results.n_total
+            pct = pl_results.fraction_validated * 100
+            lines.append(
+                f"    Per-location validation was performed at {n_t} sensor "
+                f"locations using criterion {criterion}."
+            )
+            lines.append(
+                f"    Result: {n_v} of {n_t} locations ({pct:.0f}%) meet the "
+                f"validation criterion."
+            )
+            # List failed locations
+            failed = [loc for loc in pl_results.locations if not loc.bias_explained]
+            if failed:
+                lines.append(
+                    f"    Locations that did not pass ({len(failed)}):"
+                )
+                for loc in failed:
+                    lines.append(
+                        f"      - {loc.name}: \u0112 = {loc.E_mean:+.4g}, "
+                        f"U_val = {loc.U_val_local:.4g}"
+                    )
+            # Worst case
+            if pl_results.locations:
+                worst = min(pl_results.locations, key=lambda x: x.E_mean)
+                lines.append(
+                    f"    Worst-case: \u0112 = {worst.E_mean:+.4g} at {worst.name} "
+                    f"(U_val = {worst.U_val_local:.4g})"
+                )
+            lines.append("")
+
+            # --- 5a-iii. Budget Covariance Multivariate Check (V&V 20.1) ---
+            if pl_results.budget_mv_computed:
+                lines.append("5a-iii. BUDGET COVARIANCE MULTIVARIATE CHECK (V&V 20.1):")
+                lines.append(
+                    f"    Mahalanobis d\u00b2 = {pl_results.budget_mv_d_squared:.4f} "
+                    f"(d\u00b2/m = {pl_results.budget_mv_d_sq_per_m:.3f}, "
+                    f"m = {pl_results.budget_mv_m} locations)"
+                )
+                if pl_results.budget_mv_p_value >= 0.001:
+                    p_str = f"{pl_results.budget_mv_p_value:.4f}"
+                else:
+                    p_str = f"{pl_results.budget_mv_p_value:.2e}"
+                lines.append(f"    p-value = {p_str}")
+                lines.append(
+                    f"    Verdict: {pl_results.budget_mv_verdict}"
+                )
+                lines.append(f"    {pl_results.budget_mv_interpretation}")
+                if pl_results.budget_mv_note:
+                    lines.append(f"    Note: {pl_results.budget_mv_note}")
+                lines.append("")
+                lines.append(
+                    "    Interpretation guide: d\u00b2/m \u2248 1.0 means the bias "
+                    "pattern matches what the budget predicts. Values well "
+                    "below 1.0 mean the model is better than the budget "
+                    "requires. Values above 1.0 mean the model has more "
+                    "bias than the budget can explain."
+                )
+                lines.append("")
 
         # --- 5b. Monte Carlo Validation Assessment (JCGM 101) ---
         lines.append("5b. MONTE CARLO VALIDATION ASSESSMENT (JCGM 101:2008):")
@@ -9558,8 +10845,53 @@ class ComparisonRollUpTab(QWidget):
             lines.append("    Both RSS and MC results required for comparison.")
         lines.append("")
 
-        # --- 5d. Recommended Accuracy Statement for Report ---
-        lines.append("5d. RECOMMENDED CFD ACCURACY STATEMENT:")
+        # --- 5d. Double-Loop MC Assessment (if available) ---
+        dl = getattr(self, '_dl_mc', None)
+        if dl is not None and getattr(dl, 'computed', False):
+            lines.append("5d. DOUBLE-LOOP MONTE CARLO ASSESSMENT "
+                         "(Oberkampf & Roy 2010):")
+            mode_str = ("Corners (2\u207f worst-case)"
+                        if dl.mode == "corners" else "Full (stochastic)")
+            lines.append(f"    Method:            Double-loop MC ({mode_str})")
+            lines.append(f"    Outer loop:        {dl.n_outer} epistemic "
+                         f"realizations")
+            lines.append(f"    Inner loop:        {dl.n_inner:,} aleatory "
+                         f"trials per realization")
+            lines.append(f"    Epistemic sources: {dl.n_epistemic_sources}")
+            lines.append(f"    Aleatory sources:  {dl.n_aleatory_sources}")
+            lines.append(f"    P-box lower bound: {dl.lower_bound_min:+.4f} "
+                         f"[{unit}]")
+            lines.append(f"    P-box upper bound: {dl.upper_bound_max:+.4f} "
+                         f"[{unit}]")
+            lines.append(f"    P-box width:       "
+                         f"{dl.upper_bound_max - dl.lower_bound_min:.4f} "
+                         f"[{unit}]")
+            lines.append(f"    Epistemic spread (std of means): "
+                         f"{dl.std_of_means:.4f} [{unit}]")
+            lines.append(f"    Validation fraction: "
+                         f"{dl.validation_fraction:.1%}")
+            if dl.validation_fraction >= 1.0:
+                lines.append("    VERDICT: VALIDATED across all epistemic "
+                             "realizations.")
+            elif dl.validation_fraction >= 0.5:
+                lines.append(
+                    f"    VERDICT: PARTIALLY VALIDATED \u2014 "
+                    f"{dl.validation_fraction:.0%} of epistemic realizations "
+                    f"bracket zero."
+                )
+            else:
+                lines.append(
+                    "    VERDICT: NOT VALIDATED \u2014 majority of epistemic "
+                    "scenarios do not bracket zero."
+                )
+            if dl.epistemic_source_names:
+                lines.append(f"    Epistemic sources: "
+                             f"{', '.join(dl.epistemic_source_names)}")
+            lines.append("")
+
+        # --- 5e. Recommended Accuracy Statement for Report ---
+        section_letter = "5e" if (dl is not None and getattr(dl, 'computed', False)) else "5d"
+        lines.append(f"{section_letter}. RECOMMENDED CFD ACCURACY STATEMENT:")
         lines.append("    (Copy/adapt the following for the VVUQ report conclusion)")
         lines.append("")
         if rss is not None and rss.computed and rss.n_data == 0:
@@ -9711,11 +11043,29 @@ class ComparisonRollUpTab(QWidget):
 
         # --- Pooling assumption -----------------------------------------
         if self._comp is not None:
+            n_locs = self._comp.data.shape[0] if self._comp.data.ndim == 2 else 0
+            n_conds = self._comp.data.shape[1] if self._comp.data.ndim == 2 else 0
+            n_total = self._comp.flat_data().size
             if self._comp.is_pooled:
                 lines.append(
-                    "\u2022 Pooling: Comparison data POOLED across all "
-                    "sensor locations / conditions."
+                    f"\u2022 Pooling: Comparison errors from {n_locs} "
+                    f"T/C location(s) \u00d7 {n_conds} operating condition(s) "
+                    f"are POOLED into a single sample of N = {n_total}. "
+                    f"Pooling treats all location-condition pairs as "
+                    f"independent draws from the same comparison-error "
+                    f"population, per ASME V&V 20 \u00a72.4. This assumption "
+                    f"must be verified (e.g., Levene test for homogeneity "
+                    f"of variance, or engineering judgment that the thermal "
+                    f"environment is similar across the pooled region)."
                 )
+                rationale = getattr(self._comp, 'pooling_rationale', '')
+                if rationale:
+                    lines.append(f"    Analyst rationale: {rationale}")
+                else:
+                    lines.append(
+                        "    \u26a0 No pooling rationale provided. "
+                        "Document justification in the Comparison Data tab."
+                    )
             else:
                 lines.append(
                     "\u2022 Pooling: Comparison data treated PER-LOCATION "
@@ -9874,8 +11224,10 @@ class ComparisonRollUpTab(QWidget):
             _set(0, col_rss, f"{comp_rss.u_val:.4f}")
             _set(1, col_rss, f"{comp_rss.k_factor:.3f}")
             _set(2, col_rss, f"{comp_rss.U_val:.4f}")
-            _set(3, col_rss, f"{comp_rss.lower_bound_uval:.4f}")
-            _set(4, col_rss, f"{comp_rss.upper_bound_uval:.4f}")
+            _set(3, col_rss, f"{comp_rss.lower_bound_uval:.4f}"
+                 if not np.isnan(comp_rss.lower_bound_uval) else "\u2014")
+            _set(4, col_rss, f"{comp_rss.upper_bound_uval:.4f}"
+                 if not np.isnan(comp_rss.upper_bound_uval) else "\u2014")
             _set(5, col_rss, f"{comp_rss.E_mean:.4f}")
             if comp_rss.U_val > 0:
                 r_cmp = abs(comp_rss.E_mean) / comp_rss.U_val
@@ -10279,8 +11631,10 @@ class ReferenceTab(QWidget):
         of freedom (via Welch-Satterthwaite) and the desired coverage probability.</p>
 
         <h2>Validation Assessment</h2>
-        <p>The comparison error is compared against the expanded validation uncertainty:</p>
+        <p>The comparison error is compared against the expanded validation uncertainty.
+        The criterion depends on whether a <b>two-sided</b> or <b>one-sided</b> test is used:</p>
 
+        <h3>Two-Sided Criterion</h3>
         <table>
             <tr>
                 <th>Condition</th>
@@ -10288,17 +11642,37 @@ class ReferenceTab(QWidget):
             </tr>
             <tr>
                 <td><code>|E| &le; U_val</code></td>
-                <td><b>Validation is achieved</b> at the stated coverage level.
-                The model agrees with the experiment within the combined uncertainty.</td>
+                <td><b>Validated.</b> The model agrees with experiment within
+                the combined uncertainty.</td>
             </tr>
             <tr>
                 <td><code>|E| &gt; U_val</code></td>
-                <td><b>Validation is NOT achieved.</b> The discrepancy exceeds what
-                uncertainty alone can explain. Model deficiency is indicated.</td>
+                <td><b>Not validated.</b> The discrepancy exceeds what
+                uncertainty alone can explain.</td>
             </tr>
         </table>
 
-        <h2>When |E| Exceeds U_val</h2>
+        <h3>One-Sided Underprediction Criterion</h3>
+        <p>When only underprediction is a concern (e.g., model too cold = unconservative),
+        positive E (overprediction) always passes because it is conservative:</p>
+        <table>
+            <tr>
+                <th>Condition</th>
+                <th>Interpretation</th>
+            </tr>
+            <tr>
+                <td><code>E &ge; &minus;U_val</code></td>
+                <td><b>Validated.</b> Any overprediction (E &gt; 0) automatically passes.
+                Underprediction is within the uncertainty bound.</td>
+            </tr>
+            <tr>
+                <td><code>E &lt; &minus;U_val</code></td>
+                <td><b>Not validated.</b> Underprediction exceeds what uncertainty
+                can explain &mdash; the model is unconservatively low.</td>
+            </tr>
+        </table>
+
+        <h2>When Validation Fails</h2>
         <p>If the comparison error exceeds the validation uncertainty, V&amp;V 20
         recommends the following actions:</p>
         <ol>
@@ -11291,6 +12665,8 @@ class HTMLReportGenerator:
         audit_entries: list,
         rollup_headers: list = None,
         project_metadata: Optional[dict] = None,
+        dl_mc_results: Optional[DoubleLoopMCResults] = None,
+        per_loc_results: Optional[PerLocationValidationResults] = None,
     ) -> str:
         """
         Build and return a complete self-contained HTML report string.
@@ -11325,6 +12701,8 @@ class HTMLReportGenerator:
         project_metadata : dict, optional
             Program/analyst/date/notes and decision consequence metadata
             from the project info panel.
+        per_loc_results : PerLocationValidationResults, optional
+            Per-location validation results (when not pooled).
 
         Returns
         -------
@@ -11350,9 +12728,15 @@ class HTMLReportGenerator:
         n += 1; toc_entries.append(("section-compdata", f"{n}. Comparison Data Summary"))
         n += 1; toc_entries.append(("section-budget", f"{n}. Uncertainty Budget"))
         n += 1; toc_entries.append(("section-rss", f"{n}. RSS Results"))
+        if per_loc_results is not None and per_loc_results.computed:
+            n += 1
+            toc_entries.append(("section-perloc", f"{n}. Per-Location Validation"))
         if mc_results is not None and mc_results.computed:
             n += 1
             toc_entries.append(("section-mc", f"{n}. Monte Carlo Results"))
+        if dl_mc_results is not None and dl_mc_results.computed:
+            n += 1
+            toc_entries.append(("section-dlmc", f"{n}. Double-Loop Monte Carlo Results"))
         n += 1; toc_entries.append(("section-rollup", f"{n}. Comparison Roll-Up"))
         n += 1; toc_entries.append(("section-assumptions", f"{n}. Assumptions &amp; Engineering Judgments"))
         n += 1; toc_entries.append(("section-audit", f"{n}. Audit Trail"))
@@ -11380,10 +12764,21 @@ class HTMLReportGenerator:
             sections_html.append(self._build_rss_section(
                 rss_results, settings, unit, figures.get("rss_plots")))
 
+        # ---- 4b. Per-Location Validation (optional) -------------------
+        if per_loc_results is not None and per_loc_results.computed:
+            sections_html.append(self._build_per_location_validation_section(
+                per_loc_results, unit))
+
         # ---- 5. Monte Carlo Results (optional) ------------------------
         if mc_results is not None and mc_results.computed:
             sections_html.append(self._build_mc_section(
                 mc_results, rss_results, settings, unit,
+                figures.get("mc_plots")))
+
+        # ---- 5b. Double-Loop Monte Carlo Results (optional) -----------
+        if dl_mc_results is not None and dl_mc_results.computed:
+            sections_html.append(self._build_dl_mc_section(
+                dl_mc_results, settings, unit,
                 figures.get("mc_plots")))
 
         # ---- 6. Comparison Roll-Up ------------------------------------
@@ -11625,12 +13020,52 @@ class HTMLReportGenerator:
 
         img_html = self._embed_figure(fig, "Comparison data plots")
 
+        # Pooling transparency statement
+        pooling_html = ""
+        if cd.is_pooled:
+            rationale = getattr(cd, 'pooling_rationale', '') or ''
+            if rationale:
+                rationale_escaped = _esc(rationale)
+                pooling_html = textwrap.dedent(f"""\
+                <div class="info-box" style="margin:0.8em 0; padding:0.8em;
+                     border-left:4px solid #e65100; background:#fff3e0;">
+                    <strong>Pooling Statement</strong>
+                    <p style="margin:0.4em 0 0 0;">Comparison errors from
+                    <strong>{n_locs}</strong> T/C location(s) &times;
+                    <strong>{n_conds}</strong> operating condition(s) are
+                    <strong>pooled</strong> into a single sample of
+                    N&nbsp;=&nbsp;{n_total}. Pooling treats all location-condition
+                    pairs as independent draws from the same comparison-error
+                    population (ASME&nbsp;V&amp;V&nbsp;20 &sect;2.4).</p>
+                    <p style="margin:0.4em 0 0 0;"><em>Analyst rationale:</em>
+                    {rationale_escaped}</p>
+                </div>
+                """)
+            else:
+                pooling_html = textwrap.dedent(f"""\
+                <div class="info-box" style="margin:0.8em 0; padding:0.8em;
+                     border-left:4px solid #e65100; background:#fff3e0;">
+                    <strong>Pooling Statement</strong>
+                    <p style="margin:0.4em 0 0 0;">Comparison errors from
+                    <strong>{n_locs}</strong> T/C location(s) &times;
+                    <strong>{n_conds}</strong> operating condition(s) are
+                    <strong>pooled</strong> into a single sample of
+                    N&nbsp;=&nbsp;{n_total}. Pooling treats all location-condition
+                    pairs as independent draws from the same comparison-error
+                    population (ASME&nbsp;V&amp;V&nbsp;20 &sect;2.4).</p>
+                    <p style="margin:0.4em 0 0 0; color:#c62828;">
+                    <em>&#x26a0; No pooling rationale was provided by the analyst.
+                    Document justification for this assumption.</em></p>
+                </div>
+                """)
+
         return textwrap.dedent(f"""\
         <div class="section" id="section-compdata">
             <h2>2. Comparison Data Summary</h2>
             <p>Data dimensions: <strong>{n_locs}</strong> locations &times;
                <strong>{n_conds}</strong> conditions = <strong>{n_total}</strong>
                total data points.</p>
+            {pooling_html}
             <table class="stats-table">
                 <thead>
                     <tr><th>Statistic</th><th>Value</th></tr>
@@ -11948,23 +13383,40 @@ class HTMLReportGenerator:
         )
 
         # Validation assessment
+        rss_one_sided = getattr(r, 'one_sided', False)
         if r.u_val > 0:
-            ratio = abs(r.E_mean) / r.U_val if r.U_val > 0 else float('inf')
-            if ratio <= 1.0:
-                verdict = (
-                    f'<p class="verdict pass">|E&#772;| / U<sub>val</sub> = '
-                    f'{ratio:.3f} &le; 1.0 &mdash; <strong>Validation '
-                    f'requirement is SATISFIED.</strong> The model-form '
-                    f'uncertainty is within the expanded validation '
-                    f'uncertainty.</p>'
-                )
+            if rss_one_sided:
+                if r.bias_explained:
+                    verdict = (
+                        f'<p class="verdict pass">E&#772; = {r.E_mean:+.4f} '
+                        f'&ge; &minus;U<sub>val</sub> = {-r.U_val:.4f} &mdash; '
+                        f'<strong>Validation requirement is SATISFIED</strong> '
+                        f'(one-sided underprediction criterion).</p>'
+                    )
+                else:
+                    verdict = (
+                        f'<p class="verdict fail">E&#772; = {r.E_mean:+.4f} '
+                        f'&lt; &minus;U<sub>val</sub> = {-r.U_val:.4f} &mdash; '
+                        f'<strong>Validation requirement is NOT satisfied.</strong> '
+                        f'Underprediction exceeds the expanded uncertainty.</p>'
+                    )
             else:
-                verdict = (
-                    f'<p class="verdict fail">|E&#772;| / U<sub>val</sub> = '
-                    f'{ratio:.3f} &gt; 1.0 &mdash; <strong>Validation '
-                    f'requirement is NOT satisfied.</strong> Significant '
-                    f'unaccounted model-form error exists.</p>'
-                )
+                ratio = abs(r.E_mean) / r.U_val if r.U_val > 0 else float('inf')
+                if ratio <= 1.0:
+                    verdict = (
+                        f'<p class="verdict pass">|E&#772;| / U<sub>val</sub> = '
+                        f'{ratio:.3f} &le; 1.0 &mdash; <strong>Validation '
+                        f'requirement is SATISFIED.</strong> The model-form '
+                        f'uncertainty is within the expanded validation '
+                        f'uncertainty.</p>'
+                    )
+                else:
+                    verdict = (
+                        f'<p class="verdict fail">|E&#772;| / U<sub>val</sub> = '
+                        f'{ratio:.3f} &gt; 1.0 &mdash; <strong>Validation '
+                        f'requirement is NOT satisfied.</strong> Significant '
+                        f'unaccounted model-form error exists.</p>'
+                    )
         else:
             verdict = (
                 '<p class="verdict neutral">RSS results not computed or '
@@ -12011,6 +13463,149 @@ class HTMLReportGenerator:
             {verdict}
             {mv_verdict}
             {img_html}
+        </div>
+        """)
+
+    # -- 4b. Per-Location Validation Results -------------------------------
+    def _build_per_location_validation_section(
+        self,
+        pl: PerLocationValidationResults,
+        unit: str,
+    ) -> str:
+        """Render per-location validation summary section for the HTML report."""
+        n_v = pl.n_validated
+        n_t = pl.n_total
+        pct = pl.fraction_validated * 100
+
+        # Color-coded summary badge
+        if n_v == n_t:
+            badge_color = "#4caf50"
+            badge_text = f"VALIDATED at all {n_t} locations"
+        elif pl.fraction_validated >= 0.5:
+            badge_color = "#ff9800"
+            badge_text = f"PARTIALLY VALIDATED: {n_v}/{n_t} locations ({pct:.0f}%)"
+        else:
+            badge_color = "#f44336"
+            badge_text = f"NOT VALIDATED: only {n_v}/{n_t} locations ({pct:.0f}%) pass"
+
+        criterion = (
+            "E&#772;<sub>i</sub> &ge; &minus;U<sub>val,i</sub> (one-sided underprediction)"
+            if pl.one_sided else
+            "|E&#772;<sub>i</sub>| &le; U<sub>val,i</sub> (two-sided)"
+        )
+
+        # Build location rows
+        rows_html = ""
+        for loc in pl.locations:
+            if loc.bias_explained:
+                cls = "pass"
+                verdict = "PASS"
+            else:
+                cls = "fail"
+                verdict = "FAIL"
+            rows_html += (
+                f'<tr class="{cls}">'
+                f'<td>{_esc(loc.name)}</td>'
+                f'<td>{loc.E_mean:+.4g}</td>'
+                f'<td>{loc.s_E:.4g}</td>'
+                f'<td>{loc.n}</td>'
+                f'<td>{loc.U_val_local:.4g}</td>'
+                f'<td><strong>{verdict}</strong></td>'
+                f'</tr>\n'
+            )
+
+        # Budget covariance multivariate section (V&V 20.1)
+        budget_mv_html = ""
+        if pl.budget_mv_computed:
+            if pl.budget_mv_verdict == "PASS":
+                mv_badge_color = "#4caf50"
+            else:
+                mv_badge_color = "#f44336"
+            ratio_str = f"{pl.budget_mv_d_sq_per_m:.3f}"
+            if pl.budget_mv_p_value >= 0.001:
+                p_str = f"{pl.budget_mv_p_value:.4f}"
+            else:
+                p_str = f"{pl.budget_mv_p_value:.2e}"
+            edge_note = ""
+            if pl.budget_mv_note:
+                edge_note = (
+                    f'<p style="color: #999; font-size: 12px; font-style: italic;">'
+                    f'{_esc(pl.budget_mv_note)}</p>'
+                )
+            budget_mv_html = textwrap.dedent(f"""\
+            <div style="margin-top: 24px; padding-top: 16px; border-top: 1px solid #555;">
+                <h3>Budget Covariance Multivariate Check (V&amp;V 20.1)</h3>
+                <div style="background: {mv_badge_color}; color: white; padding: 8px 16px;
+                            border-radius: 4px; font-size: 14px; font-weight: bold;
+                            display: inline-block; margin-bottom: 12px;">
+                    {pl.budget_mv_verdict}: d&sup2;/m = {ratio_str}, p = {p_str}
+                </div>
+                <table class="stats-table" style="margin-top: 8px;">
+                    <tr><td>Mahalanobis d&sup2;</td><td>{pl.budget_mv_d_squared:.4f}</td></tr>
+                    <tr><td>Number of locations (m)</td><td>{pl.budget_mv_m}</td></tr>
+                    <tr><td>d&sup2;/m ratio</td><td>{ratio_str}</td></tr>
+                    <tr><td>p-value (&chi;&sup2; with {pl.budget_mv_m} d.f.)</td><td>{p_str}</td></tr>
+                    <tr><td>&sigma;<sub>global</sub></td><td>{pl.global_u_val:.4g} [{_esc(unit)}]</td></tr>
+                    <tr><td>&sigma;<sub>per-loc</sub></td><td>{pl.per_loc_u_val:.4g} [{_esc(unit)}]</td></tr>
+                </table>
+                <p style="margin-top: 12px;">{_esc(pl.budget_mv_interpretation)}</p>
+                {edge_note}
+                <details style="margin-top: 8px;">
+                    <summary style="cursor: pointer; color: #90caf9;">How to read this metric</summary>
+                    <div style="padding: 8px; font-size: 13px; color: #bbb;">
+                        <p>This metric checks whether the <em>pattern</em> of bias across all
+                        {pl.budget_mv_m} locations is consistent with the uncertainty budget.
+                        Unlike the per-location PASS/FAIL checks (which treat each location
+                        independently), this accounts for the fact that global uncertainty
+                        sources (grid convergence, inlet BC, DAQ calibration) shift all
+                        locations in the same direction simultaneously.</p>
+                        <ul>
+                            <li><strong>d&sup2;/m &asymp; 1.0</strong>: The bias pattern matches
+                                what the budget predicts &mdash; normal.</li>
+                            <li><strong>d&sup2;/m &lt; 1.0</strong>: The model is better than
+                                the budget requires.</li>
+                            <li><strong>d&sup2;/m &gt; 1.0</strong>: The model has more bias
+                                than the budget can explain &mdash; investigate.</li>
+                        </ul>
+                        <p>The p-value tests: &ldquo;If the model were correct (all bias
+                        explained by the budget), what is the probability of seeing a bias
+                        pattern this extreme?&rdquo; p &ge; 0.05 &rarr; PASS;
+                        p &lt; 0.05 &rarr; FAIL.</p>
+                    </div>
+                </details>
+            </div>
+            """)
+
+        return textwrap.dedent(f"""\
+        <div class="section page-break-before" id="section-perloc">
+            <h2>Per-Location Validation Results</h2>
+            <div style="background: {badge_color}; color: white; padding: 8px 16px;
+                        border-radius: 4px; font-size: 14px; font-weight: bold;
+                        display: inline-block; margin-bottom: 12px;">
+                {badge_text}
+            </div>
+            <p>Validation criterion: <code>{criterion}</code><br>
+               Coverage factor: k = {pl.k_factor:.4f}<br>
+               Global u<sub>val</sub> = {pl.global_u_val:.4g} [{_esc(unit)}],
+               Per-location u<sub>val</sub> = {pl.per_loc_u_val:.4g} [{_esc(unit)}]</p>
+            <div class="table-wrapper">
+            <table class="stats-table">
+                <thead>
+                    <tr>
+                        <th>Location</th>
+                        <th>Mean E&#772; [{_esc(unit)}]</th>
+                        <th>Std Dev [{_esc(unit)}]</th>
+                        <th>n</th>
+                        <th>U<sub>val</sub> [{_esc(unit)}]</th>
+                        <th>Verdict</th>
+                    </tr>
+                </thead>
+                <tbody>
+        {rows_html}
+                </tbody>
+            </table>
+            </div>
+            {budget_mv_html}
         </div>
         """)
 
@@ -12095,6 +13690,115 @@ class HTMLReportGenerator:
                 </tbody>
             </table>
             {comparison_html}
+            {notes_html}
+            {img_html}
+        </div>
+        """)
+
+    # -- 5b. Double-Loop Monte Carlo Results -----------------------------
+    def _build_dl_mc_section(self, dl: DoubleLoopMCResults,
+                              s: AnalysisSettings, unit: str,
+                              fig: Optional[Figure]) -> str:
+        """Build the HTML section for double-loop Monte Carlo p-box results."""
+        mode_label = "Corners (2^n exact)" if dl.mode == "corners" else "Full stochastic"
+
+        rows = [
+            ("Mode", _esc(mode_label)),
+            ("Outer-loop realizations (epistemic)", f"{dl.n_outer:,}"),
+            ("Inner-loop trials (aleatory)", f"{dl.n_inner:,}"),
+            ("Epistemic sources", f"{dl.n_epistemic_sources}"),
+            ("Aleatory sources", f"{dl.n_aleatory_sources}"),
+            ("P-box lower bound (worst-case)", f"{dl.lower_bound_min:.6g} {_esc(unit)}"),
+            ("P-box upper bound (worst-case)", f"{dl.upper_bound_max:.6g} {_esc(unit)}"),
+            ("P-box lower bound (best-case)", f"{dl.lower_bound_max:.6g} {_esc(unit)}"),
+            ("P-box upper bound (best-case)", f"{dl.upper_bound_min:.6g} {_esc(unit)}"),
+            ("Mean of inner-loop means", f"{dl.mean_of_means:.6g} {_esc(unit)}"),
+            ("Std of inner-loop means (epistemic spread)", f"{dl.std_of_means:.6g} {_esc(unit)}"),
+        ]
+
+        # Validation fraction row with colour-coded verdict
+        vf = dl.validation_fraction
+        if vf >= 0.90:
+            vf_colour = "#2e7d32"  # green
+            verdict = "PASS"
+        elif vf >= 0.50:
+            vf_colour = "#e65100"  # amber
+            verdict = "MARGINAL"
+        else:
+            vf_colour = "#c62828"  # red
+            verdict = "FAIL"
+        rows.append(
+            ("Validation fraction",
+             f"<strong style='color:{vf_colour}'>{vf:.1%}</strong> "
+             f"&mdash; {verdict}")
+        )
+
+        body = "\n".join(
+            f"            <tr><td class='label-cell'>{lbl}</td>"
+            f"<td>{val}</td></tr>"
+            for lbl, val in rows
+        )
+
+        # Epistemic source list
+        epi_names = dl.epistemic_source_names
+        if epi_names:
+            epi_items = "\n".join(
+                f"<li>{_esc(str(n))}</li>" for n in epi_names
+            )
+            epi_html = (
+                "<h3>Epistemic Sources (Outer Loop)</h3>"
+                f"<ul>{epi_items}</ul>"
+            )
+        else:
+            epi_html = ""
+
+        # Notes
+        notes_html = ""
+        if dl.notes:
+            note_items = "\n".join(
+                f"<li>{_esc(str(n))}</li>" for n in dl.notes
+            )
+            notes_html = (
+                "<h3>Double-Loop MC Notes</h3>"
+                f"<ul>{note_items}</ul>"
+            )
+
+        # Interpretation guidance
+        guide_html = textwrap.dedent(f"""\
+        <div class="info-box" style="margin-top:1em; padding:0.8em; border-left:4px solid #1565c0; background:#e3f2fd;">
+            <strong>Interpretation (Oberkampf &amp; Roy 2010; Roy &amp; Oberkampf 2011)</strong>
+            <ul style="margin:0.5em 0 0 1.2em; padding:0;">
+                <li>The <b>p-box</b> envelope bounds all CDFs consistent with the epistemic
+                    uncertainty. A narrow envelope means epistemic uncertainty has limited
+                    impact; a wide envelope means model predictions are sensitive to
+                    knowledge gaps.</li>
+                <li>The <b>validation fraction</b> ({vf:.1%}) reports the proportion of
+                    epistemic realizations for which the prediction interval brackets
+                    zero (the ideal agreement value). Higher is better.</li>
+                <li>When the validation fraction is low, examine the epistemic source
+                    list above to identify which knowledge gaps most affect the
+                    validation outcome and prioritize those for reduction.</li>
+            </ul>
+        </div>
+        """)
+
+        img_html = self._embed_figure(fig, "Double-loop Monte Carlo p-box plots")
+
+        return textwrap.dedent(f"""\
+        <div class="section page-break-before" id="section-dlmc">
+            <h2>Double-Loop Monte Carlo Results</h2>
+            <p><em>Epistemic/aleatory separation per Oberkampf &amp; Roy (2010),
+            Roy &amp; Oberkampf (2011).</em></p>
+            <table class="results-table">
+                <thead>
+                    <tr><th>Quantity</th><th>Value</th></tr>
+                </thead>
+                <tbody>
+        {body}
+                </tbody>
+            </table>
+            {epi_html}
+            {guide_html}
             {notes_html}
             {img_html}
         </div>
@@ -12299,9 +14003,13 @@ class HTMLReportGenerator:
             "RSS"
         )
 
+        if getattr(rss, 'one_sided', False):
+            val_fail_check = "Scalar validation fails: Ebar < -U_val (underprediction exceeds uncertainty)"
+        else:
+            val_fail_check = "Scalar validation fails: |Ebar| > U_val"
         stop_checks = [
             "No comparison data loaded (n = 0)",
-            "Scalar validation fails: |Ebar| > U_val",
+            val_fail_check,
             "Effective DOF below 5 (k-factor instability)",
             "Any unresolved unit mismatch between source and global unit",
         ]
@@ -12382,13 +14090,21 @@ class HTMLReportGenerator:
         consequence: str,
     ) -> str:
         """Render optional conformity wording template section."""
+        rss_one_sided = getattr(rss, 'one_sided', False) if rss else False
         if rss is None or not rss.computed or rss.U_val <= 0:
             metric_value = "Not available (run RSS first)"
+            metric_name = "Validation ratio |Ebar| / U_val"
+        elif rss_one_sided:
+            # One-sided: margin = E + U_val (positive = passing, negative = failing)
+            margin = rss.E_mean + rss.U_val
+            metric_value = f"{margin:+.4f} (margin: E + U_val)"
+            metric_name = "One-sided margin (E + U_val)"
         else:
             ratio = abs(rss.E_mean) / rss.U_val if rss.U_val > 0 else float("inf")
             metric_value = f"{ratio:.4f}"
+            metric_name = "Validation ratio |Ebar| / U_val"
         return render_conformity_template_html(
-            metric_name="Validation ratio |Ebar| / U_val",
+            metric_name=metric_name,
             metric_value=metric_value,
             consequence=consequence,
         )
@@ -12714,6 +14430,11 @@ class ProjectManager:
             if mc_results and mc_results.computed:
                 payload['mc_results'] = _sanitize_for_json(mc_results.to_dict())
 
+            # Double-loop MC results (if available via kwargs)
+            dl_mc = kwargs.get('dl_mc_results', None)
+            if dl_mc is not None and getattr(dl_mc, 'computed', False):
+                payload['dl_mc_results'] = _sanitize_for_json(dl_mc.to_dict())
+
             # Audit log entries
             payload['audit_log'] = audit_log_instance.to_dict()
 
@@ -12793,6 +14514,15 @@ class ProjectManager:
 
             audit_entries = payload.get('audit_log', [])
 
+            # Restore double-loop MC results (scalar summary only)
+            dl_mc = None
+            dl_mc_raw = payload.get('dl_mc_results')
+            if dl_mc_raw and isinstance(dl_mc_raw, dict):
+                try:
+                    dl_mc = DoubleLoopMCResults.from_dict(dl_mc_raw)
+                except Exception:
+                    dl_mc = None  # silently skip if format changed
+
             return {
                 'comparison_data': comp_data,
                 'sources': sources,
@@ -12801,6 +14531,7 @@ class ProjectManager:
                 'app_version': payload.get('app_version', 'unknown'),
                 'save_date': payload.get('save_date', 'unknown'),
                 'project_metadata': payload.get('project_metadata', {}),
+                'dl_mc_results': dl_mc,
             }
 
         except Exception as exc:
@@ -13201,14 +14932,8 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1200, 800)
         self.setStyleSheet(get_dark_stylesheet())
 
-        # ---- Application font ----
-        font = QFont()
-        for family in FONT_FAMILIES:
-            if QFontDatabase.hasFamily(family):
-                font.setFamily(family)
-                break
-        font.setPointSize(10)
-        QApplication.instance().setFont(font)
+        # Application font is set in the __main__ entry point to avoid
+        # duplicate setFont calls; see the if __name__ == "__main__" block.
 
         # ---- Project state ----
         self._project_folder: str = ""
@@ -13360,6 +15085,12 @@ class MainWindow(QMainWindow):
         self._status_bar.addPermanentWidget(self._version_label)
         self._status_bar.showMessage("Ready.", 5000)
 
+        # ---- Debounce timer for auto-compute (prevents stacking) ----
+        self._debounce_timer = QTimer(self)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.setInterval(100)
+        self._debounce_timer.timeout.connect(self._auto_compute_rss)
+
         # ---- Signal wiring ----
         self._wire_signals()
 
@@ -13500,16 +15231,12 @@ class MainWindow(QMainWindow):
     # =================================================================
     def _wire_signals(self):
         """Connect tab signals to main window slots with debouncing."""
-        # Debounced auto-compute on data/source/settings changes
-        self._tab_comparison.data_changed.connect(
-            lambda: QTimer.singleShot(100, self._auto_compute_rss)
-        )
-        self._tab_sources.sources_changed.connect(
-            lambda: QTimer.singleShot(100, self._auto_compute_rss)
-        )
-        self._tab_settings.settings_changed.connect(
-            lambda: QTimer.singleShot(100, self._auto_compute_rss)
-        )
+        # Debounced auto-compute on data/source/settings changes.
+        # Uses a single shared QTimer to prevent stacking of multiple
+        # concurrent singleShot timers when signals fire in rapid succession.
+        self._tab_comparison.data_changed.connect(self._debounce_timer.start)
+        self._tab_sources.sources_changed.connect(self._debounce_timer.start)
+        self._tab_settings.settings_changed.connect(self._debounce_timer.start)
 
         # MC finished
         self._tab_mc.mc_finished.connect(self._on_mc_finished)
@@ -13570,6 +15297,9 @@ class MainWindow(QMainWindow):
             self._tab_rss.compute_and_display(sources, comp_data, settings)
             rss = self._tab_rss.get_results()
 
+            # Refresh per-location validation on comparison data tab
+            self._tab_comparison.refresh_per_location_validation(sources, rss)
+
             # Update k-display on settings tab
             self._tab_settings.update_k_display(rss.nu_eff, rss.k_factor)
 
@@ -13628,12 +15358,16 @@ class MainWindow(QMainWindow):
         """Handle Monte Carlo completion: update roll-up and status."""
         try:
             mc = self._tab_mc.get_results()
+            dl_mc = self._tab_mc.get_dl_results()
             rss = self._tab_rss.get_results()
             comp_data = self._tab_comparison.get_comparison_data()
             settings = self._tab_settings.get_settings()
             all_sources = self._tab_sources.get_all_sources()
 
-            self._tab_rollup.update_rollup(rss, mc, comp_data, settings, all_sources)
+            self._tab_rollup.update_rollup(
+                rss, mc, comp_data, settings, all_sources,
+                dl_mc_results=dl_mc,
+            )
             self._unsaved_changes = True
             self._status_bar.showMessage("Monte Carlo complete.", 10000)
 
@@ -13718,6 +15452,11 @@ class MainWindow(QMainWindow):
             if result.get('audit_entries'):
                 audit_log.from_dict(result['audit_entries'])
 
+            # Restore double-loop MC scalar summary (if saved)
+            dl_mc_loaded = result.get('dl_mc_results')
+            if dl_mc_loaded is not None:
+                self._tab_mc.set_dl_results(dl_mc_loaded)
+
             self._project_folder = os.path.dirname(json_path)
             self._project_name = os.path.splitext(
                 os.path.basename(json_path)
@@ -13801,6 +15540,7 @@ class MainWindow(QMainWindow):
 
             rss = self._tab_rss.get_results()
             mc = self._tab_mc.get_results()
+            dl_mc = self._tab_mc.get_dl_results()
             comp_data = self._tab_comparison.get_comparison_data()
             settings = self._tab_settings.get_settings()
             all_sources = self._tab_sources.get_all_sources()
@@ -13816,6 +15556,7 @@ class MainWindow(QMainWindow):
                 audit_log_instance=audit_log,
                 html_report_content=html_content,
                 project_metadata=self.get_project_metadata(),
+                dl_mc_results=dl_mc,
             )
 
             if result.startswith("ERROR:"):
@@ -13875,6 +15616,12 @@ class MainWindow(QMainWindow):
 
         # Use None for MC if not computed
         mc_for_report = mc if (mc and mc.computed) else None
+        dl_mc = self._tab_mc.get_dl_results()
+        dl_mc_for_report = dl_mc if (dl_mc and dl_mc.computed) else None
+
+        # Get per-location results (only when not pooled)
+        pl_results = self._tab_comparison.get_per_location_results()
+        pl_for_report = pl_results if (pl_results and pl_results.computed) else None
 
         html = generator.generate_report(
             rss_results=rss,
@@ -13890,6 +15637,8 @@ class MainWindow(QMainWindow):
             audit_entries=audit_log.to_dict(),
             rollup_headers=rollup_headers,
             project_metadata=self.get_project_metadata(),
+            dl_mc_results=dl_mc_for_report,
+            per_loc_results=pl_for_report,
         )
         return html
 
@@ -14109,6 +15858,7 @@ class MainWindow(QMainWindow):
         self._project_name = "Untitled"
         self._lbl_project_name.setText("Untitled")
         self._unsaved_changes = False
+        self.set_project_metadata({})
 
         audit_log.entries.clear()
         audit_log.log("SESSION_START", f"{APP_NAME} v{APP_VERSION} — Data cleared")

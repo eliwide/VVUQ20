@@ -3797,7 +3797,12 @@ class GCICalculatorTab(QWidget):
     # ------------------------------------------------------------------
 
     def _rebuild_table(self):
-        """Rebuild the grid data table when grid count changes."""
+        """Rebuild the grid data table when grid count changes.
+
+        NOTE: Changing the grid count via setRowCount/setColumnCount clears
+        existing cell data.  This is standard QTableWidget behavior and is
+        expected — users are warned by the stale-results indicator.
+        """
         n_grids = self._cmb_n_grids.currentData()
         n_cols = 1 + self._n_quantities  # cell count + N quantities
 
@@ -3871,6 +3876,7 @@ class GCICalculatorTab(QWidget):
             return
 
         rows = []
+        dropped_count = 0
         for line in text.strip().split('\n'):
             tokens = line.replace(',', '\t').split('\t')
             vals = []
@@ -3881,7 +3887,7 @@ class GCICalculatorTab(QWidget):
                 try:
                     vals.append(float(t))
                 except ValueError:
-                    pass
+                    dropped_count += 1
             if vals:
                 rows.append(vals)
 
@@ -3936,9 +3942,13 @@ class GCICalculatorTab(QWidget):
                 item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self._grid_table.setItem(i, j, item)
 
+        drop_msg = ""
+        if dropped_count > 0:
+            drop_msg = (f"\n\n{dropped_count} non-numeric token(s) were "
+                        f"skipped (e.g. headers or text labels).")
         QMessageBox.information(
             self, "Data Pasted",
-            f"Pasted {n_grids} grids x {n_qty} quantities."
+            f"Pasted {n_grids} grids x {n_qty} quantities.{drop_msg}"
         )
 
     # ------------------------------------------------------------------
@@ -3957,6 +3967,10 @@ class GCICalculatorTab(QWidget):
             # Cell count
             item = self._grid_table.item(i, 0)
             if item is None or not item.text().strip():
+                self._guidance_convergence.set_guidance(
+                    f"Grid {i+1}: Cell Count is empty. "
+                    f"Enter a positive integer for every grid row.",
+                    'yellow')
                 return None, None
             try:
                 val = float(item.text())
@@ -3977,6 +3991,13 @@ class GCICalculatorTab(QWidget):
             for q in range(n_qty):
                 item = self._grid_table.item(i, 1 + q)
                 if item is None or not item.text().strip():
+                    q_label = (self._quantity_names[q]
+                               if q < len(self._quantity_names)
+                               else f"Quantity {q+1}")
+                    self._guidance_convergence.set_guidance(
+                        f"Grid {i+1}, {q_label}: cell is empty. "
+                        f"Enter a numeric value for every grid/quantity cell.",
+                        'yellow')
                     return None, None
                 try:
                     sol_val = float(item.text())
@@ -4479,7 +4500,7 @@ class GCICalculatorTab(QWidget):
                             dir_pct = ((dir_u / abs(res.grid_solutions[tgt]))
                                        * 100.0
                                        if abs(res.grid_solutions[tgt]) > 1e-30
-                                       else 0.0) if q_idx == 0 else carry_pct
+                                       else 0.0)
                             dir_line = (
                                 f"u_num (directional)  = {dir_u:.6g}"
                                 f"{unit_sfx}   ({dir_pct:.4f}%, adverse)"
@@ -4493,7 +4514,6 @@ class GCICalculatorTab(QWidget):
                         )
                         if res.directional_note:
                             # Wrap note to fit box (multi-line)
-                            import textwrap
                             wrapped = textwrap.wrap(
                                 res.directional_note, width=55)
                             for wline in wrapped:
@@ -5031,6 +5051,9 @@ class GCICalculatorTab(QWidget):
                 'red'
             )
             # --- Conservative bounding estimate for small-spread divergence ---
+            # NOTE: Bounding estimate only evaluates quantity 1 (index 0).
+            # Multi-quantity bounding would require per-quantity threshold
+            # settings and a more complex UI; acceptable limitation for now.
             self._update_bounding_estimate(res)
         elif res.convergence_type == "grid-independent":
             self._guidance_convergence.set_guidance(
@@ -5580,7 +5603,14 @@ class GCICalculatorTab(QWidget):
                                 f"Could not copy:\n\n{exc}")
 
     def _copy_carry_to_clipboard(self):
-        """Copy u_num carry-over value to clipboard."""
+        """Copy u_num carry-over value to clipboard.
+
+        NOTE: Currently copies only quantity 0 (the first quantity).
+        For multi-quantity studies, the user should use the carry-over
+        table's "Copy All" button which includes all quantities.
+        A per-quantity copy would require tracking the currently-visible
+        quantity in the results display, which is not yet implemented.
+        """
         if not self._results:
             return
         try:
@@ -6471,6 +6501,10 @@ class GCICalculatorTab(QWidget):
 
     def set_state(self, state: dict):
         """Restore input state from a dict (loaded from JSON)."""
+        # Clear previous computation results, guidance, plots, carry-over,
+        # report, and bounding visibility before loading new state.
+        self.clear_all()
+
         # Set number of grids
         n_grids = state.get("n_grids", 3)
         found = False
@@ -6562,6 +6596,13 @@ class GCICalculatorTab(QWidget):
         self._carry_table.setRowCount(0)
         self._carry_warnings.clear()
         self._btn_copy_all_carry.setEnabled(False)
+        # Finding 2: hide bounding estimate panels
+        self._guidance_bounding.setVisible(False)
+        self._bounding_config_frame.setVisible(False)
+        # Finding 1: reset stale flag and restore compute button text
+        self._results_stale = False
+        self._btn_compute.setText("Compute GCI")
+        self._btn_compute.setToolTip("")
 
 
 # =============================================================================
@@ -6706,7 +6747,7 @@ class SpatialGCITab(QWidget):
 
         self._tbl_sep_files = QTableWidget(3, 3)
         self._tbl_sep_files.setHorizontalHeaderLabels(
-            ["File Path", "Cell Count", "Points"])
+            ["File Name", "Cell Count", "Points"])
         style_table(self._tbl_sep_files, stretch_col=0)
         for i in range(3):
             self._tbl_sep_files.setVerticalHeaderItem(
@@ -6753,7 +6794,7 @@ class SpatialGCITab(QWidget):
 
         self._tbl_prof_files = QTableWidget(3, 3)
         self._tbl_prof_files.setHorizontalHeaderLabels(
-            ["File Path", "Cell Count", "Points"])
+            ["File Name", "Cell Count", "Points"])
         style_table(self._tbl_prof_files, stretch_col=0)
         for i in range(3):
             self._tbl_prof_files.setVerticalHeaderItem(
@@ -7182,14 +7223,33 @@ class SpatialGCITab(QWidget):
         if not paths:
             return
 
-        # Adjust table row count if needed
-        if len(paths) > n_grids:
-            self._tbl_sep_files.setRowCount(len(paths))
-            for i in range(n_grids, len(paths)):
+        # Find empty slots (rows without loaded data), fill those first
+        empty_slots = [i for i in range(n_grids) if i not in self._sep_data]
+
+        # Add new rows if we need more slots than are empty
+        extra_needed = len(paths) - len(empty_slots)
+        if extra_needed > 0:
+            new_total = n_grids + extra_needed
+            # Cap at 6 rows maximum
+            if new_total > 6:
+                allowed = 6 - n_grids + len(empty_slots)
+                if allowed < len(paths):
+                    QMessageBox.warning(
+                        self, "Grid Limit",
+                        f"Maximum 6 grids supported. Only the first "
+                        f"{allowed} of {len(paths)} selected files "
+                        f"will be loaded.")
+                    paths = paths[:allowed]
+                    extra_needed = len(paths) - len(empty_slots)
+                new_total = min(new_total, 6)
+            self._tbl_sep_files.setRowCount(new_total)
+            for i in range(n_grids, new_total):
                 self._tbl_sep_files.setVerticalHeaderItem(
                     i, QTableWidgetItem(f"Grid {i+1}"))
+                empty_slots.append(i)
 
-        for i, path in enumerate(paths):
+        for j, path in enumerate(paths):
+            idx = empty_slots[j]
             try:
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
@@ -7197,15 +7257,16 @@ class SpatialGCITab(QWidget):
                 if caught:
                     warn_msgs = "\n".join(str(w.message) for w in caught)
                     QMessageBox.warning(
-                        self, f"CSV Parse Warning (Grid {i+1})", warn_msgs)
-                self._sep_data[i] = (coords, values, path)
+                        self, f"CSV Parse Warning (Grid {idx+1})", warn_msgs)
+                self._sep_data[idx] = (coords, values, path)
+                item = QTableWidgetItem(os.path.basename(path))
+                item.setToolTip(path)
+                self._tbl_sep_files.setItem(idx, 0, item)
                 self._tbl_sep_files.setItem(
-                    i, 0, QTableWidgetItem(os.path.basename(path)))
-                self._tbl_sep_files.setItem(
-                    i, 2, QTableWidgetItem(f"{len(values):,}"))
+                    idx, 2, QTableWidgetItem(f"{len(values):,}"))
             except Exception as exc:
                 QMessageBox.warning(
-                    self, f"Error Loading Grid {i+1}", str(exc))
+                    self, f"Error Loading Grid {idx+1}", str(exc))
 
         self._guidance_import.set_guidance(
             f"Loaded {len(paths)} grid files. Enter cell counts, then Compute.",
@@ -7239,23 +7300,44 @@ class SpatialGCITab(QWidget):
         if not paths:
             return
 
-        if len(paths) > n_grids:
-            self._tbl_prof_files.setRowCount(len(paths))
-            for i in range(n_grids, len(paths)):
+        # Find empty slots (rows without loaded data), fill those first
+        empty_slots = [i for i in range(n_grids) if i not in self._prof_data]
+
+        # Add new rows if we need more slots than are empty
+        extra_needed = len(paths) - len(empty_slots)
+        if extra_needed > 0:
+            new_total = n_grids + extra_needed
+            # Cap at 6 rows maximum
+            if new_total > 6:
+                allowed = 6 - n_grids + len(empty_slots)
+                if allowed < len(paths):
+                    QMessageBox.warning(
+                        self, "Grid Limit",
+                        f"Maximum 6 grids supported. Only the first "
+                        f"{allowed} of {len(paths)} selected files "
+                        f"will be loaded.")
+                    paths = paths[:allowed]
+                    extra_needed = len(paths) - len(empty_slots)
+                new_total = min(new_total, 6)
+            self._tbl_prof_files.setRowCount(new_total)
+            for i in range(n_grids, new_total):
                 self._tbl_prof_files.setVerticalHeaderItem(
                     i, QTableWidgetItem(f"Grid {i+1}"))
+                empty_slots.append(i)
 
-        for i, path in enumerate(paths):
+        for j, path in enumerate(paths):
+            idx = empty_slots[j]
             try:
                 coords, values = parse_fluent_prof(path)
-                self._prof_data[i] = (coords, values, path)
+                self._prof_data[idx] = (coords, values, path)
+                item = QTableWidgetItem(os.path.basename(path))
+                item.setToolTip(path)
+                self._tbl_prof_files.setItem(idx, 0, item)
                 self._tbl_prof_files.setItem(
-                    i, 0, QTableWidgetItem(os.path.basename(path)))
-                self._tbl_prof_files.setItem(
-                    i, 2, QTableWidgetItem(f"{len(values):,}"))
+                    idx, 2, QTableWidgetItem(f"{len(values):,}"))
             except Exception as exc:
                 QMessageBox.warning(
-                    self, f"Error Loading Grid {i+1}", str(exc))
+                    self, f"Error Loading Grid {idx+1}", str(exc))
 
         self._guidance_import.set_guidance(
             f"Loaded {len(paths)} .prof files. Enter cell counts, then Compute.",
@@ -8481,6 +8563,21 @@ class SpatialGCITab(QWidget):
         self._spatial_carry_table.setRowCount(0)
         self._spatial_carry_info.clear()
         self._btn_copy_spatial_carry.setEnabled(False)
+        # Reset file tables back to 3 rows and clear file name/point items
+        for tbl in (self._tbl_sep_files, self._tbl_prof_files):
+            tbl.setRowCount(3)
+            for i in range(3):
+                tbl.setVerticalHeaderItem(
+                    i, QTableWidgetItem(f"Grid {i+1}"))
+                tbl.setItem(i, 0, QTableWidgetItem(""))
+                tbl.setItem(i, 2, QTableWidgetItem(""))
+        # Reset stale flag and compute button text
+        self._spatial_stale = False
+        self._btn_compute_spatial.setText("Compute Spatial GCI")
+        self._btn_compute_spatial.setToolTip("")
+        # Clear the 3D viewer if available
+        if self._pv_available and self._pv_plotter is not None:
+            self._pv_plotter.clear()
 
 
 # =============================================================================
@@ -9021,6 +9118,7 @@ class MeshStudyPlannerTab(QWidget):
             for item_text in items:
                 cb = QCheckBox(item_text)
                 cb.setStyleSheet(f"color: {DARK_COLORS['fg']};")
+                cb.stateChanged.connect(self._update_checklist_status)
                 grp_lay.addWidget(cb)
                 self._checklist_boxes[item_text] = cb
             cl_inner_lay.addWidget(grp)
@@ -9509,6 +9607,15 @@ class MeshStudyPlannerTab(QWidget):
         for cb in self._checklist_boxes.values():
             cb.setChecked(False)
         self._update_checklist_status()
+        # Clear ratio check table cells (reset to 3 rows with labels only)
+        self._tbl_ratio_check.setRowCount(3)
+        for i in range(3):
+            lbl = QTableWidgetItem(f"Grid {i+1}")
+            lbl.setFlags(lbl.flags() & ~Qt.ItemIsEditable)
+            self._tbl_ratio_check.setItem(i, 0, lbl)
+            self._tbl_ratio_check.setItem(i, 1, QTableWidgetItem(""))
+        # Reset stored mesh plan
+        self._last_mesh_plan = None
 
 
 class GCIReportGenerator:
